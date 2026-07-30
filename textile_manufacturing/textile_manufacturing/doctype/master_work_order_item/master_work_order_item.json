@@ -1,0 +1,131 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-07-30 12:12:36.092710",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "item_code",
+  "item_name",
+  "production_plan_number",
+  "work_order_number",
+  "column_break_xgsz",
+  "bom_no",
+  "qty_to_manufacture",
+  "manufacture_qty",
+  "mateial_transfer_qty",
+  "warehouses_section",
+  "source_warehouse",
+  "target_warehouse",
+  "work_in_progress_warehouse",
+  "scrape_warhouse"
+ ],
+ "fields": [
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item Code",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "fetch_from": "item_code.item_name",
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "label": "Item Name",
+   "options": "Item",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "work_order_number",
+   "fieldtype": "Link",
+   "label": "Work order Number",
+   "options": "Work Order"
+  },
+  {
+   "fieldname": "column_break_xgsz",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fetch_from": "item_code.default_bom",
+   "fieldname": "bom_no",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "BOM No",
+   "options": "BOM"
+  },
+  {
+   "fieldname": "qty_to_manufacture",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Qty to Manufacture"
+  },
+  {
+   "fieldname": "manufacture_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Manufacture Qty"
+  },
+  {
+   "fieldname": "mateial_transfer_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Mateial Transfer Qty"
+  },
+  {
+   "fieldname": "warehouses_section",
+   "fieldtype": "Section Break",
+   "label": "Warehouses"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "label": "Source Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "target_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "work_in_progress_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "scrape_warhouse",
+   "fieldtype": "Link",
+   "label": "Scrape Warhouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "production_plan_number",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Production Plan Number",
+   "options": "Production Plan"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-07-30 15:11:20.057262",
+ "modified_by": "Administrator",
+ "module": "Textile Manufacturing",
+ "name": "Master Work Order Item",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -1,0 +1,163 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "autoname": "naming_series:",
+ "creation": "2026-07-30 10:54:38.771215",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "posting_date",
+  "production_plan_number",
+  "column_break_ejou",
+  "company",
+  "material_transfer_on",
+  "warehouse_section",
+  "source_warehouse",
+  "target_warehouse",
+  "column_break_sozm",
+  "work_in_progress_warehouse",
+  "scrape_warhouse",
+  "section_break_btac",
+  "items_to_be_manufacture",
+  "operation_tab_tab",
+  "operations",
+  "section_break_xrgg",
+  "required_items"
+ ],
+ "fields": [
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "MWO-.YYYY.-.##"
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Posting Date",
+   "reqd": 1
+  },
+  {
+   "fieldname": "production_plan_number",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Production Plan Number",
+   "options": "Production Plan",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_ejou",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fetch_from": "production_plan_number.company",
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "material_transfer_on",
+   "fieldtype": "Select",
+   "label": "Material Transfer On ",
+   "options": "\nWork Oder\nJob Card"
+  },
+  {
+   "fieldname": "warehouse_section",
+   "fieldtype": "Section Break",
+   "label": "Warehouse"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "label": "Source Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "target_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "column_break_sozm",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "work_in_progress_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "scrape_warhouse",
+   "fieldtype": "Link",
+   "label": "Scrape Warhouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "section_break_btac",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "items_to_be_manufacture",
+   "fieldtype": "Table",
+   "label": "Items To be manufacture",
+   "options": "Master Work Order Item"
+  },
+  {
+   "fieldname": "operations",
+   "fieldtype": "Table",
+   "label": "Operations",
+   "options": "Master Work Order Operation"
+  },
+  {
+   "fieldname": "section_break_xrgg",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "required_items",
+   "fieldtype": "Table",
+   "label": "Required Items",
+   "options": "Master Work Order Required Item"
+  },
+  {
+   "fieldname": "operation_tab_tab",
+   "fieldtype": "Tab Break",
+   "label": "Operation"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-07-30 15:44:34.380615",
+ "modified_by": "Administrator",
+ "module": "Textile Manufacturing",
+ "name": "Master Work Order",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}
