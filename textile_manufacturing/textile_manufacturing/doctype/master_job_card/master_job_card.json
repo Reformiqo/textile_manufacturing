@@ -1,0 +1,410 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "autoname": "naming_series: naming_series",
+ "creation": "2026-07-31 15:52:34.823336",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_break_8nem",
+  "naming_series",
+  "amended_from",
+  "posting_date",
+  "company",
+  "production_plan_number",
+  "master_work_order_number",
+  "operation_name",
+  "opration_sequence_no",
+  "previous_opration_master_job_card",
+  "workstation_type",
+  "workstation",
+  "manufacturing_type",
+  "status",
+  "hold_reason",
+  "expected_start_date",
+  "expected_end_date",
+  "actual_start_date",
+  "actual_end_date",
+  "material_transfer_on",
+  "column_break_wpxd",
+  "total_sfg_stock_out_qty",
+  "total_sfg_stock_in_qty",
+  "sfg_balance_qty",
+  "project",
+  "cost_center",
+  "quality_inspection_requied",
+  "quality_inspection_template",
+  "total_qty_to_manufacture",
+  "total_completed_qty",
+  "total_process_loss_qty",
+  "total_rejected_qty",
+  "total_pending_qty",
+  "total_standerd_time",
+  "total_actual_time",
+  "hour_rate",
+  "total_operating_cost",
+  "warehouses_section",
+  "source_warehouse",
+  "work_in_progress_warehouse",
+  "column_break_vnqp",
+  "target_warehouse",
+  "scrape_warhouse",
+  "sfg_warehouse",
+  "section_break_knyb",
+  "remarks",
+  "material_tab",
+  "required_item",
+  "time_tab",
+  "time_log",
+  "section_break_mulk",
+  "employee",
+  "sfg_tab",
+  "sfg_stock",
+  "scrap_tab",
+  "scrap_item"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_break_8nem",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Master Job Card",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Datetime",
+   "label": "Posting Date"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "fieldname": "production_plan_number",
+   "fieldtype": "Link",
+   "label": "Production Plan Number",
+   "options": "Production Plan"
+  },
+  {
+   "fieldname": "master_work_order_number",
+   "fieldtype": "Link",
+   "label": "Master Work Order Number",
+   "options": "Master Work Order"
+  },
+  {
+   "fieldname": "operation_name",
+   "fieldtype": "Link",
+   "label": "Operation Name",
+   "options": "Operation"
+  },
+  {
+   "fieldname": "opration_sequence_no",
+   "fieldtype": "Int",
+   "label": "Opration Sequence No"
+  },
+  {
+   "fieldname": "previous_opration_master_job_card",
+   "fieldtype": "Link",
+   "label": "Previous Opration Master Job Card",
+   "options": "Master Job Card"
+  },
+  {
+   "fieldname": "workstation_type",
+   "fieldtype": "Link",
+   "label": "Workstation Type",
+   "options": "Workstation Type"
+  },
+  {
+   "fieldname": "workstation",
+   "fieldtype": "Link",
+   "label": "Workstation",
+   "options": "Workstation"
+  },
+  {
+   "fieldname": "manufacturing_type",
+   "fieldtype": "Select",
+   "label": "Manufacturing Type",
+   "options": "\nIn-House"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Draft\nOpen\nMaterial Transferred\nWork In Progress\nOn Hold\nCompleted,Cancelled"
+  },
+  {
+   "fieldname": "hold_reason",
+   "fieldtype": "Small Text",
+   "label": "Hold Reason"
+  },
+  {
+   "fieldname": "expected_start_date",
+   "fieldtype": "Datetime",
+   "label": "Expected Start Date"
+  },
+  {
+   "fieldname": "expected_end_date",
+   "fieldtype": "Datetime",
+   "label": "Expected End Date"
+  },
+  {
+   "fieldname": "actual_start_date",
+   "fieldtype": "Datetime",
+   "label": "Actual Start Date"
+  },
+  {
+   "fieldname": "actual_end_date",
+   "fieldtype": "Datetime",
+   "label": "Actual End Date"
+  },
+  {
+   "fieldname": "material_transfer_on",
+   "fieldtype": "Select",
+   "label": "Material Transfer On",
+   "options": "\nWork Oder\nJob Card"
+  },
+  {
+   "fieldname": "warehouses_section",
+   "fieldtype": "Section Break",
+   "label": "Warehouses"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "label": "Source Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "work_in_progress_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "column_break_vnqp",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "target_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "scrape_warhouse",
+   "fieldtype": "Link",
+   "label": "Scrape Warhouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "sfg_warehouse",
+   "fieldtype": "Link",
+   "label": "SFG Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "column_break_wpxd",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_sfg_stock_out_qty",
+   "fieldtype": "Float",
+   "label": "Total SFG Stock Out Qty",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_sfg_stock_in_qty",
+   "fieldtype": "Float",
+   "label": "Total SFG Stock In Qty",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "sfg_balance_qty",
+   "fieldtype": "Float",
+   "label": "SFG Balance Qty",
+   "precision": "2"
+  },
+  {
+   "fieldname": "project",
+   "fieldtype": "Link",
+   "label": "Project",
+   "options": "Project"
+  },
+  {
+   "fieldname": "cost_center",
+   "fieldtype": "Link",
+   "label": "Cost Center",
+   "options": "Cost Center"
+  },
+  {
+   "default": "0",
+   "fieldname": "quality_inspection_requied",
+   "fieldtype": "Check",
+   "label": "Quality Inspection Requied"
+  },
+  {
+   "fieldname": "quality_inspection_template",
+   "fieldtype": "Link",
+   "label": "Quality Inspection Template",
+   "options": "Quality Inspection Template"
+  },
+  {
+   "fieldname": "total_qty_to_manufacture",
+   "fieldtype": "Float",
+   "label": "Total Qty to Manufacture"
+  },
+  {
+   "fieldname": "total_completed_qty",
+   "fieldtype": "Float",
+   "label": "Total Completed Qty"
+  },
+  {
+   "fieldname": "total_process_loss_qty",
+   "fieldtype": "Float",
+   "label": "Total Process Loss Qty"
+  },
+  {
+   "fieldname": "total_rejected_qty",
+   "fieldtype": "Float",
+   "label": "Total Rejected Qty"
+  },
+  {
+   "fieldname": "total_pending_qty",
+   "fieldtype": "Float",
+   "label": "Total Pending Qty"
+  },
+  {
+   "fieldname": "total_standerd_time",
+   "fieldtype": "Float",
+   "label": "Total Standerd Time"
+  },
+  {
+   "fieldname": "total_actual_time",
+   "fieldtype": "Float",
+   "label": "Total Actual Time"
+  },
+  {
+   "fieldname": "hour_rate",
+   "fieldtype": "Currency",
+   "label": "Hour Rate"
+  },
+  {
+   "fieldname": "total_operating_cost",
+   "fieldtype": "Currency",
+   "label": "Total Operating Cost"
+  },
+  {
+   "fieldname": "section_break_knyb",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks"
+  },
+  {
+   "fieldname": "material_tab",
+   "fieldtype": "Tab Break",
+   "label": "Material"
+  },
+  {
+   "fieldname": "required_item",
+   "fieldtype": "Table",
+   "label": "Required Item",
+   "options": "Master Job Card Required Item"
+  },
+  {
+   "fieldname": "time_tab",
+   "fieldtype": "Tab Break",
+   "label": "Time"
+  },
+  {
+   "fieldname": "time_log",
+   "fieldtype": "Table",
+   "label": "Time Log",
+   "options": "Job Card Time Log"
+  },
+  {
+   "fieldname": "section_break_mulk",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "employee",
+   "fieldtype": "Table",
+   "label": "Employee",
+   "options": "Master Job Card Employee"
+  },
+  {
+   "fieldname": "sfg_tab",
+   "fieldtype": "Tab Break",
+   "label": "SFG"
+  },
+  {
+   "fieldname": "sfg_stock",
+   "fieldtype": "Table",
+   "label": "SFG Stock",
+   "options": "Master SFG Stock"
+  },
+  {
+   "fieldname": "scrap_tab",
+   "fieldtype": "Tab Break",
+   "label": "Scrap"
+  },
+  {
+   "fieldname": "scrap_item",
+   "fieldtype": "Table",
+   "label": "Scrap Item",
+   "options": "Master Job Card Scrap Item"
+  },
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "MJC-.YYYY.-.#####"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-07-31 17:09:19.138836",
+ "modified_by": "Administrator",
+ "module": "Textile Manufacturing",
+ "name": "Master Job Card",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

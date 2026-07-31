@@ -3,7 +3,7 @@ frappe.ui.form.on("Production Plan", {
         // Remove standard buttons
         frm.remove_custom_button(__("Work Order / Subcontract PO"), __("Create"));
 
-        if (frm.doc.status !== "Completed") {
+        if (frm.doc.status !== "Completed" && frm.doc.docstatus == 1) {
             let items = frm.events.get_items_for_work_order(frm);
             if (items?.length && frm.doc.status !== "Closed") {
 					frm.add_custom_button(__("Master Work Order"),
@@ -29,6 +29,7 @@ function make_master_word_order(frm){
         },
         callback: function () {
             frappe.show_alert({ message: __("Master Work Order Created"), indicator: "green" });
+            frm.reload_doc();
         },
     });
 }

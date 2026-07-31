@@ -21,7 +21,19 @@ frappe.ui.form.on("Master Work Order", {
             return;
         }
 
-        create_master_word_order(frm)
+        frm.call({
+            method: "fetch_from_production_plan",
+            doc: frm.doc,
+            freeze: true,
+            freeze_message: __("Fetching details from Production Plan..."),
+            callback: function () {
+                frm.refresh_fields();
+                frappe.show_alert({
+                    message: __("Details fetched from Production Plan"),
+                    indicator: "green",
+                });
+            },
+        });
     },
 
     // Whenever parent warehouse fields change, push the update to all existing rows
@@ -39,41 +51,6 @@ frappe.ui.form.on("Master Work Order", {
     },
 });
 
-
-function fetch_production_plan_items(frm){
-    frappe.call({
-        method: "frappe.client.get",
-        args: {
-            doctype: "Production Plan",
-            name: frm.doc.production_plan_number,
-        },
-        callback: function (r) {
-            if (!r.message) return;
-
-            const plan = r.message;
-            frm.clear_table("items_to_be_manufacture");
-
-            (plan.po_items || []).forEach((item) => {
-                const child = frm.add_child("items_to_be_manufacture");
-
-                // From Production Plan
-                child.item_code = item.item_code;
-                child.production_plan_number = frm.doc.production_plan_number;
-                child.qty_to_manufacture = item.planned_qty;
-                child.bom_no = item.bom_no
-
-                // Auto-fetch from parent warehouse fields
-                set_child_warehouses(frm, child);
-            });
-
-            frm.refresh_field("items_to_be_manufacture");
-            frappe.show_alert({
-                message: __("Items fetched from Production Plan"),
-                indicator: "green",
-            });
-        },
-    });
-}
 
 function set_child_warehouses(frm, child) {
     child.source_warehouse = frm.doc.source_warehouse;

@@ -2,7 +2,7 @@
  "actions": [],
  "allow_bulk_edit": 1,
  "allow_rename": 1,
- "creation": "2026-07-30 12:52:56.936757",
+ "creation": "2026-07-31 16:26:20.221032",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
@@ -11,14 +11,16 @@
   "item_name",
   "uom",
   "source_warehouse",
-  "available_qty",
+  "batch_no",
   "requried_qty",
+  "available_qty",
   "transfer_qty",
-  "return_qty",
   "consumed_qty",
+  "return_qty",
   "pending_transfer_qty",
   "rate",
-  "amount"
+  "amount",
+  "stock_entry_reference"
  ],
  "fields": [
   {
@@ -26,66 +28,67 @@
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Item Code",
-   "options": "Item",
-   "reqd": 1
+   "options": "Item"
   },
   {
-   "fetch_from": "item_code.item_name",
    "fieldname": "item_name",
-   "fieldtype": "Link",
-   "in_list_view": 1,
-   "label": "Item Name",
-   "options": "Item"
+   "fieldtype": "Data",
+   "label": "Item Name"
   },
   {
    "fieldname": "uom",
    "fieldtype": "Link",
-   "in_list_view": 1,
    "label": "UOM",
    "options": "UOM"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Source Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "batch_no",
+   "fieldtype": "Link",
+   "label": "Batch No",
+   "options": "Batch"
   },
   {
    "default": "0",
    "fieldname": "requried_qty",
    "fieldtype": "Float",
+   "in_list_view": 1,
    "label": "Requried Qty",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "available_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Available Qty",
    "precision": "2"
   },
   {
    "default": "0",
    "fieldname": "transfer_qty",
    "fieldtype": "Float",
-   "in_list_view": 1,
    "label": "Transfer Qty",
-   "precision": "2"
-  },
-  {
-   "default": "0",
-   "fieldname": "return_qty",
-   "fieldtype": "Float",
-   "in_list_view": 1,
-   "label": "Return Qty",
    "precision": "2"
   },
   {
    "default": "0",
    "fieldname": "consumed_qty",
    "fieldtype": "Float",
-   "in_list_view": 1,
    "label": "Consumed Qty",
    "precision": "2"
   },
   {
-   "fieldname": "source_warehouse",
-   "fieldtype": "Link",
-   "label": "Source Warehouse",
-   "options": "Warehouse"
-  },
-  {
    "default": "0",
-   "fieldname": "available_qty",
+   "fieldname": "return_qty",
    "fieldtype": "Float",
-   "label": "Available Qty",
+   "label": "Return Qty",
    "precision": "2"
   },
   {
@@ -96,25 +99,34 @@
    "precision": "2"
   },
   {
+   "default": "0",
    "fieldname": "rate",
    "fieldtype": "Currency",
    "label": "Rate",
-   "read_only": 1
+   "precision": "2"
   },
   {
+   "default": "0",
    "fieldname": "amount",
    "fieldtype": "Currency",
-   "label": "Amount"
+   "label": "Amount",
+   "precision": "2"
+  },
+  {
+   "fieldname": "stock_entry_reference",
+   "fieldtype": "Link",
+   "label": "Stock Entry Reference",
+   "options": "Stock Entry"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-31 14:59:53.028403",
+ "modified": "2026-07-31 17:06:48.543762",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
- "name": "Master Work Order Required Item",
+ "name": "Master Job Card Required Item",
  "owner": "Administrator",
  "permissions": [],
  "row_format": "Dynamic",

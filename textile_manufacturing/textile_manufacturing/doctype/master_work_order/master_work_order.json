@@ -10,21 +10,42 @@
   "naming_series",
   "posting_date",
   "production_plan_number",
+  "sales_order_number",
+  "customer",
+  "project",
+  "cost_center",
+  "status",
+  "planned_start_date",
+  "planned_end_date",
+  "actual_start_date",
+  "actual_end_date",
   "column_break_ejou",
   "company",
   "material_transfer_on",
+  "use_multi_level_bom",
+  "skip_material_transfer_to_wip_warehouse",
+  "total_qty_to_manufacture",
+  "total_manufacture_qty",
+  "total_raw_material_cost",
+  "total_operating_cost",
   "warehouse_section",
   "source_warehouse",
   "target_warehouse",
   "column_break_sozm",
   "work_in_progress_warehouse",
   "scrape_warhouse",
+  "sfg_warehouse",
   "section_break_btac",
   "items_to_be_manufacture",
+  "section_break_rjpp",
+  "remarks",
   "operation_tab_tab",
   "operations",
   "section_break_xrgg",
-  "required_items"
+  "required_items",
+  "amended_from",
+  "scrap_tab",
+  "scrap_item"
  ],
  "fields": [
   {
@@ -130,12 +151,135 @@
    "fieldname": "operation_tab_tab",
    "fieldtype": "Tab Break",
    "label": "Operation"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Master Work Order",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "sales_order_number",
+   "fieldtype": "Link",
+   "label": "Sales Order Number",
+   "options": "Sales Order"
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer"
+  },
+  {
+   "fieldname": "project",
+   "fieldtype": "Link",
+   "label": "Project",
+   "options": "Project"
+  },
+  {
+   "fieldname": "cost_center",
+   "fieldtype": "Link",
+   "label": "Cost Center",
+   "options": "Cost Center"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Draft\nNot Started\nIn Process\nCompleted\nStopped\nCancelled"
+  },
+  {
+   "fieldname": "planned_start_date",
+   "fieldtype": "Datetime",
+   "label": "Planned Start Date"
+  },
+  {
+   "fieldname": "planned_end_date",
+   "fieldtype": "Datetime",
+   "label": "Planned End Date"
+  },
+  {
+   "fieldname": "actual_start_date",
+   "fieldtype": "Datetime",
+   "label": "Actual Start Date"
+  },
+  {
+   "fieldname": "actual_end_date",
+   "fieldtype": "Datetime",
+   "label": "Actual End Date"
+  },
+  {
+   "default": "1",
+   "fieldname": "use_multi_level_bom",
+   "fieldtype": "Check",
+   "label": "Use Multi-Level BOM"
+  },
+  {
+   "default": "0",
+   "fieldname": "skip_material_transfer_to_wip_warehouse",
+   "fieldtype": "Check",
+   "label": "Skip Material Transfer to WIP Warehouse"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_qty_to_manufacture",
+   "fieldtype": "Float",
+   "label": "Total Qty to Manufacture",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_manufacture_qty",
+   "fieldtype": "Float",
+   "label": "Total Manufacture Qty",
+   "precision": "2"
+  },
+  {
+   "fieldname": "total_raw_material_cost",
+   "fieldtype": "Currency",
+   "label": "Total Raw Material Cost"
+  },
+  {
+   "fieldname": "total_operating_cost",
+   "fieldtype": "Currency",
+   "label": "Total Operating Cost"
+  },
+  {
+   "fieldname": "sfg_warehouse",
+   "fieldtype": "Link",
+   "label": "SFG Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "section_break_rjpp",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks"
+  },
+  {
+   "fieldname": "scrap_tab",
+   "fieldtype": "Tab Break",
+   "label": "Scrap"
+  },
+  {
+   "fieldname": "scrap_item",
+   "fieldtype": "Table",
+   "label": "Scrap Item",
+   "options": "Master Work Order Scrap Item"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
+ "is_submittable": 1,
  "links": [],
- "modified": "2026-07-30 15:44:34.380615",
+ "modified": "2026-07-31 14:12:52.718428",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order",

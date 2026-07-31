@@ -7,11 +7,27 @@
  "editable_grid": 1,
  "engine": "InnoDB",
  "field_order": [
+  "opration_sequence_no",
   "opration_name",
   "workstation",
   "workstation_type",
+  "manufacturing_type",
+  "supplier",
+  "service_item",
+  "job_work_rate",
+  "material_sent_qty",
+  "received_qty",
   "standerd_time",
-  "manufacturing_type"
+  "actual_time",
+  "hour_rate",
+  "operating_cost",
+  "master_job_card_number",
+  "subcontracting_po_number",
+  "total_qty_to_manufacture",
+  "completed_qty",
+  "pending_qty",
+  "pending_master_job_card",
+  "status"
  ],
  "fields": [
   {
@@ -38,7 +54,6 @@
   {
    "fieldname": "standerd_time",
    "fieldtype": "Float",
-   "in_list_view": 1,
    "label": "Standerd Time"
   },
   {
@@ -47,13 +62,97 @@
    "in_list_view": 1,
    "label": "Manufacturing Type",
    "options": "\nIn-House\nOut House"
+  },
+  {
+   "fieldname": "opration_sequence_no",
+   "fieldtype": "Int",
+   "label": "Opration Sequence No"
+  },
+  {
+   "fieldname": "supplier",
+   "fieldtype": "Link",
+   "label": "Supplier",
+   "options": "Supplier"
+  },
+  {
+   "fieldname": "service_item",
+   "fieldtype": "Link",
+   "label": "Service Item",
+   "options": "Item"
+  },
+  {
+   "fieldname": "job_work_rate",
+   "fieldtype": "Currency",
+   "label": "Job Work Rate"
+  },
+  {
+   "fieldname": "material_sent_qty",
+   "fieldtype": "Float",
+   "label": "Material Sent Qty"
+  },
+  {
+   "fieldname": "received_qty",
+   "fieldtype": "Float",
+   "label": "Received Qty"
+  },
+  {
+   "fieldname": "actual_time",
+   "fieldtype": "Float",
+   "label": "Actual Time"
+  },
+  {
+   "fieldname": "hour_rate",
+   "fieldtype": "Currency",
+   "label": "Hour Rate"
+  },
+  {
+   "fieldname": "operating_cost",
+   "fieldtype": "Currency",
+   "label": "Operating Cost"
+  },
+  {
+   "fieldname": "master_job_card_number",
+   "fieldtype": "Data",
+   "label": "Master Job Card Number"
+  },
+  {
+   "fieldname": "subcontracting_po_number",
+   "fieldtype": "Link",
+   "label": "Subcontracting PO Number",
+   "options": "Purchase Order"
+  },
+  {
+   "fieldname": "total_qty_to_manufacture",
+   "fieldtype": "Float",
+   "label": "Total Qty to Manufacture"
+  },
+  {
+   "fieldname": "completed_qty",
+   "fieldtype": "Float",
+   "label": "Completed Qty"
+  },
+  {
+   "fieldname": "pending_qty",
+   "fieldtype": "Float",
+   "label": "Pending Qty"
+  },
+  {
+   "fieldname": "pending_master_job_card",
+   "fieldtype": "Data",
+   "label": "Pending Master Job Card"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "\nPending\nWork In Progress\nCompleted"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-31 11:27:04.950819",
+ "modified": "2026-07-31 13:13:03.554117",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Operation",
