@@ -68,14 +68,17 @@ class MasterWorkOrder(Document):
         work_order.operations = in_house_operations
 
 
-    def on_cancel(self):
-        for row in self.items_to_be_manufacture:
-            if not row.work_order_number:
-                continue
+    def before_cancel(self):
+        self.validate_linked_docs_cancelled()
 
-            wo = frappe.get_doc("Work Order", row.work_order_number)
-            if wo.docstatus == 1:
-                wo.cancel()
+    def validate_linked_docs_cancelled(self):
+        pending = []
+
+        for row in self.items_to_be_manufacture:
+            if row.work_order_number and frappe.db.get_value(
+                "Work Order", row.work_order_number, "docstatus"
+            ) == 1:
+                pending.append(("Work Order {0}").format(row.work_order_number))
 
 
     @frappe.whitelist()

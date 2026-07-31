@@ -67,7 +67,8 @@
    "in_list_view": 1,
    "label": "Production Plan Number",
    "options": "Production Plan",
-   "reqd": 1
+   "reqd": 1,
+   "unique": 1
   },
   {
    "fieldname": "column_break_ejou",

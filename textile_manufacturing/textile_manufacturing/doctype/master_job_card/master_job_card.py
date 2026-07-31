@@ -244,23 +244,38 @@ class MasterJobCard(Document):
                 log.time_in_mins = flt(time_diff_in_seconds(log.to_time, log.from_time)) / 60.0
 
     def calculate_detail_rows(self):
-        # actual_time per detail row = sum of matching time logs (by job card)
+        # Roll up the time logs back to the detail row they belong to (by job card):
+        # actual time, and the completed / rejected qty reported against it.
         actual_by_jc = {}
+        completed_by_jc = {}
+        rejected_by_jc = {}
         for log in self.time_log:
-            if log.job_card_number:
-                actual_by_jc[log.job_card_number] = (
-                    actual_by_jc.get(log.job_card_number, 0.0) + flt(log.time_in_mins)
-                )
+            if not log.job_card_number:
+                continue
+            actual_by_jc[log.job_card_number] = (
+                actual_by_jc.get(log.job_card_number, 0.0) + flt(log.time_in_mins)
+            )
+            completed_by_jc[log.job_card_number] = (
+                completed_by_jc.get(log.job_card_number, 0.0) + flt(log.completed_qty)
+            )
+            rejected_by_jc[log.job_card_number] = (
+                rejected_by_jc.get(log.job_card_number, 0.0) + flt(log.rejected_qty)
+            )
 
         for row in (self.get("job_card_detail") or []):
+            if row.job_card_number:
+                row.actual_time = actual_by_jc.get(row.job_card_number, 0.0)
+                if row.job_card_number in completed_by_jc:
+                    row.completed_qty = completed_by_jc[row.job_card_number]
+                if row.job_card_number in rejected_by_jc:
+                    row.rejected_qty = rejected_by_jc[row.job_card_number]
+
             row.pending_qty = (
                 flt(row.qty_to_manufacture)
                 - flt(row.completed_qty)
                 - flt(row.process_loss_qty)
                 - flt(row.rejected_qty)
             )
-            if row.job_card_number:
-                row.actual_time = actual_by_jc.get(row.job_card_number, 0.0)
 
     def calculate_required_items(self):
         for row in self.required_item:

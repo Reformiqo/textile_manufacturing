@@ -8,17 +8,23 @@ frappe.ui.form.on("Master Work Order", {
         frm.add_custom_button(__("Job Card"), () => {
         }, __("Create"));
 
-        frm.add_custom_button(__("Start Work Order"), () => {
-            frm.call({
-                method: "start_job_card",
-                doc: frm.doc,
-                freeze: true,
-                freeze_message: __("Creating Master Job Cards..."),
-                callback: function(r){
-                    frm.reload_doc();
-                }
-            })
-        }, __("Create"));
+        // Show Start only until Master Job Cards have been created for this MWO.
+        const has_master_job_card = (frm.doc.operations || []).some(
+            (op) => op.master_job_card_number
+        );
+        if (!has_master_job_card) {
+            frm.add_custom_button(__("Start Work Order"), () => {
+                frm.call({
+                    method: "start_job_card",
+                    doc: frm.doc,
+                    freeze: true,
+                    freeze_message: __("Creating Master Job Cards..."),
+                    callback: function () {
+                        frm.reload_doc();
+                    },
+                });
+            }, __("Create"));
+        }
 
         frm.add_custom_button(__("Finish Work Order"), () => {
         }, __("Create"));

@@ -6,6 +6,7 @@ frappe.ui.form.on("Master Job Card", {
         if (frm.doc.master_work_order_number) {
             load_inhouse_operations(frm);
         }
+        toggle_material_tab(frm);
     },
 
     master_work_order_number: function (frm) {
@@ -16,6 +17,10 @@ frappe.ui.form.on("Master Job Card", {
         load_inhouse_operations(frm);
     },
 
+    material_transfer_on: function (frm) {
+        toggle_material_tab(frm);
+    },
+
     operation_name: function (frm) {
         if (!frm.doc.master_work_order_number || !frm.doc.operation_name) {
             return;
@@ -23,6 +28,13 @@ frappe.ui.form.on("Master Job Card", {
         fetch_from_master_work_order(frm);
     },
 });
+
+
+function toggle_material_tab(frm) {
+    const read_only = frm.doc.material_transfer_on === "Work Oder";
+    frm.set_df_property("required_item", "read_only", read_only ? 1 : 0);
+    frm.refresh_field("required_item");
+}
 
 
 function load_inhouse_operations(frm) {
