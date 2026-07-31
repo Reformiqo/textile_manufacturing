@@ -33,7 +33,7 @@ class MasterJobCard(Document):
 
         self._set_header_from_mwo(mwo)
         self._set_operation_details(mwo)
-        # self._set_detail_rows(mwo)
+        self._set_detail_rows(mwo)
         self._set_required_items(mwo)
         self._set_scrap_items()
 
@@ -114,40 +114,40 @@ class MasterJobCard(Document):
             fields=["operation", "workstation", "time_in_mins"],
         )
 
-    # def _set_detail_rows(self, mwo):
-    #     """One row per MWO item (work order) whose BOM includes this operation."""
-    #     self.set("job_card_detail", [])
+    def _set_detail_rows(self, mwo):
+        """One row per MWO item (work order) whose BOM includes this operation."""
+        self.set("job_card_detail", [])
 
-    #     for item in mwo.items_to_be_manufacture:
-    #         if not item.bom_no:
-    #             continue
+        for item in mwo.items_to_be_manufacture:
+            if not item.bom_no:
+                continue
 
-    #         bom_op = next(
-    #             (r for r in self._bom_operation_rows(item.bom_no)
-    #              if r.operation == self.operation_name),
-    #             None,
-    #         )
-    #         if not bom_op:
-    #             # This work order does not run through this operation.
-    #             continue
+            bom_op = next(
+                (r for r in self._bom_operation_rows(item.bom_no)
+                 if r.operation == self.operation_name),
+                None,
+            )
+            if not bom_op:
+                # This work order does not run through this operation.
+                continue
 
-    #         item_details = frappe.get_cached_value(
-    #             "Item", item.item_code, ["item_name", "stock_uom"], as_dict=True
-    #         ) or frappe._dict()
+            item_details = frappe.get_cached_value(
+                "Item", item.item_code, ["item_name", "stock_uom"], as_dict=True
+            ) or frappe._dict()
 
-    #         self.append("job_card_detail", {
-    #             "item_code": item.item_code,
-    #             "item_name": item_details.get("item_name"),
-    #             "uom": item.get("uom") or item_details.get("stock_uom"),
-    #             "production_plan_number": item.get("production_plan_number") or mwo.production_plan_number,
-    #             "work_order_number": item.get("work_order_number"),
-    #             "bom_no": item.bom_no,
-    #             "operation_name": self.operation_name,
-    #             "workstation": bom_op.workstation or self.workstation,
-    #             "qty_to_manufacture": item.qty_to_manufacture,
-    #             "standerd_time": bom_op.time_in_mins,
-    #             "status": "Open",
-    #         })
+            self.append("job_card_detail", {
+                "item_code": item.item_code,
+                "item_name": item_details.get("item_name"),
+                "uom": item.get("uom") or item_details.get("stock_uom"),
+                "production_plan_number": item.get("production_plan_number") or mwo.production_plan_number,
+                "work_order_number": item.get("work_order_number"),
+                "bom_no": item.bom_no,
+                "operation_name": self.operation_name,
+                "workstation": bom_op.workstation or self.workstation,
+                "qty_to_manufacture": item.qty_to_manufacture,
+                "standerd_time": bom_op.time_in_mins,
+                "status": "Open",
+            })
 
     def _set_required_items(self, mwo):
         """Consolidate the required items of every work order (MWO item) whose

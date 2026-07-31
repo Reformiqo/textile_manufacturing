@@ -53,6 +53,8 @@
   "sfg_warehouse",
   "section_break_knyb",
   "remarks",
+  "detail_tab",
+  "job_card_detail",
   "material_tab",
   "required_item",
   "time_tab",
@@ -321,6 +323,17 @@
    "fieldname": "remarks",
    "fieldtype": "Small Text",
    "label": "Remarks"
+  },
+  {
+   "fieldname": "detail_tab",
+   "fieldtype": "Tab Break",
+   "label": "Job Card Detail"
+  },
+  {
+   "fieldname": "job_card_detail",
+   "fieldtype": "Table",
+   "label": "Job Card Detail",
+   "options": "Master Job Card Detail"
   },
   {
    "fieldname": "material_tab",

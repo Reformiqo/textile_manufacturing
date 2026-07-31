@@ -37,11 +37,14 @@
    "options": "Item"
   },
   {
+   "fetch_from": "item_code.item_name",
    "fieldname": "item_name",
    "fieldtype": "Data",
-   "label": "Item Name"
+   "label": "Item Name",
+   "read_only": 1
   },
   {
+   "fetch_from": "item_code.stock_uom",
    "fieldname": "uom",
    "fieldtype": "Link",
    "label": "UOM",
@@ -88,12 +91,14 @@
    "options": "Master Job Card"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "stock_entry_reference",
    "fieldtype": "Link",
    "label": "Stock Entry Reference",
    "options": "Stock Entry"
   },
   {
+   "default": "Now",
    "fieldname": "posting_date",
    "fieldtype": "Datetime",
    "label": "Posting Date"

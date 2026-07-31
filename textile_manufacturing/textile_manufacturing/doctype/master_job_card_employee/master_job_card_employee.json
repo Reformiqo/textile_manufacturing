@@ -25,21 +25,24 @@
    "fieldname": "employee_name",
    "fieldtype": "Data",
    "in_list_view": 1,
-   "label": "Employee Name"
+   "label": "Employee Name",
+   "read_only": 1
   },
   {
    "fetch_from": "employee.designation",
    "fieldname": "designation",
-   "fieldtype": "Data",
+   "fieldtype": "Link",
    "in_list_view": 1,
-   "label": "Designation"
+   "label": "Designation",
+   "options": "Designation",
+   "read_only": 1
   },
   {
-   "fetch_from": "employee.default_shift",
    "fieldname": "shift",
-   "fieldtype": "Data",
+   "fieldtype": "Link",
    "in_list_view": 1,
-   "label": "Shift"
+   "label": "Shift",
+   "options": "Shift Type"
   }
  ],
  "grid_page_length": 50,
