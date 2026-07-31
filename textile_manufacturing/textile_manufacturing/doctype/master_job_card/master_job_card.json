@@ -11,9 +11,9 @@
   "naming_series",
   "amended_from",
   "posting_date",
+  "master_work_order_number",
   "company",
   "production_plan_number",
-  "master_work_order_number",
   "operation_name",
   "opration_sequence_no",
   "previous_opration_master_job_card",
@@ -46,10 +46,10 @@
   "total_operating_cost",
   "warehouses_section",
   "source_warehouse",
-  "work_in_progress_warehouse",
+  "wip_warehouse",
   "column_break_vnqp",
-  "target_warehouse",
-  "scrape_warhouse",
+  "fg_warehouse",
+  "scrap_warehouse",
   "sfg_warehouse",
   "section_break_knyb",
   "remarks",
@@ -80,11 +80,13 @@
    "search_index": 1
   },
   {
+   "default": "Now",
    "fieldname": "posting_date",
    "fieldtype": "Datetime",
    "label": "Posting Date"
   },
   {
+   "fetch_from": "master_work_order_number.company",
    "fieldname": "company",
    "fieldtype": "Link",
    "label": "Company",
@@ -135,7 +137,8 @@
    "fieldname": "manufacturing_type",
    "fieldtype": "Select",
    "label": "Manufacturing Type",
-   "options": "\nIn-House"
+   "options": "In-House",
+   "read_only": 1
   },
   {
    "fieldname": "status",
@@ -146,7 +149,8 @@
   {
    "fieldname": "hold_reason",
    "fieldtype": "Small Text",
-   "label": "Hold Reason"
+   "label": "Hold Reason",
+   "mandatory_depends_on": "eval: doc.status == \"On Hold\""
   },
   {
    "fieldname": "expected_start_date",
@@ -169,6 +173,7 @@
    "label": "Actual End Date"
   },
   {
+   "fetch_from": "master_work_order_number.material_transfer_on",
    "fieldname": "material_transfer_on",
    "fieldtype": "Select",
    "label": "Material Transfer On",
@@ -186,7 +191,7 @@
    "options": "Warehouse"
   },
   {
-   "fieldname": "work_in_progress_warehouse",
+   "fieldname": "wip_warehouse",
    "fieldtype": "Link",
    "label": "Work in Progress Warehouse",
    "options": "Warehouse"
@@ -196,13 +201,13 @@
    "fieldtype": "Column Break"
   },
   {
-   "fieldname": "target_warehouse",
+   "fieldname": "fg_warehouse",
    "fieldtype": "Link",
    "label": "Target Warehouse",
    "options": "Warehouse"
   },
   {
-   "fieldname": "scrape_warhouse",
+   "fieldname": "scrap_warehouse",
    "fieldtype": "Link",
    "label": "Scrape Warhouse",
    "options": "Warehouse"
@@ -257,6 +262,7 @@
    "label": "Quality Inspection Requied"
   },
   {
+   "depends_on": "eval: doc.quality_inspection_requied == 1",
    "fieldname": "quality_inspection_template",
    "fieldtype": "Link",
    "label": "Quality Inspection Template",
@@ -381,7 +387,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-07-31 17:09:19.138836",
+ "modified": "2026-07-31 18:15:24.272904",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",

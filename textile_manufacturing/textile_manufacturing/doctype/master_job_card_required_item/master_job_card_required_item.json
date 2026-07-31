@@ -68,7 +68,8 @@
    "fieldtype": "Float",
    "in_list_view": 1,
    "label": "Available Qty",
-   "precision": "2"
+   "precision": "2",
+   "read_only": 1
   },
   {
    "default": "0",
@@ -103,7 +104,8 @@
    "fieldname": "rate",
    "fieldtype": "Currency",
    "label": "Rate",
-   "precision": "2"
+   "precision": "2",
+   "read_only": 1
   },
   {
    "default": "0",
@@ -113,6 +115,7 @@
    "precision": "2"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "stock_entry_reference",
    "fieldtype": "Link",
    "label": "Stock Entry Reference",

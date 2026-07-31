@@ -10,7 +10,7 @@
   "item_code",
   "item_name",
   "uom",
-  "scrape_warhouse",
+  "scrap_warehouse",
   "scrap_qty",
   "rate",
   "amount"
@@ -59,7 +59,7 @@
    "precision": "2"
   },
   {
-   "fieldname": "scrape_warhouse",
+   "fieldname": "scrap_warehouse",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Scrape Warhouse",

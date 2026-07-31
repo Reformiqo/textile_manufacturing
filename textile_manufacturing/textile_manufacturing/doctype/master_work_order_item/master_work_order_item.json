@@ -25,10 +25,10 @@
   "pending_qty",
   "warehouses_section",
   "source_warehouse",
-  "target_warehouse",
+  "wip_warehouse",
   "column_break_xooo",
-  "work_in_progress_warehouse",
-  "scrape_warhouse"
+  "fg_warehouse",
+  "scrap_warehouse"
  ],
  "fields": [
   {
@@ -104,19 +104,7 @@
    "options": "Warehouse"
   },
   {
-   "fieldname": "target_warehouse",
-   "fieldtype": "Link",
-   "label": "Target Warehouse",
-   "options": "Warehouse"
-  },
-  {
-   "fieldname": "work_in_progress_warehouse",
-   "fieldtype": "Link",
-   "label": "Work in Progress Warehouse",
-   "options": "Warehouse"
-  },
-  {
-   "fieldname": "scrape_warhouse",
+   "fieldname": "scrap_warehouse",
    "fieldtype": "Link",
    "label": "Scrape Warhouse",
    "options": "Warehouse"
@@ -176,13 +164,25 @@
    "fieldtype": "Select",
    "label": "Status",
    "options": "\nNot Started\nIn Process\nCompleted\nStopped"
+  },
+  {
+   "fieldname": "wip_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "fg_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-31 14:37:09.062482",
+ "modified": "2026-07-31 18:06:01.911406",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Item",

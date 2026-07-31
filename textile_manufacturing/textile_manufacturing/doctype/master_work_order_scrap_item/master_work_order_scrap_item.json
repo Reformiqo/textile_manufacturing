@@ -11,7 +11,7 @@
   "item_name",
   "uom",
   "scrap_qty",
-  "scrape_warhouse"
+  "scrap_warehouse"
  ],
  "fields": [
   {
@@ -42,7 +42,7 @@
    "label": "Scrap Qty"
   },
   {
-   "fieldname": "scrape_warhouse",
+   "fieldname": "scrap_warehouse",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Scrape Warhouse",

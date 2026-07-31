@@ -140,13 +140,11 @@ doctype_js = {
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Work Order": {
+		"on_update": "textile_manufacturing.override.work_order.on_update",
+	}
+}
 
 # Scheduled Tasks
 # ---------------

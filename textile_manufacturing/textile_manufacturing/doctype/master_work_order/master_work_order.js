@@ -3,10 +3,21 @@
 
 frappe.ui.form.on("Master Work Order", {
     refresh: function(frm){
+
+        if(frm.doc.docstatus != 1) return;
         frm.add_custom_button(__("Job Card"), () => {
         }, __("Create"));
 
         frm.add_custom_button(__("Start Work Order"), () => {
+            frm.call({
+                method: "start_job_card",
+                doc: frm.doc,
+                freeze: true,
+                freeze_message: __("Creating Master Job Cards..."),
+                callback: function(r){
+                    frm.reload_doc();
+                }
+            })
         }, __("Create"));
 
         frm.add_custom_button(__("Finish Work Order"), () => {
@@ -40,13 +51,13 @@ frappe.ui.form.on("Master Work Order", {
     source_warehouse: function (frm) {
         update_all_child_warehouses(frm);
     },
-    target_warehouse: function (frm) {
+    fg_warehouse: function (frm) {
         update_all_child_warehouses(frm);
     },
-    work_in_progress_warehouse: function (frm) {
+    wip_warehouse: function (frm) {
         update_all_child_warehouses(frm);
     },
-    scrape_warhouse: function (frm) {
+    scrap_warehouse: function (frm) {
         update_all_child_warehouses(frm);
     },
 });
@@ -54,9 +65,9 @@ frappe.ui.form.on("Master Work Order", {
 
 function set_child_warehouses(frm, child) {
     child.source_warehouse = frm.doc.source_warehouse;
-    child.target_warehouse = frm.doc.target_warehouse;
-    child.work_in_progress_warehouse = frm.doc.work_in_progress_warehouse;
-    child.scrape_warhouse = frm.doc.scrape_warhouse;
+    child.fg_warehouse = frm.doc.fg_warehouse;
+    child.wip_warehouse = frm.doc.wip_warehouse;
+    child.scrap_warehouse = frm.doc.scrap_warehouse;
 }
 
 function update_all_child_warehouses(frm) {

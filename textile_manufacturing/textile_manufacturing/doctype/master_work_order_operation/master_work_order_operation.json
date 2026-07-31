@@ -111,6 +111,7 @@
    "label": "Operating Cost"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "master_job_card_number",
    "fieldtype": "Data",
    "label": "Master Job Card Number"

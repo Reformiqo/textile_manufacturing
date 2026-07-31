@@ -30,10 +30,10 @@
   "total_operating_cost",
   "warehouse_section",
   "source_warehouse",
-  "target_warehouse",
+  "wip_warehouse",
   "column_break_sozm",
-  "work_in_progress_warehouse",
-  "scrape_warhouse",
+  "fg_warehouse",
+  "scrap_warehouse",
   "sfg_warehouse",
   "section_break_btac",
   "items_to_be_manufacture",
@@ -100,26 +100,8 @@
    "options": "Warehouse"
   },
   {
-   "fieldname": "target_warehouse",
-   "fieldtype": "Link",
-   "label": "Target Warehouse",
-   "options": "Warehouse"
-  },
-  {
    "fieldname": "column_break_sozm",
    "fieldtype": "Column Break"
-  },
-  {
-   "fieldname": "work_in_progress_warehouse",
-   "fieldtype": "Link",
-   "label": "Work in Progress Warehouse",
-   "options": "Warehouse"
-  },
-  {
-   "fieldname": "scrape_warhouse",
-   "fieldtype": "Link",
-   "label": "Scrape Warhouse",
-   "options": "Warehouse"
   },
   {
    "fieldname": "section_break_btac",
@@ -203,14 +185,18 @@
    "label": "Planned End Date"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "actual_start_date",
    "fieldtype": "Datetime",
-   "label": "Actual Start Date"
+   "label": "Actual Start Date",
+   "read_only": 1
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "actual_end_date",
    "fieldtype": "Datetime",
-   "label": "Actual End Date"
+   "label": "Actual End Date",
+   "read_only": 1
   },
   {
    "default": "1",
@@ -273,13 +259,31 @@
    "fieldtype": "Table",
    "label": "Scrap Item",
    "options": "Master Work Order Scrap Item"
+  },
+  {
+   "fieldname": "wip_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "fg_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "scrap_warehouse",
+   "fieldtype": "Link",
+   "label": "Scrape Warhouse",
+   "options": "Warehouse"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-07-31 14:12:52.718428",
+ "modified": "2026-07-31 19:40:16.298483",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order",
