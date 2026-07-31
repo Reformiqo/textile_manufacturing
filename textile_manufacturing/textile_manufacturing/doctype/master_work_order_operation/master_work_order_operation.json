@@ -46,14 +46,14 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Manufacturing Type",
-   "options": "In-House\nOut House"
+   "options": "\nIn-House\nOut House"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-30 12:51:39.447798",
+ "modified": "2026-07-31 11:27:04.950819",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Operation",
