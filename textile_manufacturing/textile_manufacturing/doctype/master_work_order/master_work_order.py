@@ -15,13 +15,13 @@ class MasterWorkOrder(Document):
                     )
                 )
 
-        # for row in self.operations:
-        #     if not row.manufacturing_type:
-        #         frappe.throw(
-        #             ("Row {0}: Manufacturing Type is not set for operation {1}").format(
-        #                 row.idx, row.opration_name
-        #             )
-        #         )
+        for row in self.operations:
+            if not row.manufacturing_type:
+                frappe.throw(
+                    ("Row {0}: Manufacturing Type is not set for operation {1}").format(
+                        row.idx, row.opration_name
+                    )
+                )
 
 
     def on_submit(self):
@@ -44,6 +44,7 @@ class MasterWorkOrder(Document):
             self.set_in_house_operations(work_order)
 
             work_order.insert()
+            work_order.submit()
 
             row.db_set("work_order_number", work_order.name, update_modified=False)
 
@@ -59,11 +60,6 @@ class MasterWorkOrder(Document):
         in_house_operations = [
             op for op in work_order.operations if not op.is_subcontracted
         ]
-
-        # Re-number so the sequence has no gaps left by the skipped operations.
-        for sequence_id, op in enumerate(in_house_operations, start=1):
-            op.idx = sequence_id
-            op.sequence_id = sequence_id
 
         work_order.operations = in_house_operations
 
@@ -110,6 +106,8 @@ class MasterWorkOrder(Document):
 
         scrap_items = self.get_scrap_items(bom_ids)
         self.set_scrap_items(scrap_items)
+
+        self.set_planned_dates()
 
 
     def _make_master_work_order(self):
@@ -312,31 +310,56 @@ class MasterWorkOrder(Document):
                 "scrap_warehouse": self.scrap_warehouse,
             })
 
+    def set_planned_dates(self):
+        if not self.items_to_be_manufacture:
+            return
+
+        start = self.items_to_be_manufacture[0].planned_start_date
+        if not start:
+            return
+
+        self.planned_start_date = start
+
+        total_minutes = sum(frappe.utils.flt(op.standerd_time) for op in self.operations)
+        self.planned_end_date = frappe.utils.add_to_date(start, minutes=total_minutes)
+
 
     @frappe.whitelist()
     def start_job_card(self):
-        self.db_set("actual_start_date", frappe.utils.now_datetime())
+        # STEP 1: start every linked Work Order by transferring its raw material
+        # to WIP (ERPNext's own Material Transfer for Manufacture), which moves
+        # each Work Order to In Process.
+        self.transfer_material_for_work_orders()
+
+        # STEP 2-4: create the Master Job Cards (which create the backend Job
+        # Cards) and link their numbers back.
         self.create_master_job_cards()
 
-    def create_master_job_cards(self):
-        """Create one Master Job Card per In-House operation. Out House
-        (subcontracted) operations never get a Master Job Card.
+        # STEP 5: Master Work Order goes In Process with the actual start stamped.
+        self.db_set("actual_start_date", frappe.utils.now_datetime())
+        self.db_set("status", "In Process")
 
-        The operations table is already combined (one row per operation), so a
-        simple filter on manufacturing type is all that is needed here."""
+    def transfer_material_for_work_orders(self):
+        """Create and submit a Material Transfer for Manufacture for each linked
+        Work Order using ERPNext's own logic -- this starts each Work Order."""
+        from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
+
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+
+            stock_entry = frappe.get_doc(
+                make_stock_entry(row.work_order_number, "Material Transfer for Manufacture")
+            )
+            stock_entry.insert()
+            stock_entry.submit()
+
+    def create_master_job_cards(self):
         created = []
 
-        # Operations are ordered by sequence, so the last In-House card we know
-        # about is the "previous operation" reference for the next one.
         previous_master_job_card = None
-
         for op in self.operations:
             if op.manufacturing_type != "In-House":
-                continue
-            # Skip operations whose Master Job Card was already created earlier,
-            # but still carry it forward as the previous-operation reference.
-            if op.master_job_card_number:
-                previous_master_job_card = op.master_job_card_number
                 continue
 
             master_job_card = frappe.new_doc("Master Job Card")
@@ -345,6 +368,7 @@ class MasterWorkOrder(Document):
             master_job_card.previous_opration_master_job_card = previous_master_job_card
             master_job_card.fetch_from_master_work_order()
             master_job_card.insert()
+            master_job_card.submit()
 
             op.db_set("master_job_card_number", master_job_card.name, update_modified=False)
             previous_master_job_card = master_job_card.name
@@ -360,6 +384,41 @@ class MasterWorkOrder(Document):
             )
 
         return created
+
+    @frappe.whitelist()
+    def finish_work_orders(self):
+        """Finish every linked Work Order together -- ERPNext 'Manufacture' Stock
+        Entry per Work Order, which produces the FG and completes each one."""
+        from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
+
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+            status = frappe.db.get_value("Work Order", row.work_order_number, "status")
+            if status in ("Completed", "Closed", "Cancelled"):
+                continue
+
+            stock_entry = frappe.get_doc(
+                make_stock_entry(row.work_order_number, "Manufacture")
+            )
+            stock_entry.insert()
+            stock_entry.submit()
+
+    @frappe.whitelist()
+    def close_work_orders(self):
+        """Close every linked Work Order together (ERPNext close_work_order)."""
+        from erpnext.manufacturing.doctype.work_order.work_order import close_work_order
+
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+            status = frappe.db.get_value("Work Order", row.work_order_number, "status")
+            if status in ("Closed", "Cancelled"):
+                continue
+
+            close_work_order(row.work_order_number, "Closed")
+
+        self.db_set("status", "Stopped")
 
 
 

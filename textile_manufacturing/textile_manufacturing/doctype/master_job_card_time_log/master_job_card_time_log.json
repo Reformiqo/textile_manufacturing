@@ -22,15 +22,14 @@
   {
    "fieldname": "employee",
    "fieldtype": "Link",
+   "in_list_view": 1,
    "label": "Employee",
    "options": "Employee"
   },
   {
-   "fetch_from": "employee.employee_name",
    "fieldname": "employee_name",
    "fieldtype": "Data",
-   "label": "Employee Name",
-   "read_only": 1
+   "label": "Employee Name"
   },
   {
    "fieldname": "job_card_number",
@@ -39,28 +38,29 @@
    "options": "Job Card"
   },
   {
-   "fetch_from": "job_card_number.production_item",
    "fieldname": "item_code",
    "fieldtype": "Link",
+   "in_list_view": 1,
    "label": "Item Code",
-   "options": "Item",
-   "read_only": 1
+   "options": "Item"
   },
   {
    "fieldname": "from_time",
    "fieldtype": "Datetime",
+   "in_list_view": 1,
    "label": "From Time"
   },
   {
    "fieldname": "to_time",
    "fieldtype": "Datetime",
+   "in_list_view": 1,
    "label": "To Time"
   },
   {
    "fieldname": "time_in_mins",
    "fieldtype": "Float",
-   "label": "Time in Mins",
-   "read_only": 1
+   "in_list_view": 1,
+   "label": "Time in Mins"
   },
   {
    "fieldname": "completed_qty",
@@ -82,7 +82,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-31 16:44:08.188218",
+ "modified": "2026-08-01 12:56:10.136188",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card Time Log",

@@ -143,7 +143,19 @@ doctype_js = {
 doc_events = {
 	"Work Order": {
 		"on_update": "textile_manufacturing.override.work_order.on_update",
-	}
+	},
+	"Stock Entry": {
+		"on_submit": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
+		"on_cancel": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
+	},
+}
+
+# Create/refresh this app's custom fields on migrate.
+after_migrate = "textile_manufacturing.custom_fields.make_custom_fields"
+
+
+override_doctype_class = {
+	"Work Order": "textile_manufacturing.override.work_order.CustomWorkOrder",
 }
 
 # Scheduled Tasks

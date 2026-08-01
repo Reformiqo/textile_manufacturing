@@ -7,18 +7,234 @@ from frappe.utils import flt, now_datetime, time_diff_in_seconds
 
 
 class MasterJobCard(Document):
+    def before_validate(self):
+        # This card keeps being updated after submit (time logs, qty, status),
+        # and before_save recomputes derived totals -- allow those changes.
+        if self.docstatus == 1:
+            self.flags.ignore_validate_update_after_submit = True
+
     def validate(self):
         self.validate_operation_is_in_house()
+        self.set_actual_dates()
+        self.validate_quality_inspection()
+
+    def before_save(self):
+        # These only compute/derive values (they don't validate anything), so
+        # they run on save rather than during validation.
         self.recalculate_time_logs()
         self.calculate_detail_rows()
         self.calculate_required_items()
         self.calculate_scrap_items()
         self.calculate_sfg_stock()
         self.calculate_totals()
-        self.set_actual_dates()
-        self.set_status()
-        self.validate_mandatory_reasons()
-        self.validate_quality_inspection()
+
+    def on_submit(self):
+        self.create_job_cards()
+        self.db_set("status", "Open")
+
+    def on_cancel(self):
+        self.cancel_job_cards()
+        self.db_set("status", "Cancelled")
+
+    def create_job_cards(self):
+        for row in (self.get("job_card_detail") or []):
+            if row.job_card_number:
+                continue  # already created
+            if not row.work_order_number:
+                frappe.throw(
+                    ("Row {0}: Work Order is required to create a Job Card.").format(row.idx)
+                )
+
+            job_card = frappe.new_doc("Job Card")
+            job_card.work_order = row.work_order_number
+            job_card.production_item = row.item_code
+            job_card.bom_no = row.bom_no
+            job_card.operation = self.operation_name
+            job_card.workstation_type = self.workstation_type
+            job_card.workstation = row.workstation or self.workstation
+            job_card.for_quantity = row.qty_to_manufacture
+            job_card.wip_warehouse = self.wip_warehouse
+            job_card.company = self.company
+            job_card.posting_date = frappe.utils.nowdate()
+            job_card.insert()
+
+            row.db_set("job_card_number", job_card.name, update_modified=False)
+
+    def cancel_job_cards(self):
+        """Cancel/remove the Job Cards created from this Master Job Card."""
+        for row in (self.get("job_card_detail") or []):
+            if not row.job_card_number:
+                continue
+            if not frappe.db.exists("Job Card", row.job_card_number):
+                continue
+
+            job_card = frappe.get_doc("Job Card", row.job_card_number)
+            if job_card.docstatus == 1:
+                job_card.cancel()
+
+    @frappe.whitelist()
+    def make_material_transfer_for_manufacture(self):
+        """Build ONE consolidated 'Material Transfer for Manufacture' Stock Entry
+        (Source -> WIP) covering the pending required items of all the linked Job
+        Cards of this operation. Returned unsaved so the user can review/submit."""
+        if not self.source_warehouse or not self.wip_warehouse:
+            frappe.throw(("Source and WIP warehouses are required for the transfer."))
+
+        from erpnext.stock.get_item_details import get_conversion_factor
+
+        stock_entry = frappe.new_doc("Stock Entry")
+        stock_entry.stock_entry_type = "Material Transfer for Manufacture"
+        stock_entry.company = self.company
+        stock_entry.from_warehouse = self.source_warehouse
+        stock_entry.to_warehouse = self.wip_warehouse
+        stock_entry.master_job_card = self.name
+
+        for row in self.required_item:
+            pending = flt(row.pending_transfer_qty)
+            if pending <= 0:
+                continue
+
+            stock_uom = frappe.db.get_value("Item", row.item_code, "stock_uom")
+            uom = row.uom or stock_uom
+            conversion_factor = (
+                flt(get_conversion_factor(row.item_code, uom).get("conversion_factor")) or 1.0
+            )
+
+            stock_entry.append("items", {
+                "item_code": row.item_code,
+                "qty": pending,
+                "uom": uom,
+                "stock_uom": stock_uom,
+                "conversion_factor": conversion_factor,
+                "s_warehouse": self.source_warehouse,
+                "t_warehouse": self.wip_warehouse,
+            })
+
+        if not stock_entry.get("items"):
+            frappe.throw(("There is nothing pending to transfer."))
+
+        stock_entry.set_stock_entry_type()
+        return stock_entry
+
+    # ------------------------------------------------------------------
+    # Start / Pause / Resume / Complete -- applied on all linked Job Cards
+    # ------------------------------------------------------------------
+    @frappe.whitelist()
+    def start_jobs(self, employees=None):
+        self.start_operators(employees)
+        self.drive_job_cards("start")
+        self.db_set("status", "Work In Progress")
+
+    def start_operators(self, employees):
+        if isinstance(employees, str):
+            employees = frappe.parse_json(employees)
+        employees = employees or []
+
+        now = frappe.utils.now()
+        existing = {e.employee for e in (self.get("employee") or [])}
+
+        for emp in employees:
+            emp_id = (emp.get("employee") or emp.get("name")) if isinstance(emp, dict) else emp
+            if not emp_id:
+                continue
+
+            if emp_id not in existing:
+                self.append("employee", {"employee": emp_id})
+                existing.add(emp_id)
+
+
+            self.append("time_log", {"employee": emp_id, "from_time": now})
+
+        self.save_after_submit()
+
+    @frappe.whitelist()
+    def pause_jobs(self, reason=None):
+        self.drive_job_cards("pause")
+        self.close_open_time_logs()
+        self.db_set("hold_reason", reason)
+        self.db_set("status", "On Hold")
+
+    @frappe.whitelist()
+    def resume_jobs(self):
+        self.drive_job_cards("resume")
+        self.open_operator_time_logs()
+        self.db_set("status", "Work In Progress")
+
+    @frappe.whitelist()
+    def complete_jobs(self):
+        self.drive_job_cards("complete")
+        self.close_open_time_logs()
+        self.db_set("status", "Completed")
+
+    def close_open_time_logs(self):
+        """Set to_time = now on any open Time Log row (from_time set, no to_time)."""
+        now = frappe.utils.now()
+        changed = False
+        for log in self.time_log:
+            if log.from_time and not log.to_time:
+                log.to_time = now
+                changed = True
+        if changed:
+            self.save_after_submit()
+
+    def open_operator_time_logs(self):
+        """Open a fresh Time Log row (from_time = now) for each assigned operator."""
+        now = frappe.utils.now()
+        for emp in (self.get("employee") or []):
+            if emp.employee:
+                self.append("time_log", {"employee": emp.employee, "from_time": now})
+        self.save_after_submit()
+
+    def save_after_submit(self):
+        # This card keeps being updated after submit (time logs, totals), so skip
+        # the "cannot change after submit" guard and let before_save refresh totals.
+        self.flags.ignore_validate_update_after_submit = True
+        self.save()
+
+    def drive_job_cards(self, action):
+        details = [r for r in (self.get("job_card_detail") or []) if r.job_card_number]
+        if not details:
+            frappe.throw(("No linked Job Cards to process."))
+
+        employees = [{"employee": e.employee} for e in (self.get("employee") or []) if e.employee]
+        if action == "start" and not employees:
+            frappe.throw(("Assign at least one Employee before starting."))
+
+        now = frappe.utils.now()
+        processed = 0
+
+        for detail in details:
+            job_card = frappe.get_doc("Job Card", detail.job_card_number)
+            # ERPNext allows start/pause/resume/complete only on draft Job Cards.
+            if job_card.docstatus != 0:
+                continue
+
+            if action == "start":
+                # Populate the Job Card's own employees so pause/resume work later.
+                job_card.set("employee", [{"employee": e["employee"]} for e in employees])
+                job_card.start_timer(start_time=now, employees=employees)
+            elif action == "pause":
+                job_card.pause_job(end_time=now)
+            elif action == "resume":
+                job_card.resume_job(start_time=now)
+            elif action == "complete":
+                qty = flt(detail.completed_qty) or flt(job_card.for_quantity)
+                job_card.complete_job_card(
+                    end_time=now,
+                    qty=qty,
+                    process_loss_qty=flt(detail.process_loss_qty),
+                )
+                job_card.reload()
+                job_card.submit()
+
+            processed += 1
+
+        frappe.msgprint(
+            ("{0}: applied on {1} Job Card(s).").format(action.title(), processed),
+            indicator="green",
+            alert=True,
+        )
+        return processed
 
 
     @frappe.whitelist()
@@ -242,6 +458,8 @@ class MasterJobCard(Document):
         for log in self.time_log:
             if log.from_time and log.to_time:
                 log.time_in_mins = flt(time_diff_in_seconds(log.to_time, log.from_time)) / 60.0
+            else:
+                log.time_in_mins = 0
 
     def calculate_detail_rows(self):
         # Roll up the time logs back to the detail row they belong to (by job card):
@@ -338,17 +556,8 @@ class MasterJobCard(Document):
     # ------------------------------------------------------------------
     def validate_operation_is_in_house(self):
         if self.manufacturing_type and self.manufacturing_type != "In-House":
-            frappe.throw(("Master Job Card is created only for In-House operations."))
+            frappe.throw("Master Job Card is created only for In-House operations.")
 
-    def validate_mandatory_reasons(self):
-        if self.status == "On Hold" and not self.hold_reason:
-            frappe.throw(("Hold Reason is mandatory when Status is On Hold."))
-
-        for row in (self.get("job_card_detail") or []):
-            if flt(row.rejected_qty) > 0 and not row.rejection_reason:
-                frappe.throw(
-                    ("Row {0}: Rejection Reason is mandatory when Rejected Qty > 0.").format(row.idx)
-                )
 
     def validate_quality_inspection(self):
         if not self.quality_inspection_requied:

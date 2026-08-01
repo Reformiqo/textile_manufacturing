@@ -3,12 +3,11 @@
 
 frappe.ui.form.on("Master Work Order", {
     refresh: function(frm){
-
         if(frm.doc.docstatus != 1) return;
+
         frm.add_custom_button(__("Job Card"), () => {
         }, __("Create"));
 
-        // Show Start only until Master Job Cards have been created for this MWO.
         const has_master_job_card = (frm.doc.operations || []).some(
             (op) => op.master_job_card_number
         );
@@ -27,9 +26,27 @@ frappe.ui.form.on("Master Work Order", {
         }
 
         frm.add_custom_button(__("Finish Work Order"), () => {
+            frappe.confirm(__("Finish all linked Work Orders? This will produce the finished goods."), () => {
+                frm.call({
+                    method: "finish_work_orders",
+                    doc: frm.doc,
+                    freeze: true,
+                    freeze_message: __("Finishing Work Orders..."),
+                    callback: () => frm.reload_doc(),
+                });
+            });
         }, __("Create"));
 
         frm.add_custom_button(__("Close Work Order"), () => {
+            frappe.confirm(__("Close all linked Work Orders?"), () => {
+                frm.call({
+                    method: "close_work_orders",
+                    doc: frm.doc,
+                    freeze: true,
+                    freeze_message: __("Closing Work Orders..."),
+                    callback: () => frm.reload_doc(),
+                });
+            });
         }, __("Create"));
     },
 
@@ -80,5 +97,9 @@ function update_all_child_warehouses(frm) {
     (frm.doc.items_to_be_manufacture || []).forEach((child) => {
         set_child_warehouses(frm, child);
     });
+    (frm.doc.required_items || []).forEach((child) => {
+        child.source_warehouse = frm.doc.source_warehouse
+    });
     frm.refresh_field("items_to_be_manufacture");
+    frm.refresh_field("required_items");
 }

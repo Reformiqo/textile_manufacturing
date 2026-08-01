@@ -1,4 +1,12 @@
 import frappe
+from erpnext.manufacturing.doctype.work_order.work_order import WorkOrder
+
+
+class CustomWorkOrder(WorkOrder):
+    def create_job_card(self):
+        # In this app, Job Cards are created only when the Master Job Card is
+        # submitted -- not automatically when the Work Order is submitted.
+        return
 
 
 def on_update(doc, method=None):

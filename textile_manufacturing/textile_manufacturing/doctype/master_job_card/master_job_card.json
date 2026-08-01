@@ -7,13 +7,14 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "job_card_dashboard",
   "section_break_8nem",
   "naming_series",
   "amended_from",
   "posting_date",
+  "production_plan_number",
   "master_work_order_number",
   "company",
-  "production_plan_number",
   "operation_name",
   "opration_sequence_no",
   "previous_opration_master_job_card",
@@ -143,10 +144,11 @@
    "read_only": 1
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "status",
    "fieldtype": "Select",
    "label": "Status",
-   "options": "Draft\nOpen\nMaterial Transferred\nWork In Progress\nOn Hold\nCompleted,Cancelled"
+   "options": "Draft\nOpen\nMaterial Transferred\nWork In Progress\nOn Hold\nCompleted\nCancelled"
   },
   {
    "fieldname": "hold_reason",
@@ -352,6 +354,7 @@
    "label": "Time"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "time_log",
    "fieldtype": "Table",
    "label": "Time Log",
@@ -362,6 +365,7 @@
    "fieldtype": "Section Break"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "employee",
    "fieldtype": "Table",
    "label": "Employee",
@@ -394,13 +398,17 @@
    "fieldtype": "Select",
    "label": "Series",
    "options": "MJC-.YYYY.-.#####"
+  },
+  {
+   "fieldname": "job_card_dashboard",
+   "fieldtype": "HTML"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-01 02:19:45.595673",
+ "modified": "2026-08-01 15:54:30.424794",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",
