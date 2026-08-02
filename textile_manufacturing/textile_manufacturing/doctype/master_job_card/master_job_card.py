@@ -28,9 +28,37 @@ class MasterJobCard(Document):
         self.calculate_sfg_stock()
         self.calculate_totals()
 
-    def on_submit(self):
+    def after_insert(self):
         self.create_job_cards()
         self.db_set("status", "Open")
+
+    def on_submit(self):
+        self.validate_jobs_completed()
+        self.db_set("status", "Completed")
+
+    def validate_jobs_completed(self):
+        """Submitting means the operation is finished, so every Job Card under it has
+        to be finished too -- the same bar ERPNext sets, where a Job Card cannot be
+        submitted with nothing completed against it."""
+        pending = [
+            row.job_card_number
+            for row in (self.get("job_card_detail") or [])
+            if row.job_card_number
+            and frappe.db.get_value("Job Card", row.job_card_number, "docstatus") != 1
+        ]
+        if not pending:
+            return
+
+        frappe.throw(
+            ("These Job Cards are not finished yet:<br><br>{0}<br><br>"
+             "Use <b>Job &gt; Complete</b> to finish the operation -- that submits "
+             "this card for you.").format(
+                "<br>".join(
+                    frappe.utils.get_link_to_form("Job Card", name) for name in pending
+                )
+            ),
+            title="Operation Not Complete",
+        )
 
     def on_cancel(self):
         self.cancel_job_cards()
@@ -50,6 +78,15 @@ class MasterJobCard(Document):
             job_card.production_item = row.item_code
             job_card.bom_no = row.bom_no
             job_card.operation = self.operation_name
+            # Without this the card is orphaned from the Work Order's operation row:
+            # Job Card.update_work_order() bails on `elif self.operation_id`, so the
+            # operation's completed qty stays 0 and a later Manufacture entry fails
+            # check_if_operations_completed() with "Job Card not found".
+            job_card.operation_id = frappe.db.get_value(
+                "Work Order Operation",
+                {"parent": row.work_order_number, "operation": self.operation_name},
+                "name",
+            )
             job_card.workstation_type = self.workstation_type
             job_card.workstation = row.workstation or self.workstation
             job_card.for_quantity = row.qty_to_manufacture
@@ -205,7 +242,7 @@ class MasterJobCard(Document):
     def complete_jobs(self):
         self.drive_job_cards("complete")
         self.close_open_time_logs()
-        self.db_set("status", "Completed")
+        self.submit()
 
     def close_open_time_logs(self):
         """Set to_time = now on any open Time Log row (from_time set, no to_time)."""

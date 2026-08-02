@@ -181,7 +181,7 @@
    "fieldname": "material_transfer_on",
    "fieldtype": "Select",
    "label": "Material Transfer On",
-   "options": "\nWork Oder\nJob Card"
+   "options": "\nWork Order\nJob Card"
   },
   {
    "fieldname": "warehouses_section",
@@ -416,6 +416,7 @@
  "owner": "Administrator",
  "permissions": [
   {
+   "cancel": 1,
    "create": 1,
    "delete": 1,
    "email": 1,

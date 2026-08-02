@@ -67,8 +67,7 @@
    "in_list_view": 1,
    "label": "Production Plan Number",
    "options": "Production Plan",
-   "reqd": 1,
-   "unique": 1
+   "reqd": 1
   },
   {
    "fieldname": "column_break_ejou",
@@ -87,7 +86,7 @@
    "fieldname": "material_transfer_on",
    "fieldtype": "Select",
    "label": "Material Transfer On ",
-   "options": "\nWork Oder\nJob Card"
+   "options": "Work Order\nJob Card"
   },
   {
    "fieldname": "warehouse_section",
@@ -266,6 +265,7 @@
    "fieldname": "wip_warehouse",
    "fieldtype": "Link",
    "label": "Work in Progress Warehouse",
+   "mandatory_depends_on": "eval:!doc.skip_material_transfer_to_wip_warehouse",
    "options": "Warehouse"
   },
   {

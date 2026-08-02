@@ -33,7 +33,6 @@ frappe.ui.form.on("Master Job Card", {
 });
 
 
-// Time Log grid: Time in Mins = To Time - From Time (in minutes).
 frappe.ui.form.on("Master Job Card Time Log", {
     from_time: function (frm, cdt, cdn) {
         set_time_in_mins(cdt, cdn);
@@ -56,9 +55,7 @@ function set_time_in_mins(cdt, cdn) {
 
 
 function add_action_buttons(frm) {
-    // Material transfer is done from the Master Job Card only when material is
-    // transferred on the Job Card (not on the Work Order), and after it is saved.
-    if (!frm.doc.docstatus === 1 || frm.doc.material_transfer_on !== "Work Oder") return;
+    if (frm.is_new() || frm.doc.docstatus !== 0 || frm.doc.material_transfer_on !== "Job Card") return;
 
     frm.add_custom_button(__("Material Transfer for Manufacture"), () => {
         frm.call({
@@ -77,7 +74,8 @@ function add_action_buttons(frm) {
 
 
 function add_quality_inspection_button(frm) {
-    if (!frm.doc.quality_inspection_requied || frm.doc.docstatus !== 1) return;
+    // Inspection happens while the operation is being worked, so on the draft card.
+    if (!frm.doc.quality_inspection_requied || frm.is_new() || frm.doc.docstatus !== 0) return;
 
     const pending = (frm.doc.job_card_detail || []).filter(
         (row) => row.job_card_number && !row.quality_inspection
@@ -128,35 +126,82 @@ function quality_inspection_dialog(frm, pending) {
 
 
 function render_job_timer(frm){
-    if (frm.doc.docstatus !== 1 || (frm.doc.job_card_detail || []).every((r) => !r.job_card_number)) return;
+    if (frm.is_new() || frm.doc.docstatus !== 0) return;
+    if ((frm.doc.job_card_detail || []).every((r) => !r.job_card_number)) return;
         
-    // Not started yet
-    let time_log = frm.doc.time_log || [];
-    if(frm.doc.time_log.length == 0){
-        frm.add_custom_button(__("Start"), () => start_jobs_dialog(frm), __("Job"));
-        return;
-    }
-    
     // Completed -> no timer actions.
     if (frm.doc.status === "Completed") return;
 
-    // A row with from_time but no to_time means a timer is currently running.
-    const running = time_log.some((t) => t.from_time && !t.to_time);
+    const time_log = frm.doc.time_log || [];
 
-    if (running) {
-        frm.add_custom_button(__("Pause"), () => pause_job_dialog(frm), __("Job"));
-    } else {
-        [["Resume", "resume_jobs"], ["Complete", "complete_jobs"]].forEach(([label, method]) => {
-            frm.add_custom_button(__(label), () => {
-                frm.call({
-                    method: method,
-                    doc: frm.doc,
-                    freeze: true,
-                    freeze_message: __("Processing linked Job Cards..."),
-                }).then(() => frm.reload_doc());
-            }, __("Job"));
-        });
+    // Nothing logged yet -- the operation has not begun.
+    if (!time_log.length) {
+        frm.add_custom_button(__("Start"), () => start_jobs_dialog(frm), __("Job"));
+        return;
     }
+
+    // Paused: resuming is the only way on, the same as a Job Card on hold.
+    if (frm.doc.status === "On Hold") {
+        job_action_button(frm, __("Resume"), "resume_jobs");
+        return;
+    }
+
+    if (time_log.some((t) => t.from_time && !t.to_time)) {
+        frm.add_custom_button(__("Pause"), () => pause_job_dialog(frm), __("Job"));
+        frm.add_custom_button(__("Complete"), () => complete_jobs_dialog(frm), __("Job"));
+        return;
+    }
+
+    // Stopped but not on hold: pick the work back up, or close it out.
+    job_action_button(frm, __("Resume"), "resume_jobs");
+    frm.add_custom_button(__("Complete"), () => complete_jobs_dialog(frm), __("Job"));
+}
+
+
+function complete_jobs_dialog(frm) {
+    const rows = qty_report_rows(frm);
+    if (!rows.length) {
+        frappe.msgprint(__("There are no linked Job Cards to complete."));
+        return;
+    }
+
+    const d = new frappe.ui.Dialog({
+        title: __("Complete Operation"),
+        size: "extra-large",
+        fields: [
+            qty_report_grid(rows, [
+                { fieldname: "completed_qty", label: __("Completed Quantity") },
+                { fieldname: "process_loss_qty", label: __("Process Loss Quantity") },
+            ]),
+        ],
+        primary_action_label: __("Complete"),
+        primary_action(values) {
+            const selected = values.rows || [];
+            if (!valid_qty_report(selected, "process_loss_qty", true)) return;
+
+            d.hide();
+            frm.call({
+                method: "complete_jobs",
+                doc: frm.doc,
+                args: { rows: selected },
+                freeze: true,
+                freeze_message: __("Completing linked Job Cards..."),
+            }).then(() => frm.reload_doc());
+        },
+    });
+    d.show();
+}
+
+
+function job_action_button(frm, label, method) {
+    frm.add_custom_button(label, () => {
+        frm.call({
+            method: method,
+            doc: frm.doc,
+            freeze: true,
+            freeze_message: __("Processing linked Job Cards..."),
+        }).then(() => frm.reload_doc());
+    }, __("Job"));
 }
 
 
@@ -189,8 +234,15 @@ function start_jobs_dialog(frm) {
 
 
 function pause_job_dialog(frm) {
+    const rows = qty_report_rows(frm);
+    if (!rows.length) {
+        frappe.msgprint(__("There are no linked Job Cards to pause."));
+        return;
+    }
+
     const d = new frappe.ui.Dialog({
-        title: __("Reason for Pause"),
+        title: __("Pause Operation"),
+        size: "extra-large",
         fields: [
             {
                 fieldtype: "Data",
@@ -198,14 +250,24 @@ function pause_job_dialog(frm) {
                 fieldname: "reason",
                 reqd: 1,
             },
+            {
+                fieldtype: "Section Break",
+            },
+            qty_report_grid(rows, [
+                { fieldname: "completed_qty", label: __("Completed Quantity") },
+                { fieldname: "rejected_qty", label: __("Rejected Quantity") },
+            ]),
         ],
         primary_action_label: __("Pause"),
         primary_action(values) {
+            const selected = values.rows || [];
+            if (!valid_qty_report(selected, "rejected_qty")) return;
+
             d.hide();
             frm.call({
                 method: "pause_jobs",
                 doc: frm.doc,
-                args: { reason: values.reason },
+                args: { reason: values.reason, rows: selected },
                 freeze: true,
                 freeze_message: __("Processing linked Job Cards..."),
             }).then(() => frm.reload_doc());
@@ -215,8 +277,127 @@ function pause_job_dialog(frm) {
 }
 
 
+function qty_report_rows(frm) {
+    return (frm.doc.job_card_detail || [])
+        .filter((row) => row.job_card_number)
+        .map((row) => {
+            const ordered = flt(row.qty_to_manufacture);
+            const done = flt(row.completed_qty);
+            const accounted = done + flt(row.rejected_qty) + flt(row.process_loss_qty);
+
+            return {
+                job_card_number: row.job_card_number,
+                item_code: row.item_code,
+                qty_to_manufacture: ordered,
+                already_completed: done,
+                completed_qty: Math.max(ordered - accounted, 0),
+                rejected_qty: 0,
+                process_loss_qty: 0,
+            };
+        });
+}
+
+
+function qty_report_grid(rows, editable) {
+    return {
+        fieldtype: "Table",
+        fieldname: "rows",
+        cannot_add_rows: 1,
+        cannot_delete_rows: 1,
+        in_place_edit: false,
+        data: rows,
+        get_data: () => rows,
+        fields: [
+            {
+                fieldtype: "Link",
+                fieldname: "item_code",
+                label: __("Item"),
+                options: "Item",
+                in_list_view: 1,
+                read_only: 1,
+                columns: 3,
+            },
+            {
+                fieldtype: "Float",
+                fieldname: "qty_to_manufacture",
+                label: __("Qty to Manufacture"),
+                in_list_view: 1,
+                read_only: 1,
+                columns: 2,
+            },
+            {
+                fieldtype: "Float",
+                fieldname: "already_completed",
+                label: __("Already Completed"),
+                in_list_view: 1,
+                read_only: 1,
+                columns: 2,
+            },
+            ...editable.map((f) => ({
+                fieldtype: "Float",
+                fieldname: f.fieldname,
+                label: f.label,
+                in_list_view: 1,
+                columns: 2,
+            })),
+            {
+                fieldtype: "Data",
+                fieldname: "job_card_number",
+                label: __("Job Card"),
+                hidden: 1,
+            },
+        ],
+    };
+}
+
+
+function valid_qty_report(rows, second_field, exact) {
+    const TOLERANCE = 0.001;
+
+    for (const row of rows) {
+        const ordered = flt(row.qty_to_manufacture);
+        const reported = flt(row.completed_qty) + flt(row[second_field]);
+        const total = flt(row.already_completed) + reported;
+
+        if (flt(row.completed_qty) < 0 || flt(row[second_field]) < 0) {
+            frappe.msgprint(__("Quantities cannot be negative."));
+            return false;
+        }
+
+        if (total - ordered > TOLERANCE) {
+            frappe.msgprint(
+                __("{0}: {1} reported against a Qty to Manufacture of {2}. It cannot be more.", [
+                    over_label(row),
+                    format_number(total),
+                    format_number(ordered),
+                ]),
+            );
+            return false;
+        }
+
+        if (exact && ordered - total > TOLERANCE) {
+            frappe.msgprint(
+                __("{0}: only {1} of {2} is accounted for. Completing has to account for the whole quantity -- add the balance as Completed or as Process Loss.", [
+                    over_label(row),
+                    format_number(total),
+                    format_number(ordered),
+                ]),
+            );
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+function over_label(row) {
+    return row.item_code || row.job_card_number;
+}
+
+
 function toggle_material_tab(frm) {
-    const read_only = frm.doc.material_transfer_on === "Work Oder";
+    const read_only = frm.doc.material_transfer_on === "Work Order";
     frm.set_df_property("required_item", "read_only", read_only ? 1 : 0);
     frm.refresh_field("required_item");
 }

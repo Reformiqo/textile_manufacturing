@@ -8,6 +8,8 @@ from frappe.utils import flt
 
 class MasterWorkOrder(Document):
     def validate(self):
+        self.validate_unique_production_plan()
+
         for row in self.items_to_be_manufacture:
             if not row.qty_to_manufacture:
                 frappe.throw(
@@ -25,9 +27,37 @@ class MasterWorkOrder(Document):
                 )
 
 
+    def validate_unique_production_plan(self):
+        if not self.production_plan_number:
+            return
+
+        existing = frappe.get_all(
+            "Master Work Order",
+            filters={
+                "production_plan_number": self.production_plan_number,
+                "docstatus": ["<", 2],
+                "name": ["!=", self.name],
+            },
+            pluck="name",
+        )
+        if not existing:
+            return
+
+        frappe.throw(
+            ("Master Work Order {0} already exists for Production Plan {1}.<br><br>"
+             "Cancel it before raising another.").format(
+                frappe.utils.get_link_to_form("Master Work Order", existing[0]),
+                self.production_plan_number,
+            ),
+            title="Master Work Order Already Exists",
+        )
+
     def on_submit(self):
         self.create_work_orders()
-        self.db_set("status", "Not Started")
+        if not self.skip_material_transfer_to_wip_warehouse:
+            self.db_set("status", "Not Started")
+        else:
+            self.db_set("status", "In Process")
 
     def on_cancel(self):
         self.db_set("status", "Cancelled")
@@ -45,6 +75,7 @@ class MasterWorkOrder(Document):
             work_order.fg_warehouse = row.fg_warehouse
             work_order.scrap_warehouse = row.scrap_warehouse
             work_order.use_multi_level_bom = self.use_multi_level_bom
+            work_order.skip_transfer = self.skip_material_transfer_to_wip_warehouse
             work_order.planned_start_date = self.posting_date or frappe.utils.now_datetime()
 
             self.set_in_house_operations(work_order)
@@ -233,6 +264,19 @@ class MasterWorkOrder(Document):
     def set_required_items(self, items):
         self.set("required_items", [])
 
+        bom_qty_map = {}
+        for item in self.items_to_be_manufacture:
+            if item.bom_no:
+                bom_qty_map[item.bom_no] = bom_qty_map.get(item.bom_no, 0) + flt(item.qty_to_manufacture)
+
+        bom_base_qty = {}
+        if bom_qty_map:
+            bom_base_qty = frappe._dict(
+                frappe.get_all(
+                    "BOM", {"name": ["in", list(bom_qty_map)]}, ["name", "quantity"], as_list=1
+                )
+            )
+
         # Group by item so the same raw material coming from multiple BOMs is
         # shown as a single row with the total required qty.
         consolidated = {}
@@ -243,7 +287,8 @@ class MasterWorkOrder(Document):
                 "uom": item.uom,
                 "requried_qty": 0,
             })
-            row["requried_qty"] += item.qty or 0
+            scale = flt(bom_qty_map.get(item.parent)) / (flt(bom_base_qty.get(item.parent)) or 1.0)
+            row["requried_qty"] += flt(item.qty) * scale
 
         items_details = frappe._dict(frappe.get_all("Item", {"name": ["in", list(consolidated)]}, ["name", "valuation_rate"], as_list=1))
 
@@ -331,27 +376,168 @@ class MasterWorkOrder(Document):
 
 
     @frappe.whitelist()
-    def start_job_card(self):
-        self.transfer_material_for_work_orders()
-        self.create_master_job_cards()
-        self.db_set("actual_start_date", frappe.utils.now_datetime())
-        self.db_set("status", "In Process")
+    def start_material_transfer(self, rows=None):
+        self.transfer_material_for_work_orders(rows)
+        if not self.actual_start_date:
+            self.db_set("actual_start_date", frappe.utils.now_datetime())
 
-    def transfer_material_for_work_orders(self):
-        """Create and submit a Material Transfer for Manufacture for each linked
-        Work Order using ERPNext's own logic -- this starts each Work Order."""
+
+    @frappe.whitelist()
+    def create_master_job_card(self):
+        self.create_master_job_cards()
+
+        if self.status != "In Process":
+            self.db_set("status", "In Process")
+
+        if not self.actual_start_date:
+            self.db_set("actual_start_date", frappe.utils.now_datetime())
+
+    def can_transfer_material(self):
+        if self.skip_material_transfer_to_wip_warehouse:
+            return False
+        if self.material_transfer_on == "Job Card":
+            return False
+        if not self.wip_warehouse:
+            return False
+        return True
+
+    def pending_transfer_by_work_order(self):
+        """
+        Read from the stored rows, deliberately -- not from self. The form posts its
+        own copy of the document, so a tab left open since before an earlier partial
+        transfer carries a stale Material Transfer Qty and would happily ask for more
+        than is actually left. Going to the database is what catches that."""
+        pending = {}
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=["work_order_number", "qty_to_manufacture", "mateial_transfer_qty"],
+        ):
+            if not row.work_order_number:
+                continue
+
+            qty = flt(row.qty_to_manufacture) - flt(row.mateial_transfer_qty)
+            if qty <= 0:
+                continue
+
+            pending[row.work_order_number] = qty
+
+        return pending
+
+    def transfer_material_for_work_orders(self, rows=None):
         from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
 
+        if not self.can_transfer_material():
+            return
+
+        allowed = self.pending_transfer_by_work_order()
+        if not allowed:
+            frappe.throw(
+                "There is nothing left to transfer to the WIP Warehouse.<br><br>"
+                "Refresh the Master Work Order -- material has been transferred "
+                "against it since this form was opened.",
+                title="Nothing Left to Transfer",
+            )
+
+        rows = frappe.parse_json(rows) if rows else [
+            {"work_order_number": work_order, "qty": qty}
+            for work_order, qty in allowed.items()
+        ]
+
+        for row in rows:
+            work_order = row.get("work_order_number")
+            qty = flt(row.get("qty"))
+            if not work_order or qty <= 0:
+                continue
+            if work_order not in allowed:
+                frappe.throw(
+                    ("{0}: nothing is left to transfer against Work Order {1}.<br><br>"
+                     "Refresh the Master Work Order -- material has been transferred "
+                     "against it since this form was opened.").format(
+                        row.get("item_code") or work_order, work_order
+                    ),
+                    title="Nothing Left to Transfer",
+                )
+
+            if qty > allowed[work_order]:
+                frappe.throw(
+                    ("{0}: only {1} is left to transfer, but {2} was asked for.<br><br>"
+                     "Refresh the Master Work Order -- material has been transferred "
+                     "against it since this form was opened.").format(
+                        row.get("item_code") or work_order,
+                        flt(allowed[work_order], 3),
+                        flt(qty, 3),
+                    ),
+                    title="Qty to Transfer Too High",
+                )
+
+            status = frappe.db.get_value("Work Order", work_order, "status")
+            if status in ("Completed", "Closed", "Stopped", "Cancelled"):
+                frappe.throw(
+                    ("Work Order {0} is {1} -- material cannot be transferred to it.").format(
+                        work_order, status
+                    )
+                )
+
+            stock_entry = frappe.get_doc(
+                make_stock_entry(work_order, "Material Transfer for Manufacture", qty)
+            )
+            stock_entry.master_work_order = self.name
+            if not stock_entry.get("project"):
+                stock_entry.project = self.get("project")
+            stock_entry.insert()
+            stock_entry.submit()
+
+        self.update_transferred_qty()
+
+    def update_transferred_qty(self):
         for row in self.items_to_be_manufacture:
             if not row.work_order_number:
                 continue
 
-            stock_entry = frappe.get_doc(
-                make_stock_entry(row.work_order_number, "Material Transfer for Manufacture")
+            row.db_set(
+                "mateial_transfer_qty",
+                flt(
+                    frappe.db.get_value(
+                        "Work Order",
+                        row.work_order_number,
+                        "material_transferred_for_manufacturing",
+                    )
+                ),
+                update_modified=False,
             )
-            stock_entry.master_work_order = self.name
-            stock_entry.insert()
-            stock_entry.submit()
+
+        self.update_required_item_transfers()
+
+    def update_required_item_transfers(self):
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return
+
+        totals = {}
+        for item in frappe.get_all(
+            "Work Order Item",
+            filters={"parent": ["in", work_orders], "parenttype": "Work Order"},
+            fields=["item_code", "transferred_qty", "consumed_qty", "returned_qty"],
+        ):
+            row = totals.setdefault(
+                item.item_code,
+                {"transfer_qty": 0.0, "consumed_qty": 0.0, "return_qty": 0.0},
+            )
+            row["transfer_qty"] += flt(item.transferred_qty)
+            row["consumed_qty"] += flt(item.consumed_qty)
+            row["return_qty"] += flt(item.returned_qty)
+
+        for row in self.required_items:
+            data = totals.get(row.item_code) or {}
+            transfer_qty = flt(data.get("transfer_qty"))
+            return_qty = flt(data.get("return_qty"))
+            row.db_set({
+                "transfer_qty": transfer_qty,
+                "consumed_qty": flt(data.get("consumed_qty")),
+                "return_qty": return_qty,
+                "pending_transfer_qty": flt(row.requried_qty) - transfer_qty + return_qty,
+            }, update_modified=False)
 
     def create_master_job_cards(self):
         created = []
@@ -367,7 +553,6 @@ class MasterWorkOrder(Document):
             master_job_card.previous_opration_master_job_card = previous_master_job_card
             master_job_card.fetch_from_master_work_order()
             master_job_card.insert()
-            master_job_card.submit()
 
             op.db_set("master_job_card_number", master_job_card.name, update_modified=False)
             previous_master_job_card = master_job_card.name
@@ -384,24 +569,261 @@ class MasterWorkOrder(Document):
 
         return created
 
+    # ------------------------------------------------------------------
+    # Finish -- produce the finished goods
+    # ------------------------------------------------------------------
+    def pending_manufacture_by_work_order(self):
+        pending = {}
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=[
+                "work_order_number", "qty_to_manufacture",
+                "mateial_transfer_qty", "manufacture_qty",
+            ],
+        ):
+            if not row.work_order_number:
+                continue
+
+            if self.skip_material_transfer_to_wip_warehouse:
+                ceiling = flt(row.qty_to_manufacture)
+            else:
+                ceiling = flt(row.mateial_transfer_qty)
+
+            qty = ceiling - flt(row.manufacture_qty)
+            if qty <= 0:
+                continue
+
+            pending[row.work_order_number] = qty
+
+        return pending
+
+    def validate_master_job_cards_completed(self):
+        if not self.skip_material_transfer_to_wip_warehouse:
+            return
+
+        in_house = [op for op in self.operations if op.manufacturing_type == "In-House"]
+        if not in_house:
+            return
+
+        missing = [op.opration_name for op in in_house if not op.master_job_card_number]
+        if missing:
+            frappe.throw(
+                ("No Master Job Card has been raised for: {0}.<br><br>"
+                 "Create and complete them before finishing.").format(
+                    frappe.bold(", ".join(name for name in missing if name))
+                ),
+                title="Operations Not Complete",
+            )
+
+        cards = [op.master_job_card_number for op in in_house]
+        incomplete = frappe.get_all(
+            "Master Job Card",
+            filters={"name": ["in", cards], "status": ["!=", "Completed"]},
+            fields=["name", "operation_name", "status"],
+        )
+        if not incomplete:
+            return
+
+        lines = "<br>".join(
+            "{0} -- {1} is {2}".format(
+                frappe.utils.get_link_to_form("Master Job Card", row.name),
+                frappe.bold(row.operation_name or ""),
+                row.status,
+            )
+            for row in incomplete
+        )
+        frappe.throw(
+            ("Operations are not complete for this Master Work Order.<br><br>{0}"
+             "<br><br>Complete them before finishing.").format(lines),
+            title="Operations Not Complete",
+        )
+
     @frappe.whitelist()
-    def finish_work_orders(self):
-        """Finish every linked Work Order together -- ERPNext 'Manufacture' Stock
-        Entry per Work Order, which produces the FG and completes each one."""
+    def finish_work_orders(self, rows=None):
         from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
+
+        self.validate_master_job_cards_completed()
+
+        allowed = self.pending_manufacture_by_work_order()
+        if not allowed:
+            frappe.throw(
+                "There is nothing left to produce.<br><br>"
+                "Refresh the Master Work Order -- goods have been produced against it "
+                "since this form was opened.",
+                title="Nothing Left to Produce",
+            )
+
+        rows = frappe.parse_json(rows) if rows else [
+            {"work_order_number": work_order, "qty": qty}
+            for work_order, qty in allowed.items()
+        ]
+
+        for row in rows:
+            work_order = row.get("work_order_number")
+            qty = flt(row.get("qty"))
+            if not work_order or qty <= 0:
+                continue
+
+            if work_order not in allowed:
+                frappe.throw(
+                    ("{0}: nothing is left to produce against Work Order {1}.<br><br>"
+                     "Refresh the Master Work Order -- goods have been produced "
+                     "against it since this form was opened.").format(
+                        row.get("item_code") or work_order, work_order
+                    ),
+                    title="Nothing Left to Produce",
+                )
+
+            if qty > allowed[work_order]:
+                frappe.throw(
+                    ("{0}: only {1} is left to produce, but {2} was asked for.<br><br>"
+                     "Refresh the Master Work Order -- goods have been produced "
+                     "against it since this form was opened.").format(
+                        row.get("item_code") or work_order,
+                        flt(allowed[work_order], 3),
+                        flt(qty, 3),
+                    ),
+                    title="Qty to Produce Too High",
+                )
+
+            status = frappe.db.get_value("Work Order", work_order, "status")
+            if status in ("Completed", "Closed", "Stopped", "Cancelled"):
+                frappe.throw(
+                    ("Work Order {0} is {1} -- nothing can be produced against it.").format(
+                        work_order, status
+                    )
+                )
+
+            stock_entry = frappe.get_doc(make_stock_entry(work_order, "Manufacture", qty))
+            stock_entry.master_work_order = self.name
+            if not stock_entry.get("project"):
+                stock_entry.project = self.get("project")
+            stock_entry.insert()
+            stock_entry.submit()
+
+        self.update_manufactured_qty()
+
+    def update_manufactured_qty(self):
+        """Bring this order's own tables back in step with what the Work Orders now
+        report, then let the status and the Production Plan follow from it."""
+        produced_total = 0.0
 
         for row in self.items_to_be_manufacture:
             if not row.work_order_number:
                 continue
-            status = frappe.db.get_value("Work Order", row.work_order_number, "status")
-            if status in ("Completed", "Closed", "Cancelled"):
-                continue
 
-            stock_entry = frappe.get_doc(
-                make_stock_entry(row.work_order_number, "Manufacture")
-            )
-            stock_entry.insert()
-            stock_entry.submit()
+            work_order = frappe.db.get_value(
+                "Work Order",
+                row.work_order_number,
+                ["produced_qty", "process_loss_qty", "status"],
+                as_dict=True,
+            ) or frappe._dict()
+
+            produced = flt(work_order.produced_qty)
+            produced_total += produced
+
+            row.db_set({
+                "manufacture_qty": produced,
+                "process_loss_qty": flt(work_order.process_loss_qty),
+                "pending_qty": flt(row.qty_to_manufacture) - produced,
+                "status": self.item_status(work_order.status),
+            }, update_modified=False)
+
+        self.db_set("total_manufacture_qty", produced_total, update_modified=False)
+
+        # Consumed qty moves with a Manufacture entry, so the raw material table has
+        # to be refreshed too.
+        self.update_required_item_transfers()
+        self.set_status_from_work_orders()
+
+    def item_status(self, work_order_status):
+        """Map a Work Order status onto the shorter set the item rows carry."""
+        if work_order_status in ("Completed", "Stopped"):
+            return work_order_status
+        if work_order_status in ("Not Started", "Draft", None):
+            return "Not Started"
+        return "In Process"
+
+    def set_status_from_work_orders(self):
+        """Completed only once every Work Order is, which is also when the actual end
+        date is known and the Production Plan can be brought up to date."""
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return
+
+        statuses = frappe.get_all(
+            "Work Order", filters={"name": ["in", work_orders]}, pluck="status"
+        )
+        if not statuses:
+            return
+
+        if all(status == "Completed" for status in statuses):
+            self.db_set("status", "Completed")
+            self.db_set("actual_end_date", frappe.utils.now_datetime())
+        elif self.status == "Not Started":
+            self.db_set("status", "In Process")
+
+        self.update_production_plan()
+
+
+    def update_production_plan(self):
+        """Push produced qty back to the Production Plan.
+
+        The Work Orders raised here carry no production_plan link, so ERPNext's own
+        write-back never fires and the plan would sit at Submitted for ever."""
+        if not self.production_plan_number:
+            return
+
+        production_plan = frappe.get_doc("Production Plan", self.production_plan_number)
+        if production_plan.docstatus != 1 or production_plan.status in ("Closed", "Cancelled"):
+            return
+
+        plan_item_by_row = self.map_to_production_plan_items(production_plan)
+        if not plan_item_by_row:
+            return
+
+        produced = {}
+        for row in self.items_to_be_manufacture:
+            plan_item = plan_item_by_row.get(row.name)
+            if not plan_item:
+                continue
+            produced[plan_item] = flt(produced.get(plan_item)) + flt(row.manufacture_qty)
+
+        for row in production_plan.po_items:
+            if row.name not in produced:
+                continue
+            row.produced_qty = produced[row.name]
+            row.pending_qty = flt(row.planned_qty) - produced[row.name]
+            row.db_update()
+
+        # The closing sequence ERPNext runs in update_produced_pending_qty: total
+        # first, then let the plan decide its own status. set_status() only persists
+        # when called with an explicit `close`, so store it here.
+        production_plan.calculate_total_produced_qty()
+        production_plan.set_status()
+        production_plan.db_set("status", production_plan.status)
+
+    def map_to_production_plan_items(self, production_plan):
+        """Pair each row back to the Production Plan Item it came from.
+
+        The rows don't store that reference, so match on item + BOM + sales order --
+        the same key fetch_production_plan_items copied across -- taking candidates in
+        row order so two rows for one item land on separate plan rows."""
+        available = {}
+        for row in production_plan.po_items:
+            key = (row.item_code, row.bom_no, row.sales_order or None)
+            available.setdefault(key, []).append(row.name)
+
+        mapping = {}
+        for row in self.items_to_be_manufacture:
+            key = (row.item_code, row.bom_no, row.get("sales_order_number") or None)
+            candidates = available.get(key)
+            if not candidates:
+                continue
+            mapping[row.name] = candidates.pop(0)
+
+        return mapping
 
     # ------------------------------------------------------------------
     # Status -- Close / Stop / Re-open, applied to every linked Work Order

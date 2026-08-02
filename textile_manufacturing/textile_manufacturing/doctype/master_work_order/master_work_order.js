@@ -50,13 +50,15 @@ frappe.ui.form.on("Master Work Order", {
 
 
 function add_create_buttons(frm) {
+    add_start_button(frm);
+
     const has_master_job_card = (frm.doc.operations || []).some(
         (op) => op.master_job_card_number
     );
     if (!has_master_job_card) {
-        frm.add_custom_button(__("Start Work Order"), () => {
+        frm.add_custom_button(__("Create Master Job Card"), () => {
             frm.call({
-                method: "start_job_card",
+                method: "create_master_job_card",
                 doc: frm.doc,
                 freeze: true,
                 freeze_message: __("Creating Master Job Cards..."),
@@ -67,17 +69,7 @@ function add_create_buttons(frm) {
 
     add_pending_master_job_card_button(frm);
 
-    frm.add_custom_button(__("Finish Work Order"), () => {
-        frappe.confirm(__("Finish all linked Work Orders? This will produce the finished goods."), () => {
-            frm.call({
-                method: "finish_work_orders",
-                doc: frm.doc,
-                freeze: true,
-                freeze_message: __("Finishing Work Orders..."),
-                callback: () => frm.reload_doc(),
-            });
-        });
-    }, __("Create"));
+    add_finish_button(frm);
 
     frm.add_custom_button(__("Create Subcontracted PO"), () => {
         frm.call({
@@ -92,6 +84,301 @@ function add_create_buttons(frm) {
             },
         });
     }, __("Create"));
+
+    frm.page.set_inner_btn_group_as_primary(__("Create"));
+}
+
+
+function pending_transfer_rows(frm) {
+    return (frm.doc.items_to_be_manufacture || [])
+        .filter((row) => row.work_order_number)
+        .map((row) => ({
+            work_order_number: row.work_order_number,
+            item_code: row.item_code,
+            s_warehouse: row.source_warehouse || frm.doc.source_warehouse,
+            t_warehouse: row.wip_warehouse || frm.doc.wip_warehouse,
+            qty_to_manufacture: flt(row.qty_to_manufacture),
+            transferred_qty: flt(row.mateial_transfer_qty),
+            pending_qty: flt(row.qty_to_manufacture) - flt(row.mateial_transfer_qty),
+        }))
+        .filter((row) => row.pending_qty > 0)
+        .map((row) => ({ ...row, qty: row.pending_qty }));
+}
+
+
+function add_start_button(frm) {
+    if (frm.doc.skip_material_transfer_to_wip_warehouse || frm.doc.material_transfer_on === "Job Card") {
+        return;
+    }
+    if (!pending_transfer_rows(frm).length) return;
+
+    frm.add_custom_button(__("Start"), () => {
+        transfer_qty_dialog(frm, pending_transfer_rows(frm));
+    }, __("Create"));
+}
+
+
+function transfer_qty_dialog(frm, rows) {
+    const d = new frappe.ui.Dialog({
+        title: __("Material Transfer to WIP Warehouse"),
+        size: "extra-large",
+        fields: [
+            {
+                fieldtype: "Table",
+                fieldname: "rows",
+                cannot_add_rows: 1,
+                cannot_delete_rows: 1,
+                in_place_edit: false,
+                data: rows,
+                get_data: () => rows,
+                fields: [
+                    {
+                        fieldtype: "Link",
+                        fieldname: "item_code",
+                        label: __("Item"),
+                        options: "Item",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Link",
+                        fieldname: "s_warehouse",
+                        label: __("Source Warehouse"),
+                        options: "Warehouse",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Link",
+                        fieldname: "t_warehouse",
+                        label: __("WIP Warehouse"),
+                        options: "Warehouse",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "qty_to_manufacture",
+                        label: __("Qty to Manufacture"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "transferred_qty",
+                        label: __("Transferred"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "pending_qty",
+                        label: __("Pending"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "qty",
+                        label: __("Qty to Transfer"),
+                        in_list_view: 1,
+                        reqd: 1,
+                        columns: 1,
+                    },
+                    {
+                        // Carried so the server knows which order each qty belongs
+                        // to; never shown -- it is plumbing, not information.
+                        fieldtype: "Data",
+                        fieldname: "work_order_number",
+                        label: __("Work Order"),
+                        hidden: 1,
+                    },
+                ],
+            },
+        ],
+        primary_action_label: __("Start"),
+        primary_action(values) {
+            const selected = (values.rows || []).filter((row) => flt(row.qty) > 0);
+            if (!selected.length) {
+                frappe.msgprint(__("Enter a Qty to Transfer for at least one item."));
+                return;
+            }
+
+            const over = selected.find((row) => flt(row.qty) > flt(row.pending_qty));
+            if (over) {
+                frappe.msgprint(
+                    __("{0}: Qty to Transfer must not be more than the pending {1}.", [
+                        over.item_code,
+                        format_number(over.pending_qty),
+                    ]),
+                );
+                return;
+            }
+
+            d.hide();
+            frm.call({
+                method: "start_material_transfer",
+                doc: frm.doc,
+                args: { rows: selected },
+                freeze: true,
+                freeze_message: __("Transferring material to WIP..."),
+                callback: () => frm.reload_doc(),
+            });
+        },
+    });
+    d.show();
+}
+
+
+function pending_manufacture_rows(frm) {
+    const skip = frm.doc.skip_material_transfer_to_wip_warehouse;
+
+    return (frm.doc.items_to_be_manufacture || [])
+        .filter((row) => row.work_order_number)
+        .map((row) => {
+            const ceiling = skip ? flt(row.qty_to_manufacture) : flt(row.mateial_transfer_qty);
+            return {
+                work_order_number: row.work_order_number,
+                item_code: row.item_code,
+                t_warehouse: row.fg_warehouse || frm.doc.fg_warehouse,
+                qty_to_manufacture: flt(row.qty_to_manufacture),
+                transferred_qty: flt(row.mateial_transfer_qty),
+                produced_qty: flt(row.manufacture_qty),
+                pending_qty: ceiling - flt(row.manufacture_qty),
+            };
+        })
+        .filter((row) => row.pending_qty > 0)
+        .map((row) => ({ ...row, qty: row.pending_qty }));
+}
+
+
+function add_finish_button(frm) {
+    if (!pending_manufacture_rows(frm).length) return;
+
+    frm.add_custom_button(__("Finish"), () => {
+        finish_qty_dialog(frm, pending_manufacture_rows(frm));
+    }, __("Create"));
+}
+
+
+function finish_qty_dialog(frm, rows) {
+    const d = new frappe.ui.Dialog({
+        title: __("Finish -- Produce Finished Goods"),
+        size: "extra-large",
+        fields: [
+            {
+                fieldtype: "Table",
+                fieldname: "rows",
+                cannot_add_rows: 1,
+                cannot_delete_rows: 1,
+                in_place_edit: false,
+                data: rows,
+                get_data: () => rows,
+                fields: [
+                    {
+                        fieldtype: "Link",
+                        fieldname: "item_code",
+                        label: __("Item"),
+                        options: "Item",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 3,
+                    },
+                    {
+                        fieldtype: "Link",
+                        fieldname: "t_warehouse",
+                        label: __("Target Warehouse"),
+                        options: "Warehouse",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "qty_to_manufacture",
+                        label: __("Qty to Manufacture"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "transferred_qty",
+                        label: __("Transferred"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "produced_qty",
+                        label: __("Produced"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "pending_qty",
+                        label: __("Pending"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "qty",
+                        label: __("Qty to Produce"),
+                        in_list_view: 1,
+                        reqd: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Data",
+                        fieldname: "work_order_number",
+                        label: __("Work Order"),
+                        hidden: 1,
+                    },
+                ],
+            },
+        ],
+        primary_action_label: __("Finish"),
+        primary_action(values) {
+            const selected = (values.rows || []).filter((row) => flt(row.qty) > 0);
+            if (!selected.length) {
+                frappe.msgprint(__("Enter a Qty to Produce for at least one item."));
+                return;
+            }
+
+            const over = selected.find((row) => flt(row.qty) > flt(row.pending_qty));
+            if (over) {
+                frappe.msgprint(
+                    __("{0}: Qty to Produce must not be more than the pending {1}.", [
+                        over.item_code,
+                        format_number(over.pending_qty),
+                    ]),
+                );
+                return;
+            }
+
+            d.hide();
+            frm.call({
+                method: "finish_work_orders",
+                doc: frm.doc,
+                args: { rows: selected },
+                freeze: true,
+                freeze_message: __("Producing finished goods..."),
+                callback: () => frm.reload_doc(),
+            });
+        },
+    });
+    d.show();
 }
 
 
