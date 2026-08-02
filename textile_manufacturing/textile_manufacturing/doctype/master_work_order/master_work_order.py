@@ -3,6 +3,7 @@
 
 import frappe
 from frappe.model.document import Document
+from frappe.utils import flt
 
 
 class MasterWorkOrder(Document):
@@ -26,11 +27,16 @@ class MasterWorkOrder(Document):
 
     def on_submit(self):
         self.create_work_orders()
+        self.db_set("status", "Not Started")
+
+    def on_cancel(self):
+        self.db_set("status", "Cancelled")
 
     def create_work_orders(self):
         for row in self.items_to_be_manufacture:
             work_order = frappe.new_doc("Work Order")
             work_order.company = self.company
+            work_order.project = self.get("project")
             work_order.production_item = row.item_code
             work_order.bom_no = row.bom_no
             work_order.qty = row.qty_to_manufacture
@@ -326,16 +332,8 @@ class MasterWorkOrder(Document):
 
     @frappe.whitelist()
     def start_job_card(self):
-        # STEP 1: start every linked Work Order by transferring its raw material
-        # to WIP (ERPNext's own Material Transfer for Manufacture), which moves
-        # each Work Order to In Process.
         self.transfer_material_for_work_orders()
-
-        # STEP 2-4: create the Master Job Cards (which create the backend Job
-        # Cards) and link their numbers back.
         self.create_master_job_cards()
-
-        # STEP 5: Master Work Order goes In Process with the actual start stamped.
         self.db_set("actual_start_date", frappe.utils.now_datetime())
         self.db_set("status", "In Process")
 
@@ -420,6 +418,54 @@ class MasterWorkOrder(Document):
 
         self.db_set("status", "Stopped")
 
+    @frappe.whitelist()
+    def make_subcontracted_purchase_order(self):
+        from erpnext.stock.get_item_details import get_conversion_factor
+
+        if not self.items_to_be_manufacture:
+            frappe.throw(("There are no items to be manufactured to raise a Purchase Order for."))
+
+        transaction_date = frappe.utils.getdate()
+
+        def required_by(planned_start_date):
+            date = frappe.utils.getdate(planned_start_date or transaction_date)
+            return max(date, transaction_date)
+
+        purchase_order = frappe.new_doc("Purchase Order")
+        purchase_order.company = self.company
+        purchase_order.transaction_date = transaction_date
+        # Recomputed on validate as the earliest item date; set for the draft view.
+        purchase_order.schedule_date = required_by(self.planned_start_date)
+        purchase_order.master_work_order = self.name
+        purchase_order.cost_center = self.cost_center
+        purchase_order.project = self.get("project")
+        purchase_order.set_warehouse = self.wip_warehouse or self.fg_warehouse
+
+        for row in self.items_to_be_manufacture:
+            stock_uom = frappe.db.get_value("Item", row.item_code, "stock_uom")
+            uom = row.uom or stock_uom
+            conversion_factor = (
+                frappe.utils.flt(
+                    get_conversion_factor(row.item_code, uom).get("conversion_factor")
+                )
+                or 1.0
+            )
+
+            purchase_order.append("items", {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": row.qty_to_manufacture,
+                "uom": uom,
+                "stock_uom": stock_uom,
+                "conversion_factor": conversion_factor,
+                # Each row carries the Production Plan Item's own planned start
+                # date, the same value ERPNext copies onto its PO rows.
+                "schedule_date": required_by(row.planned_start_date or self.planned_start_date),
+                "warehouse": row.wip_warehouse or row.fg_warehouse,
+                "sales_order": row.get("sales_order_number"),
+            })
+
+        return purchase_order
 
 
 @frappe.whitelist()

@@ -170,6 +170,7 @@
    "options": "Cost Center"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "status",
    "fieldtype": "Select",
    "label": "Status",

@@ -148,6 +148,10 @@ doc_events = {
 		"on_submit": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
 		"on_cancel": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
 	},
+	"Quality Inspection": {
+		"on_submit": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail",
+		"on_cancel": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail"
+	},
 }
 
 # Create/refresh this app's custom fields on migrate.

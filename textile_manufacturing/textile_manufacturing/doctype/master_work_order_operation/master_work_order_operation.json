@@ -113,8 +113,9 @@
   {
    "allow_on_submit": 1,
    "fieldname": "master_job_card_number",
-   "fieldtype": "Data",
-   "label": "Master Job Card Number"
+   "fieldtype": "Link",
+   "label": "Master Job Card Number",
+   "options": "Master Job Card"
   },
   {
    "fieldname": "subcontracting_po_number",

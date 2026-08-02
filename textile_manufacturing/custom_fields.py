@@ -14,6 +14,26 @@ def make_custom_fields():
                 "insert_after": "work_order",
                 "read_only": 1,
                 "print_hide": 1,
+            },
+            {
+                "fieldname": "master_work_order",
+                "label": "Master Work Order",
+                "fieldtype": "Link",
+                "options": "Master Work Order",
+                "insert_after": "master_job_card",
+                "read_only": 1,
+                "print_hide": 1,
+            },
+        ],
+        "Purchase Order": [
+            {
+                "fieldname": "master_work_order",
+                "label": "Master Work Order",
+                "fieldtype": "Link",
+                "options": "Master Work Order",
+                "insert_after": "supplier",
+                "read_only": 1,
+                "print_hide": 1,
             }
         ],
     }

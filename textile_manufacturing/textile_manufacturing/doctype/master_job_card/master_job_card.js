@@ -8,6 +8,7 @@ frappe.ui.form.on("Master Job Card", {
         }
         toggle_material_tab(frm);
         add_action_buttons(frm);
+        add_quality_inspection_button(frm);
         render_job_timer(frm);
     },
 
@@ -72,6 +73,57 @@ function add_action_buttons(frm) {
             }
         });
     }, __("Create"));
+}
+
+
+function add_quality_inspection_button(frm) {
+    if (!frm.doc.quality_inspection_requied || frm.doc.docstatus !== 1) return;
+
+    const pending = (frm.doc.job_card_detail || []).filter(
+        (row) => row.job_card_number && !row.quality_inspection
+    );
+    if (!pending.length) return;
+
+    frm.add_custom_button(__("Quality Inspection"), () => {
+        quality_inspection_dialog(frm, pending);
+    }, __("Create"));
+}
+
+
+function quality_inspection_dialog(frm, pending) {
+    const d = new frappe.ui.Dialog({
+        title: __("Quality Inspection"),
+        fields: [
+            {
+                fieldtype: "Select",
+                fieldname: "detail_row",
+                label: __("Item"),
+                reqd: 1,
+                default: pending[0].name,
+                options: pending.map((row) => ({
+                    label: `${row.item_code}`,
+                    value: row.name,
+                })),
+            },
+        ],
+        primary_action_label: __("Create"),
+        primary_action(values) {
+            d.hide();
+            frm.call({
+                method: "make_quality_inspection",
+                doc: frm.doc,
+                args: { detail_row: values.detail_row },
+                freeze: true,
+                freeze_message: __("Building Quality Inspection..."),
+            }).then((r) => {
+                if (r.message) {
+                    const doc = frappe.model.sync(r.message)[0];
+                    frappe.set_route("Form", doc.doctype, doc.name);
+                }
+            });
+        },
+    });
+    d.show();
 }
 
 

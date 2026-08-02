@@ -117,6 +117,47 @@ class MasterJobCard(Document):
         return stock_entry
 
     # ------------------------------------------------------------------
+    # Quality Inspection
+    # ------------------------------------------------------------------
+    @frappe.whitelist()
+    def make_quality_inspection(self, detail_row):
+        row = next(
+            (r for r in (self.get("job_card_detail") or []) if r.name == detail_row),
+            None,
+        )
+        if not row:
+            frappe.throw(("Job Card Detail row {0} not found.").format(detail_row))
+
+        if row.quality_inspection:
+            frappe.throw(
+                ("Row {0} already has Quality Inspection {1}.").format(
+                    row.idx, row.quality_inspection
+                )
+            )
+
+        if not row.job_card_number:
+            frappe.throw(
+                ("Row {0}: the Job Card has not been created yet, so there is "
+                 "nothing to inspect against.").format(row.idx)
+            )
+
+        quality_inspection = frappe.new_doc("Quality Inspection")
+        quality_inspection.inspection_type = "In Process"
+        quality_inspection.reference_type = "Job Card"
+        quality_inspection.reference_name = row.job_card_number
+        quality_inspection.item_code = row.item_code
+        quality_inspection.item_name = row.item_name
+        quality_inspection.batch_no = row.batch_no
+        quality_inspection.sample_size = flt(row.qty_to_manufacture)
+        quality_inspection.bom_no = row.bom_no
+        quality_inspection.quality_inspection_template = self.quality_inspection_template
+        quality_inspection.company = self.company
+        quality_inspection.inspected_by = frappe.session.user
+        quality_inspection.get_item_specification_details()
+
+        return quality_inspection
+
+    # ------------------------------------------------------------------
     # Start / Pause / Resume / Complete -- applied on all linked Job Cards
     # ------------------------------------------------------------------
     @frappe.whitelist()
