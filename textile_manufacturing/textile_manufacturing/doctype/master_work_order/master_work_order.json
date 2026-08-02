@@ -174,7 +174,7 @@
    "fieldname": "status",
    "fieldtype": "Select",
    "label": "Status",
-   "options": "Draft\nNot Started\nIn Process\nCompleted\nStopped\nCancelled"
+   "options": "Draft\nNot Started\nIn Process\nCompleted\nStopped\nClosed\nCancelled"
   },
   {
    "fieldname": "planned_start_date",

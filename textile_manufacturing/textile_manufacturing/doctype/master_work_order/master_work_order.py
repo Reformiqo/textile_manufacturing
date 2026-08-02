@@ -349,6 +349,7 @@ class MasterWorkOrder(Document):
             stock_entry = frappe.get_doc(
                 make_stock_entry(row.work_order_number, "Material Transfer for Manufacture")
             )
+            stock_entry.master_work_order = self.name
             stock_entry.insert()
             stock_entry.submit()
 
@@ -402,21 +403,74 @@ class MasterWorkOrder(Document):
             stock_entry.insert()
             stock_entry.submit()
 
+    # ------------------------------------------------------------------
+    # Status -- Close / Stop / Re-open, applied to every linked Work Order
+    # ------------------------------------------------------------------
     @frappe.whitelist()
     def close_work_orders(self):
-        """Close every linked Work Order together (ERPNext close_work_order)."""
         from erpnext.manufacturing.doctype.work_order.work_order import close_work_order
 
-        for row in self.items_to_be_manufacture:
-            if not row.work_order_number:
-                continue
-            status = frappe.db.get_value("Work Order", row.work_order_number, "status")
+        for work_order in self.linked_work_orders():
+            status = frappe.db.get_value("Work Order", work_order, "status")
             if status in ("Closed", "Cancelled"):
                 continue
 
-            close_work_order(row.work_order_number, "Closed")
+            close_work_order(work_order, "Closed")
+
+        self.db_set("status", "Closed")
+
+    @frappe.whitelist()
+    def stop_work_orders(self):
+        from erpnext.manufacturing.doctype.work_order.work_order import stop_unstop
+
+        for work_order in self.linked_work_orders():
+            status = frappe.db.get_value("Work Order", work_order, "status")
+            if status in ("Stopped", "Closed", "Cancelled", "Completed"):
+                continue
+
+            stop_unstop(work_order, "Stopped")
 
         self.db_set("status", "Stopped")
+
+    @frappe.whitelist()
+    def reopen_work_orders(self):
+        from erpnext.manufacturing.doctype.work_order.work_order import stop_unstop
+
+        if self.status == "Closed":
+            frappe.throw("A Closed Master Work Order cannot be re-opened.")
+
+        for work_order in self.linked_work_orders():
+            status = frappe.db.get_value("Work Order", work_order, "status")
+            if status != "Stopped":
+                continue
+
+            stop_unstop(work_order, "Resumed")
+
+        self.db_set("status", self.status_after_reopen())
+
+    def linked_work_orders(self):
+        return [
+            row.work_order_number
+            for row in self.items_to_be_manufacture
+            if row.work_order_number
+        ]
+
+    def status_after_reopen(self):
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return "Not Started"
+
+        statuses = frappe.get_all(
+            "Work Order",
+            filters={"name": ["in", work_orders]},
+            pluck="status",
+        )
+        if statuses and all(status == "Completed" for status in statuses):
+            return "Completed"
+        if any(status not in ("Not Started", "Draft") for status in statuses):
+            return "In Process"
+
+        return "Not Started"
 
     @frappe.whitelist()
     def make_subcontracted_purchase_order(self):
