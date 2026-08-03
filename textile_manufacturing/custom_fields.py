@@ -36,6 +36,28 @@ def make_custom_fields():
                 "print_hide": 1,
             },
         ],
+        "Subcontracting Order": [
+            {
+                "fieldname": "master_work_order",
+                "label": "Master Work Order",
+                "fieldtype": "Link",
+                "options": "Master Work Order",
+                "insert_after": "purchase_order",
+                "read_only": 1,
+                "print_hide": 1,
+            }
+        ],
+        "Subcontracting Receipt": [
+            {
+                "fieldname": "master_work_order",
+                "label": "Master Work Order",
+                "fieldtype": "Link",
+                "options": "Master Work Order",
+                "insert_after": "supplier",
+                "read_only": 1,
+                "print_hide": 1,
+            }
+        ],
         "Purchase Order": [
             {
                 "fieldname": "master_work_order",

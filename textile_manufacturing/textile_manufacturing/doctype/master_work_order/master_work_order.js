@@ -89,20 +89,20 @@ function pending_transfer_rows(frm) {
         .filter((row) => row.pending_qty > 0)
         .map((row) => ({ ...row, qty: row.pending_qty }));
 }
-
-
+ 
+ 
 function add_start_button(frm) {
     if (frm.doc.skip_material_transfer_to_wip_warehouse || frm.doc.material_transfer_on === "Job Card") {
         return;
     }
     if (!pending_transfer_rows(frm).length) return;
-
+ 
     frm.add_custom_button(__("Start"), () => {
         transfer_qty_dialog(frm, pending_transfer_rows(frm));
     }, __("Create"));
 }
-
-
+ 
+ 
 function transfer_qty_dialog(frm, rows) {
     const d = new frappe.ui.Dialog({
         title: __("Material Transfer to WIP Warehouse"),
@@ -187,14 +187,14 @@ function transfer_qty_dialog(frm, rows) {
                 ],
             },
         ],
-        primary_action_label: __("Start"),
+        primary_action_label: __("Next"),
         primary_action(values) {
             const selected = (values.rows || []).filter((row) => flt(row.qty) > 0);
             if (!selected.length) {
                 frappe.msgprint(__("Enter a Qty to Transfer for at least one item."));
                 return;
             }
-
+ 
             const over = selected.find((row) => flt(row.qty) > flt(row.pending_qty));
             if (over) {
                 frappe.msgprint(
@@ -205,12 +205,163 @@ function transfer_qty_dialog(frm, rows) {
                 );
                 return;
             }
-
+ 
+            d.hide();
+            frm.call({
+                method: "get_transfer_materials",
+                doc: frm.doc,
+                args: { rows: selected },
+                freeze: true,
+                freeze_message: __("Working out the raw material..."),
+            }).then((r) => {
+                const materials = r.message || [];
+                if (!materials.length) {
+                    frappe.msgprint(__("There is no raw material to transfer for this qty."));
+                    return;
+                }
+                transfer_materials_dialog(frm, selected, materials);
+            });
+        },
+    });
+    d.show();
+}
+ 
+ 
+function transfer_materials_dialog(frm, rows, materials) {
+    // rows already has {item_code, work_order_number, ...} per selected item.
+    // Group the raw materials by work_order_number so each finished item
+    // gets its own table instead of one flat mixed list.
+    const groups = [];
+    const groups_by_wo = {};
+ 
+    rows.forEach((r) => {
+        const wo = r.work_order_number;
+        if (!groups_by_wo[wo]) {
+            groups_by_wo[wo] = { work_order_number: wo, item_code: r.item_code, materials: [] };
+            groups.push(groups_by_wo[wo]);
+        }
+    });
+ 
+    materials.forEach((m) => {
+        const grp = groups_by_wo[m.work_order_number];
+        if (grp) {
+            grp.materials.push(m);
+        }
+    });
+ 
+    const material_table_fields = [
+        {
+            fieldtype: "Link",
+            fieldname: "item_code",
+            label: __("Item"),
+            options: "Item",
+            in_list_view: 1,
+            read_only: 1,
+            columns: 2,
+        },
+        {
+            fieldtype: "Link",
+            fieldname: "s_warehouse",
+            label: __("Source Warehouse"),
+            options: "Warehouse",
+            in_list_view: 1,
+            read_only: 1,
+            columns: 2,
+        },
+        {
+            fieldtype: "Link",
+            fieldname: "t_warehouse",
+            label: __("WIP Warehouse"),
+            options: "Warehouse",
+            in_list_view: 1,
+            read_only: 1,
+            columns: 2,
+        },
+        {
+            fieldtype: "Float",
+            fieldname: "available_qty",
+            label: __("Available"),
+            in_list_view: 1,
+            read_only: 1,
+            columns: 1,
+        },
+        {
+            fieldtype: "Float",
+            fieldname: "suggested_qty",
+            label: __("Required"),
+            in_list_view: 1,
+            read_only: 1,
+            columns: 1,
+        },
+        {
+            fieldtype: "Float",
+            fieldname: "qty",
+            label: __("Qty to Transfer"),
+            in_list_view: 1,
+            reqd: 1,
+            columns: 2,
+        },
+        {
+            fieldtype: "Data",
+            fieldname: "work_order_number",
+            label: __("Work Order"),
+            hidden: 1,
+        },
+        {
+            fieldtype: "Int",
+            fieldname: "row_id",
+            label: __("Row"),
+            hidden: 1,
+        },
+    ];
+ 
+    // Build one Section Break + Table per item group so raw materials
+    // render as separate tables instead of a single mixed list.
+    const dialog_fields = [];
+    groups.forEach((grp, idx) => {
+        dialog_fields.push({
+            fieldtype: "Section Break",
+            label: `${grp.item_code} (${grp.materials.length} ${
+                grp.materials.length === 1 ? "raw material" : "raw materials"
+            })`,
+        });
+        dialog_fields.push({
+            fieldtype: "Table",
+            fieldname: `materials_${idx}`,
+            cannot_add_rows: 1,
+            cannot_delete_rows: 1,
+            in_place_edit: false,
+            data: grp.materials,
+            get_data: () => grp.materials,
+            fields: material_table_fields,
+        });
+    });
+ 
+    const d = new frappe.ui.Dialog({
+        title: __("Raw Material to Transfer"),
+        size: "extra-large",
+        fields: dialog_fields,
+        primary_action_label: __("Start"),
+        primary_action(values) {
+            // Merge rows back from every per-item table into one flat array
+            // before sending to the server -- the backend doesn't need to
+            // know the dialog grouped them visually.
+            let edited = [];
+            groups.forEach((grp, idx) => {
+                const table_values = values[`materials_${idx}`] || [];
+                edited = edited.concat(table_values.filter((row) => flt(row.qty) > 0));
+            });
+ 
+            if (!edited.length) {
+                frappe.msgprint(__("Enter a Qty to Transfer for at least one raw material."));
+                return;
+            }
+ 
             d.hide();
             frm.call({
                 method: "start_material_transfer",
                 doc: frm.doc,
-                args: { rows: selected },
+                args: { rows: rows, materials: edited },
                 freeze: true,
                 freeze_message: __("Transferring material to WIP..."),
                 callback: () => frm.reload_doc(),
@@ -219,7 +370,6 @@ function transfer_qty_dialog(frm, rows) {
     });
     d.show();
 }
-
 
 function pending_manufacture_rows(frm) {
     const skip = frm.doc.skip_material_transfer_to_wip_warehouse;

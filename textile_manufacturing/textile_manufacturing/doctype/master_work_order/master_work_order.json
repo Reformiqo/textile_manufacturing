@@ -114,6 +114,7 @@
    "options": "Master Work Order Item"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "operations",
    "fieldtype": "Table",
    "label": "Operations",

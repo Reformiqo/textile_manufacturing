@@ -3,7 +3,7 @@
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import flt
+from frappe.utils import cint, flt
 
 
 class MasterWorkOrder(Document):
@@ -37,6 +37,9 @@ class MasterWorkOrder(Document):
             self.db_set("status", "Not Started")
         else:
             self.db_set("status", "In Process")
+
+    def on_update_after_submit(self):
+        self.propagate_new_operations()
 
     def before_cancel(self):
         self.validate_linked_docs_cancelled()
@@ -388,8 +391,8 @@ class MasterWorkOrder(Document):
     # -------------------------------------------------
 
     @frappe.whitelist()
-    def start_material_transfer(self, rows=None):
-        self.transfer_material_for_work_orders(rows)
+    def start_material_transfer(self, rows=None, materials=None):
+        self.transfer_material_for_work_orders(rows, materials)
         if not self.actual_start_date:
             self.db_set("actual_start_date", frappe.utils.now_datetime())
 
@@ -423,12 +426,8 @@ class MasterWorkOrder(Document):
 
         return pending
 
-    def transfer_material_for_work_orders(self, rows=None):
-        from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
-
-        if not self.can_transfer_material():
-            return
-
+    def validated_transfer_rows(self, rows=None):
+        """The {work order, qty} rows a transfer may go ahead with."""
         allowed = self.pending_transfer_by_work_order()
         if not allowed:
             frappe.throw(
@@ -443,6 +442,7 @@ class MasterWorkOrder(Document):
             for work_order, qty in allowed.items()
         ]
 
+        validated = []
         for row in rows:
             work_order = row.get("work_order_number")
             qty = flt(row.get("qty"))
@@ -478,9 +478,58 @@ class MasterWorkOrder(Document):
                     )
                 )
 
-            stock_entry = frappe.get_doc(
-                make_stock_entry(work_order, "Material Transfer for Manufacture", qty)
-            )
+            validated.append({"work_order_number": work_order, "qty": qty})
+
+        return validated
+
+    def draft_transfer_entry(self, work_order, qty):
+        """The Stock Entry ERPNext would raise for this qty, unsaved."""
+        from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
+
+        return frappe.get_doc(
+            make_stock_entry(work_order, "Material Transfer for Manufacture", qty)
+        )
+
+    @frappe.whitelist()
+    def get_transfer_materials(self, rows=None):
+        """The raw material the transfer would move, for review before it happens.
+
+        Nothing is saved here -- the draft is built only to read its items off."""
+        if not self.can_transfer_material():
+            return []
+
+        materials = []
+        for row in self.validated_transfer_rows(rows):
+            stock_entry = self.draft_transfer_entry(row["work_order_number"], row["qty"])
+
+            for item in stock_entry.items:
+                materials.append({
+                    "work_order_number": row["work_order_number"],
+                    "row_id": item.idx,
+                    "item_code": item.item_code,
+                    "item_name": item.item_name,
+                    "s_warehouse": item.s_warehouse,
+                    "t_warehouse": item.t_warehouse,
+                    "uom": item.uom,
+                    "suggested_qty": flt(item.qty),
+                    "qty": flt(item.qty),
+                    "available_qty": flt(item.get("actual_qty")),
+                })
+
+        return materials
+
+    def transfer_material_for_work_orders(self, rows=None, materials=None):
+        if not self.can_transfer_material():
+            return
+
+        rows = self.validated_transfer_rows(rows)
+        edited = self.materials_by_work_order(materials)
+
+        for row in rows:
+            work_order = row["work_order_number"]
+            stock_entry = self.draft_transfer_entry(work_order, row["qty"])
+            self.apply_edited_materials(stock_entry, edited.get(work_order))
+
             stock_entry.master_work_order = self.name
             if not stock_entry.get("project"):
                 stock_entry.project = self.get("project")
@@ -488,6 +537,45 @@ class MasterWorkOrder(Document):
             stock_entry.submit()
 
         self.update_transferred_qty()
+
+    def materials_by_work_order(self, materials):
+        """Edited quantities keyed by work order, then by the row they came from."""
+        by_work_order = {}
+
+        for row in (frappe.parse_json(materials) if materials else []):
+            work_order = row.get("work_order_number")
+            if not work_order:
+                continue
+            by_work_order.setdefault(work_order, {})[
+                cint(row.get("row_id"))
+            ] = flt(row.get("qty"))
+
+        return by_work_order
+
+    def apply_edited_materials(self, stock_entry, edited):
+        """Carry the reviewed quantities onto the draft.
+
+        Only the qty is touched -- warehouses, rates and conversion factors stay as
+        ERPNext worked them out. A row set to zero is dropped from the entry."""
+        if not edited:
+            return
+
+        items = []
+        for item in stock_entry.items:
+            if item.idx in edited:
+                item.qty = edited[item.idx]
+
+            if flt(item.qty) > 0:
+                items.append(item)
+
+        if not items:
+            frappe.throw(
+                ("Every raw material line for Work Order {0} was set to zero -- "
+                 "there is nothing to transfer.").format(stock_entry.work_order),
+                title="Nothing to Transfer",
+            )
+
+        stock_entry.items = items
 
     def update_transferred_qty(self):
         for row in self.items_to_be_manufacture:
@@ -540,6 +628,91 @@ class MasterWorkOrder(Document):
                 "return_qty": return_qty,
                 "pending_transfer_qty": flt(row.requried_qty) - transfer_qty + return_qty,
             }, update_modified=False)
+
+    # -----------------------------------
+    # Operations added after the order is raised
+    # -----------------------------------
+    def propagate_new_operations(self):
+        """Carry an operation typed into the grid down to the shop floor.
+
+        A row added after submit exists on this order alone. The Work Orders need
+        their own operation row -- everything downstream keys off it -- then a Job
+        Card each, and a Master Job Card to take those up.
+
+        Having no Master Job Card is what marks a row as new, so this stays safe to
+        run on every update."""
+        raised = {card.operation_name for card in self.master_job_cards()}
+
+        for op in self.operations:
+            if op.manufacturing_type != "In-House":
+                continue
+            if not op.opration_name or op.opration_name in raised:
+                continue
+
+            for work_order in self.linked_work_orders():
+                self.add_work_order_operation(work_order, op)
+
+            card = self.make_master_job_card_for(op.opration_name)
+            raised.add(op.opration_name)
+
+            frappe.msgprint(
+                ("Operation {0} added, and Master Job Card {1} raised for it.").format(
+                    frappe.bold(op.opration_name),
+                    frappe.utils.get_link_to_form("Master Job Card", card),
+                ),
+                indicator="green",
+            )
+
+    def add_work_order_operation(self, work_order, operation):
+        """Add the operation to a submitted Work Order, and raise its Job Card."""
+        from erpnext.manufacturing.doctype.work_order.work_order import create_job_card
+
+        work_order = frappe.get_doc("Work Order", work_order)
+        if work_order.docstatus != 1:
+            return
+        if any(op.operation == operation.opration_name for op in work_order.operations):
+            return
+
+        row = work_order.append("operations", {
+            "operation": operation.opration_name,
+            "workstation": operation.workstation,
+            "workstation_type": operation.workstation_type,
+            "sequence_id": operation.opration_sequence_no,
+            "time_in_mins": flt(operation.standerd_time),
+            "hour_rate": flt(operation.hour_rate),
+            "status": "Pending",
+            "completed_qty": 0,
+            "process_loss_qty": 0,
+        })
+        row.docstatus = work_order.docstatus
+        row.db_insert()
+
+        # Not a stored field -- ERPNext sets it on the row in
+        # split_qty_based_on_batch_size() before it reaches create_job_card(), and
+        # the whole order goes on one card here.
+        row.job_card_qty = flt(work_order.qty)
+
+        # ERPNext's own builder, so the card carries operation_id and everything
+        # else check_if_operations_completed() later looks for.
+        create_job_card(work_order, row, auto_create=True)
+
+    def make_master_job_card_for(self, operation):
+        """A card for one operation, chained onto the last one raised here."""
+        previous = frappe.db.get_value(
+            "Master Job Card",
+            {"master_work_order_number": self.name, "docstatus": ["<", 2]},
+            "name",
+            order_by="creation desc",
+        )
+
+        master_job_card = frappe.new_doc("Master Job Card")
+        master_job_card.master_work_order_number = self.name
+        master_job_card.operation_name = operation
+        master_job_card.previous_opration_master_job_card = previous
+        master_job_card.fetch_from_master_work_order()
+        master_job_card.insert()
+
+        return master_job_card.name
 
     # -----------------------------------
     # Create Master Job Card
@@ -966,6 +1139,7 @@ class MasterWorkOrder(Document):
         purchase_order.cost_center = self.cost_center
         purchase_order.project = self.get("project")
         purchase_order.set_warehouse = self.wip_warehouse or self.fg_warehouse
+        purchase_order.is_subcontracted = 1
 
         for row in self.items_to_be_manufacture:
             stock_uom = frappe.db.get_value("Item", row.item_code, "stock_uom")
@@ -978,9 +1152,11 @@ class MasterWorkOrder(Document):
             )
 
             purchase_order.append("items", {
-                "item_code": row.item_code,
-                "item_name": row.item_name,
-                "qty": row.qty_to_manufacture,
+                # "item_code": row.item_code,
+                # "item_name": row.item_name,
+                # "qty": row.qty_to_manufacture,
+                "fg_item" : row.item_code,
+                "subcontracted_qty" : row.qty_to_manufacture,
                 "uom": uom,
                 "stock_uom": stock_uom,
                 "conversion_factor": conversion_factor,

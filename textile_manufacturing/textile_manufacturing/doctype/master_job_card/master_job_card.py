@@ -17,6 +17,13 @@ OPERATION_STATUS = {
     "Completed": "Completed",
 }
 
+# Out of the operation and into store is a receipt; back onto the floor to be
+# worked is a consumption.
+SFG_STOCK_ENTRY_TYPE = {
+    "Stock Out": "Material Receipt",
+    "Stock In": "Material Consumption for Manufacture",
+}
+
 
 class MasterJobCard(Document):
     def validate(self):
@@ -320,6 +327,120 @@ class MasterJobCard(Document):
                 "Job Card", job_card.name, "master_job_card", None, update_modified=False
             )
 
+    # ------------------------------------------------------------------
+    # Semi-finished goods
+    # ------------------------------------------------------------------
+    @frappe.whitelist()
+    def sfg_item_rows(self):
+        """The finished goods of this operation -- the same list either way."""
+        warehouse = self.sfg_warehouse or self.wip_warehouse
+
+        return [
+            {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "uom": row.uom,
+                "warehouse": warehouse,
+                "qty": flt(row.completed_qty) or flt(row.qty_to_manufacture),
+            }
+            for row in (self.get("job_card_detail") or [])
+            if row.item_code
+        ]
+
+    @frappe.whitelist()
+    def make_sfg_stock_entry(self, entry_type, rows=None):
+        """Post the semi-finished goods, and log what was posted.
+
+        Stock Out puts them into store, so it is a receipt. Stock In hands them back
+        to the floor to be worked, so it is a consumption."""
+        from erpnext.stock.get_item_details import get_conversion_factor
+
+        purpose = SFG_STOCK_ENTRY_TYPE.get(entry_type)
+        if not purpose:
+            frappe.throw(("{0} is not a semi-finished goods entry.").format(entry_type))
+
+        rows = frappe.parse_json(rows) if rows else self.sfg_item_rows()
+        incoming = entry_type == "Stock Out"
+
+        stock_entry = frappe.new_doc("Stock Entry")
+        # Both, and not set_stock_entry_type(): that reads purpose to work out the
+        # type, and ERPNext only fills purpose in from the type after it has already
+        # decided which warehouse is mandatory.
+        stock_entry.stock_entry_type = purpose
+        stock_entry.purpose = purpose
+        stock_entry.company = self.company
+        stock_entry.master_job_card = self.name
+        stock_entry.master_work_order = self.master_work_order_number
+        stock_entry.project = self.get("project")
+
+        booked = []
+        for row in rows:
+            qty = flt(row.get("qty"))
+            if qty <= 0:
+                continue
+
+            item_code = row.get("item_code")
+            warehouse = (
+                row.get("warehouse") or self.fg_warehouse
+            )
+            if not warehouse:
+                frappe.throw(
+                    ("{0}: a Warehouse is needed for this entry.").format(item_code)
+                )
+
+            stock_uom = frappe.db.get_value("Item", item_code, "stock_uom")
+            uom = row.get("uom") or stock_uom
+            conversion_factor = (
+                flt(get_conversion_factor(item_code, uom).get("conversion_factor")) or 1.0
+            )
+
+            stock_entry.append("items", {
+                "item_code": item_code,
+                "qty": qty,
+                "uom": uom,
+                "stock_uom": stock_uom,
+                "conversion_factor": conversion_factor,
+                "t_warehouse": warehouse if incoming else None,
+                "s_warehouse": None if incoming else warehouse,
+            })
+            booked.append({
+                "item_code": item_code,
+                "uom": uom,
+                "qty": qty,
+                "warehouse": warehouse,
+            })
+
+        if not stock_entry.get("items"):
+            frappe.throw("Enter a qty for at least one item.", title="Nothing to Post")
+
+        stock_entry.insert()
+        stock_entry.submit()
+
+        for row in booked:
+            self.append("sfg_stock", {
+                "entry_type": entry_type,
+                "item_code": row["item_code"],
+                "uom": row["uom"],
+                "qty": row["qty"],
+                "to_warehouse": row["warehouse"] if incoming else None,
+                "from_warehouse": None if incoming else row["warehouse"],
+                "stock_entry_reference": stock_entry.name,
+                "posting_date": frappe.utils.now_datetime(),
+            })
+
+        self.save_after_submit()
+
+        frappe.msgprint(
+            ("{0} posted on {1}.").format(
+                entry_type,
+                frappe.utils.get_link_to_form("Stock Entry", stock_entry.name),
+            ),
+            indicator="green",
+            alert=True,
+        )
+
+        return stock_entry.name
+
     @frappe.whitelist()
     def make_material_transfer_for_manufacture(self):
         """Build ONE consolidated 'Material Transfer for Manufacture' Stock Entry
@@ -332,6 +453,7 @@ class MasterJobCard(Document):
 
         stock_entry = frappe.new_doc("Stock Entry")
         stock_entry.stock_entry_type = "Material Transfer for Manufacture"
+        stock_entry.purpose = "Material Transfer for Manufacture"
         stock_entry.company = self.company
         stock_entry.from_warehouse = self.source_warehouse
         stock_entry.to_warehouse = self.wip_warehouse
@@ -361,7 +483,6 @@ class MasterJobCard(Document):
         if not stock_entry.get("items"):
             frappe.throw(("There is nothing pending to transfer."))
 
-        stock_entry.set_stock_entry_type()
         return stock_entry
 
     # ------------------------------------------------------------------
@@ -817,21 +938,34 @@ class MasterJobCard(Document):
         )
 
     def _set_detail_rows(self, mwo):
-        """One row per MWO item (work order) whose BOM includes this operation."""
+        """One row per MWO item (work order) whose BOM includes this operation.
+
+        An operation added to the order by hand is in no BOM at all, so when none of
+        them carry it every item runs through it instead."""
         self.set("job_card_detail", [])
+
+        bom_operation = {}
+        for item in mwo.items_to_be_manufacture:
+            if not item.bom_no:
+                continue
+            bom_operation[item.name] = next(
+                (r for r in self._bom_operation_rows(item.bom_no)
+                 if r.operation == self.operation_name),
+                None,
+            )
+
+        from_bom = any(bom_operation.values())
 
         for item in mwo.items_to_be_manufacture:
             if not item.bom_no:
                 continue
 
-            bom_op = next(
-                (r for r in self._bom_operation_rows(item.bom_no)
-                 if r.operation == self.operation_name),
-                None,
-            )
-            if not bom_op:
+            bom_op = bom_operation.get(item.name)
+            if from_bom and not bom_op:
                 # This work order does not run through this operation.
                 continue
+
+            bom_op = bom_op or frappe._dict()
 
             item_details = frappe.get_cached_value(
                 "Item", item.item_code, ["item_name", "stock_uom"], as_dict=True
@@ -845,9 +979,9 @@ class MasterJobCard(Document):
                 "work_order_number": item.get("work_order_number"),
                 "bom_no": item.bom_no,
                 "operation_name": self.operation_name,
-                "workstation": bom_op.workstation or self.workstation,
+                "workstation": bom_op.get("workstation") or self.workstation,
                 "qty_to_manufacture": item.qty_to_manufacture,
-                "standerd_time": bom_op.time_in_mins,
+                "standerd_time": flt(bom_op.get("time_in_mins")),
                 "status": "Open",
             })
 

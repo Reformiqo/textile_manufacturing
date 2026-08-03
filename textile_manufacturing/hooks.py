@@ -44,7 +44,8 @@ app_license = "mit"
 
 # include js in doctype views
 doctype_js = {
-    "Production Plan" : "public/js/production_plan.js"
+    "Production Plan" : "public/js/production_plan.js",
+    "Subcontracting Order" : "public/js/subcontracting_order.js"
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
@@ -148,6 +149,12 @@ doc_events = {
 		"on_submit": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
 		"on_cancel": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
 	},
+	"Subcontracting Order": {
+		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",
+	},
+	"Subcontracting Receipt": {
+		"validate": "textile_manufacturing.override.subcontracting_order.set_receipt_master_work_order",
+	},
 	"Quality Inspection": {
 		"on_submit": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail",
 		"on_cancel": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail"
@@ -156,6 +163,11 @@ doc_events = {
 
 # Create/refresh this app's custom fields on migrate.
 after_migrate = "textile_manufacturing.custom_fields.make_custom_fields"
+
+
+override_whitelisted_methods = {
+	"erpnext.controllers.subcontracting_controller.make_rm_stock_entry": "textile_manufacturing.override.subcontracting_order.make_rm_stock_entry",
+}
 
 
 override_doctype_class = {

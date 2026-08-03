@@ -9,7 +9,8 @@ frappe.ui.form.on("Master Job Card", {
         toggle_material_tab(frm);
         add_action_buttons(frm);
         add_quality_inspection_button(frm);
-        render_job_timer(frm);
+        add_sfg_button(frm);
+        set_job_card_dashboard(frm);
     },
 
     master_work_order_number: function (frm) {
@@ -125,36 +126,108 @@ function quality_inspection_dialog(frm, pending) {
 }
 
 
-function render_job_timer(frm){
-    if (frm.is_new() || frm.doc.docstatus !== 0) return;
-    if ((frm.doc.job_card_detail || []).every((r) => !r.job_card_number)) return;
-        
-    // Completed -> no timer actions.
-    if (frm.doc.status === "Completed") return;
+// Stock Out puts the goods into store (a receipt); Stock In hands them back to
+// the floor to be worked (a consumption).
+const SFG_ENTRY = {
+    "Stock Out": {
+        title: "SFG Stock Out -- Material Receipt",
+        warehouse_label: "Target Warehouse",
+    },
+    "Stock In": {
+        title: "SFG Stock In -- Material Consumption for Manufacture",
+        warehouse_label: "Source Warehouse",
+    },
+};
 
-    const time_log = frm.doc.time_log || [];
 
-    // Nothing logged yet -- the operation has not begun.
-    if (!time_log.length) {
-        frm.add_custom_button(__("Start"), () => start_jobs_dialog(frm), __("Job"));
-        return;
-    }
+function add_sfg_button(frm) {
+    if (frm.doc.docstatus !== 1) return;
 
-    // Paused: resuming is the only way on, the same as a Job Card on hold.
-    if (frm.doc.status === "On Hold") {
-        job_action_button(frm, __("Resume"), "resume_jobs");
-        return;
-    }
+    frm.call({ method: "sfg_item_rows", doc: frm.doc }).then((r) => {
+        const rows = r.message || [];
+        if (!rows.length) return;
 
-    if (time_log.some((t) => t.from_time && !t.to_time)) {
-        frm.add_custom_button(__("Pause"), () => pause_job_dialog(frm), __("Job"));
-        frm.add_custom_button(__("Complete"), () => complete_jobs_dialog(frm), __("Job"));
-        return;
-    }
+        Object.keys(SFG_ENTRY).forEach((entry_type) => {
+            frm.add_custom_button(__("SFG {0}", [entry_type]), () => {
+                sfg_stock_dialog(frm, entry_type, rows);
+            }, __("Create"));
+        });
+    });
+}
 
-    // Stopped but not on hold: pick the work back up, or close it out.
-    job_action_button(frm, __("Resume"), "resume_jobs");
-    frm.add_custom_button(__("Complete"), () => complete_jobs_dialog(frm), __("Job"));
+
+function sfg_stock_dialog(frm, entry_type, source_rows) {
+    const config = SFG_ENTRY[entry_type];
+    // A copy per dialog -- both buttons are handed the same list.
+    const rows = source_rows.map((row) => ({ ...row }));
+
+    const d = new frappe.ui.Dialog({
+        title: __(config.title),
+        size: "large",
+        fields: [
+            {
+                fieldtype: "Table",
+                fieldname: "rows",
+                cannot_add_rows: 1,
+                cannot_delete_rows: 1,
+                in_place_edit: false,
+                data: rows,
+                get_data: () => rows,
+                fields: [
+                    {
+                        fieldtype: "Link",
+                        fieldname: "item_code",
+                        label: __("Item"),
+                        options: "Item",
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 4,
+                    },
+                    {
+                        fieldtype: "Link",
+                        fieldname: "warehouse",
+                        label: __(config.warehouse_label),
+                        options: "Warehouse",
+                        in_list_view: 1,
+                        reqd: 1,
+                        columns: 4,
+                    },
+                    {
+                        fieldtype: "Float",
+                        fieldname: "qty",
+                        label: __("Qty"),
+                        in_list_view: 1,
+                        reqd: 1,
+                        columns: 2,
+                    },
+                    {
+                        fieldtype: "Data",
+                        fieldname: "uom",
+                        label: __("UOM"),
+                        hidden: 1,
+                    },
+                ],
+            },
+        ],
+        primary_action_label: __("Create"),
+        primary_action(values) {
+            const selected = (values.rows || []).filter((row) => flt(row.qty) > 0);
+            if (!selected.length) {
+                frappe.msgprint(__("Enter a Qty for at least one item."));
+                return;
+            }
+
+            d.hide();
+            frm.call({
+                method: "make_sfg_stock_entry",
+                doc: frm.doc,
+                args: { entry_type: entry_type, rows: selected },
+                freeze: true,
+                freeze_message: __("Creating Stock Entry..."),
+            }).then(() => frm.reload_doc());
+        },
+    });
+    d.show();
 }
 
 
@@ -434,4 +507,160 @@ function fetch_from_master_work_order(frm) {
             });
         },
     });
+}
+
+
+function set_job_card_dashboard(frm) {
+	// Submitted cards still show the widget -- read-only, for the total time.
+	if (frm.is_new() || frm.doc.docstatus === 2) return;
+	if ((frm.doc.job_card_detail || []).every((r) => !r.job_card_number)) return;
+
+	const wrapper = $(frm.fields_dict["job_card_dashboard"].wrapper);
+	wrapper.empty();
+
+	// Clear any previous timer tick before re-rendering.
+	if (frm._job_timer_interval) {
+		clearInterval(frm._job_timer_interval);
+		frm._job_timer_interval = null;
+	}
+
+	// Completed -> no timer actions, no widget at all.
+	// Trust either the status field, OR the actual quantities (in case status
+	// hasn't flipped yet, or the time log wasn't auto-closed server-side).
+	const all_rows_done = (frm.doc.job_card_detail || [])
+		.filter((row) => row.job_card_number)
+		.every((row) => {
+			const ordered = flt(row.qty_to_manufacture);
+			const accounted =
+				flt(row.completed_qty) + flt(row.rejected_qty) + flt(row.process_loss_qty);
+			return ordered - accounted <= 0.001;
+		});
+
+	// Done -- the total time stands as a record, with nothing left to press and
+	// nothing left to count.
+	if (frm.doc.status === "Completed" || frm.doc.docstatus === 1 || all_rows_done) {
+		render_job_timer_widget(wrapper, {
+			label: __("Total Time"),
+			seconds: flt(frm.doc.total_actual_time) * 60,
+			buttons_html: "",
+		});
+		return;
+	}
+
+	const time_log = frm.doc.time_log || [];
+	const running_log = all_rows_done ? null : time_log.find((t) => t.from_time && !t.to_time);
+
+	// ── Decide which buttons to show (same branches as the toolbar-button version) ──
+	let show_start = false,
+		show_resume = false,
+		show_pause = false,
+		show_complete = false;
+
+	if (!time_log.length) {
+		// Nothing logged yet -- the operation has not begun.
+		show_start = true;
+	} else if (frm.doc.status === "On Hold") {
+		// Paused: resuming is the only way on.
+		show_resume = true;
+	} else if (running_log) {
+		show_pause = true;
+		show_complete = true;
+	} else {
+		// Stopped but not on hold: pick work back up, or close it out.
+		show_resume = true;
+		show_complete = true;
+	}
+
+	const is_timer_running = !!running_log;
+
+	// ── Build HTML ──────────────────────────────────────────────────────
+	const btn = (cls, label) =>
+		`<button class="btn btn-sm ${cls}" style="font-weight:600;padding:6px 14px;">${label}</button>`;
+
+	const buttons_html = [
+		show_start && btn("btn-primary jt-btn-start", __("Start")),
+		show_resume && btn("btn-primary jt-btn-resume", __("Resume")),
+		show_pause && btn("btn-default jt-btn-pause", __("Pause")),
+		show_complete && btn("btn-primary jt-btn-complete", __("Complete")),
+	]
+		.filter(Boolean)
+		.join(" ");
+
+	render_job_timer_widget(wrapper, {
+		label: __("Elapsed Time"),
+		seconds: 0,
+		buttons_html: buttons_html,
+	});
+
+	// ── Bind click handlers (only after the HTML exists in the DOM) ─────
+	if (show_start) {
+		wrapper.find(".jt-btn-start").on("click", () => start_jobs_dialog(frm));
+	}
+	if (show_resume) {
+		wrapper.find(".jt-btn-resume").on("click", () => {
+			frm.call({
+				method: "resume_jobs",
+				doc: frm.doc,
+				freeze: true,
+				freeze_message: __("Processing linked Job Cards..."),
+			}).then(() => frm.reload_doc());
+		});
+	}
+	if (show_pause) {
+		wrapper.find(".jt-btn-pause").on("click", () => pause_job_dialog(frm));
+	}
+	if (show_complete) {
+		wrapper.find(".jt-btn-complete").on("click", () => complete_jobs_dialog(frm));
+	}
+
+	// ── Stopwatch tick, only while a log entry is actually open ─────────
+	if (!is_timer_running) return;
+
+	const timer_el = wrapper.find(".jt-stopwatch");
+	let elapsed = Math.floor(
+		(frappe.datetime.str_to_obj(frappe.datetime.now_datetime()) -
+			frappe.datetime.str_to_obj(running_log.from_time)) /
+			1000
+	);
+	if (isNaN(elapsed) || elapsed < 0) elapsed = 0;
+
+	timer_el.text(format_stopwatch(elapsed));
+	frm._job_timer_interval = setInterval(() => {
+		elapsed += 1;
+		timer_el.text(format_stopwatch(elapsed));
+	}, 1000);
+}
+
+
+function format_stopwatch(seconds) {
+	const pad = (n) => String(n).padStart(2, "0");
+	const h = Math.floor(seconds / 3600);
+	const m = Math.floor((seconds % 3600) / 60);
+	const s = Math.floor(seconds % 60);
+	return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+
+function render_job_timer_widget(wrapper, { label, seconds, buttons_html }) {
+	wrapper.append(`
+		<div class="job-timer-dashboard-widget"
+			style="border:1px solid var(--border-color);border-radius:var(--border-radius-lg,8px);
+				background:var(--card-bg,#fff);padding:16px 20px;margin-bottom:16px;">
+			<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+				<div>
+					<div style="font-size:10px;color:var(--text-muted);font-weight:600;
+						text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">
+						${label}
+					</div>
+					<span class="jt-stopwatch"
+						style="font-family:var(--monospace-font,'Courier New',monospace);
+						font-size:24px;font-weight:700;letter-spacing:2px;">
+						${format_stopwatch(seconds)}
+					</span>
+				</div>
+				<div style="display:flex;gap:8px;flex-wrap:wrap;">
+					${buttons_html}
+				</div>
+			</div>
+		</div>`);
 }

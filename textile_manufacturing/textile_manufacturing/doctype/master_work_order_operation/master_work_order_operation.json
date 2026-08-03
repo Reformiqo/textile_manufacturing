@@ -34,38 +34,44 @@
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Opration Name",
-   "options": "Operation"
+   "options": "Operation",
+   "allow_on_submit": 1
   },
   {
    "fieldname": "workstation",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Workstation",
-   "options": "Workstation"
+   "options": "Workstation",
+   "allow_on_submit": 1
   },
   {
    "fieldname": "workstation_type",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Workstation Type",
-   "options": "Workstation Type"
+   "options": "Workstation Type",
+   "allow_on_submit": 1
   },
   {
    "fieldname": "standerd_time",
    "fieldtype": "Float",
-   "label": "Standerd Time"
+   "label": "Standerd Time",
+   "allow_on_submit": 1
   },
   {
    "fieldname": "manufacturing_type",
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Manufacturing Type",
-   "options": "\nIn-House\nOut House"
+   "options": "\nIn-House\nOut House",
+   "allow_on_submit": 1
   },
   {
    "fieldname": "opration_sequence_no",
    "fieldtype": "Int",
-   "label": "Opration Sequence No"
+   "label": "Opration Sequence No",
+   "allow_on_submit": 1
   },
   {
    "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
@@ -73,7 +79,8 @@
    "fieldname": "supplier",
    "fieldtype": "Link",
    "label": "Supplier",
-   "options": "Supplier"
+   "options": "Supplier",
+   "allow_on_submit": 1
   },
   {
    "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
@@ -81,14 +88,16 @@
    "fieldname": "service_item",
    "fieldtype": "Link",
    "label": "Service Item",
-   "options": "Item"
+   "options": "Item",
+   "allow_on_submit": 1
   },
   {
    "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
    "description": "Rate per unit of the job work. Entered by hand, or fetched from the supplier's price list.",
    "fieldname": "job_work_rate",
    "fieldtype": "Currency",
-   "label": "Job Work Rate"
+   "label": "Job Work Rate",
+   "allow_on_submit": 1
   },
   {
    "allow_on_submit": 1,
