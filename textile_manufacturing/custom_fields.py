@@ -25,6 +25,17 @@ def make_custom_fields():
                 "print_hide": 1,
             },
         ],
+        "Job Card": [
+            {
+                "fieldname": "master_job_card",
+                "label": "Master Job Card",
+                "fieldtype": "Link",
+                "options": "Master Job Card",
+                "insert_after": "work_order",
+                "read_only": 1,
+                "print_hide": 1,
+            },
+        ],
         "Purchase Order": [
             {
                 "fieldname": "master_work_order",

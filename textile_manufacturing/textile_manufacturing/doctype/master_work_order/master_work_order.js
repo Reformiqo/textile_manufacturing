@@ -52,21 +52,6 @@ frappe.ui.form.on("Master Work Order", {
 function add_create_buttons(frm) {
     add_start_button(frm);
 
-    const has_master_job_card = (frm.doc.operations || []).some(
-        (op) => op.master_job_card_number
-    );
-    if (!has_master_job_card) {
-        frm.add_custom_button(__("Create Master Job Card"), () => {
-            frm.call({
-                method: "create_master_job_card",
-                doc: frm.doc,
-                freeze: true,
-                freeze_message: __("Creating Master Job Cards..."),
-                callback: () => frm.reload_doc(),
-            });
-        }, __("Create"));
-    }
-
     add_pending_master_job_card_button(frm);
 
     add_finish_button(frm);
@@ -439,18 +424,17 @@ function update_all_child_warehouses(frm) {
     frm.refresh_field("required_items");
 }
 
-// Create > Pending Master Job Card -- part production. Raises a fresh card for
-// the balance of an operation once an earlier card has been completed with only
-// part of the qty. The Pending Qty column of the operations table is the base.
-function add_pending_master_job_card_button(frm) {
-    const pending_operations = (frm.doc.operations || []).filter(
-        (op) => op.manufacturing_type === "In-House" && flt(op.pending_qty) > 0
-    );
-    if (!pending_operations.length) return;
 
-    frm.add_custom_button(__("Pending Master Job Card"), () => {
-        pending_master_job_card_dialog(frm, pending_operations);
-    }, __("Create"));
+function add_pending_master_job_card_button(frm) {
+    // The server decides: every Master Job Card completed, and the order still short.
+    frm.call("pending_master_job_card_operations").then((r) => {
+        const pending_operations = r.message || [];
+        if (!pending_operations.length) return;
+
+        frm.add_custom_button(__("Pending Master Job Card"), () => {
+            pending_master_job_card_dialog(frm, pending_operations);
+        }, __("Create"));
+    });
 }
 
 

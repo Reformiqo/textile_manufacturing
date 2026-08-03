@@ -159,7 +159,6 @@ after_migrate = "textile_manufacturing.custom_fields.make_custom_fields"
 
 
 override_doctype_class = {
-	"Work Order": "textile_manufacturing.override.work_order.CustomWorkOrder",
 	"Job Card": "textile_manufacturing.override.job_card.CustomJobCard",
 }
 

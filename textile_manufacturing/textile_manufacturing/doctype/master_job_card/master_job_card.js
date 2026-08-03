@@ -171,13 +171,14 @@ function complete_jobs_dialog(frm) {
         fields: [
             qty_report_grid(rows, [
                 { fieldname: "completed_qty", label: __("Completed Quantity") },
+                { fieldname: "pending_qty", label: __("Pending Quantity") },
                 { fieldname: "process_loss_qty", label: __("Process Loss Quantity") },
             ]),
         ],
         primary_action_label: __("Complete"),
         primary_action(values) {
             const selected = values.rows || [];
-            if (!valid_qty_report(selected, "process_loss_qty", true)) return;
+            if (!valid_qty_report(selected, ["pending_qty", "process_loss_qty"], true)) return;
 
             d.hide();
             frm.call({
@@ -291,6 +292,7 @@ function qty_report_rows(frm) {
                 qty_to_manufacture: ordered,
                 already_completed: done,
                 completed_qty: Math.max(ordered - accounted, 0),
+                pending_qty: 0,
                 rejected_qty: 0,
                 process_loss_qty: 0,
             };
@@ -351,15 +353,19 @@ function qty_report_grid(rows, editable) {
 }
 
 
-function valid_qty_report(rows, second_field, exact) {
+function valid_qty_report(rows, extra_fields, exact) {
     const TOLERANCE = 0.001;
+    const fields = Array.isArray(extra_fields) ? extra_fields : [extra_fields];
 
     for (const row of rows) {
         const ordered = flt(row.qty_to_manufacture);
-        const reported = flt(row.completed_qty) + flt(row[second_field]);
+        const reported = fields.reduce(
+            (sum, f) => sum + flt(row[f]),
+            flt(row.completed_qty),
+        );
         const total = flt(row.already_completed) + reported;
 
-        if (flt(row.completed_qty) < 0 || flt(row[second_field]) < 0) {
+        if (flt(row.completed_qty) < 0 || fields.some((f) => flt(row[f]) < 0)) {
             frappe.msgprint(__("Quantities cannot be negative."));
             return false;
         }
@@ -377,7 +383,7 @@ function valid_qty_report(rows, second_field, exact) {
 
         if (exact && ordered - total > TOLERANCE) {
             frappe.msgprint(
-                __("{0}: only {1} of {2} is accounted for. Completing has to account for the whole quantity -- add the balance as Completed or as Process Loss.", [
+                __("{0}: only {1} of {2} is accounted for. Add the balance as Completed, Process Loss, or Pending to carry it to a new Master Job Card.", [
                     over_label(row),
                     format_number(total),
                     format_number(ordered),

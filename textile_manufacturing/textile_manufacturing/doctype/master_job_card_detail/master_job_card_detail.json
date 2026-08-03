@@ -181,6 +181,7 @@
    "options": "Quality Inspection"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "rejection_reason",
    "fieldtype": "Small Text",
    "label": "Rejection Reason"

@@ -27,6 +27,26 @@ class MasterWorkOrder(Document):
                 )
 
 
+    def on_submit(self):
+        # Work Orders first: submitting them is what raises the Job Cards the Master
+        # Job Cards then take up.
+        self.create_work_orders()
+        self.create_master_job_cards()
+
+        if not self.skip_material_transfer_to_wip_warehouse:
+            self.db_set("status", "Not Started")
+        else:
+            self.db_set("status", "In Process")
+
+    def before_cancel(self):
+        self.validate_linked_docs_cancelled()
+
+    def on_cancel(self):
+        self.db_set("status", "Cancelled")
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
     def validate_unique_production_plan(self):
         if not self.production_plan_number:
             return
@@ -52,16 +72,18 @@ class MasterWorkOrder(Document):
             title="Master Work Order Already Exists",
         )
 
-    def on_submit(self):
-        self.create_work_orders()
-        if not self.skip_material_transfer_to_wip_warehouse:
-            self.db_set("status", "Not Started")
-        else:
-            self.db_set("status", "In Process")
+    def validate_linked_docs_cancelled(self):
+        pending = []
 
-    def on_cancel(self):
-        self.db_set("status", "Cancelled")
+        for row in self.items_to_be_manufacture:
+            if row.work_order_number and frappe.db.get_value(
+                "Work Order", row.work_order_number, "docstatus"
+            ) == 1:
+                pending.append(("Work Order {0}").format(row.work_order_number))
 
+    # ------------------------------------------------------------------
+    # Create Work Orders
+    # ------------------------------------------------------------------
     def create_work_orders(self):
         for row in self.items_to_be_manufacture:
             work_order = frappe.new_doc("Work Order")
@@ -87,8 +109,7 @@ class MasterWorkOrder(Document):
 
 
     def set_in_house_operations(self, work_order):
-        """Fetch operations from the BOM but pass only the In-House ones to the
-        Work Order. Out House (subcontracted) operations are skipped."""
+        """Pass only the In-House BOM operations to the Work Order."""
         if not work_order.bom_no:
             return
 
@@ -101,19 +122,9 @@ class MasterWorkOrder(Document):
         work_order.operations = in_house_operations
 
 
-    def before_cancel(self):
-        self.validate_linked_docs_cancelled()
-
-    def validate_linked_docs_cancelled(self):
-        pending = []
-
-        for row in self.items_to_be_manufacture:
-            if row.work_order_number and frappe.db.get_value(
-                "Work Order", row.work_order_number, "docstatus"
-            ) == 1:
-                pending.append(("Work Order {0}").format(row.work_order_number))
-
-
+    # ------------------------------------------------------------------
+    # Fetch From Production Plan Details
+    # ------------------------------------------------------------------
     @frappe.whitelist()
     def fetch_from_production_plan(self):
         if not self.production_plan_number:
@@ -213,8 +224,7 @@ class MasterWorkOrder(Document):
             if item.bom_no:
                 bom_qty_map[item.bom_no] = bom_qty_map.get(item.bom_no, 0) + (item.qty_to_manufacture or 0)
 
-        # Combine the same operation coming from multiple BOMs into a single row,
-        # summing its standard time and the qty to manufacture.
+        # One row per operation, even if several BOMs run it.
         consolidated = {}
         unique_workstation = set()
         for op in operations:
@@ -277,8 +287,7 @@ class MasterWorkOrder(Document):
                 )
             )
 
-        # Group by item so the same raw material coming from multiple BOMs is
-        # shown as a single row with the total required qty.
+        # One row per raw material, totalled across the BOMs that need it.
         consolidated = {}
         for item in items:
             row = consolidated.setdefault(item.item_code, {
@@ -341,7 +350,7 @@ class MasterWorkOrder(Document):
     def set_scrap_items(self, scrap_items):
         self.set("scrap_item", [])
 
-        # Group by item so scrap coming from multiple BOMs is shown as a single row.
+        # One row per scrap item, totalled across the BOMs that produce it.
         consolidated = {}
         for item in scrap_items:
             row = consolidated.setdefault(item.item_code, {
@@ -374,6 +383,9 @@ class MasterWorkOrder(Document):
         total_minutes = sum(frappe.utils.flt(op.standerd_time) for op in self.operations)
         self.planned_end_date = frappe.utils.add_to_date(start, minutes=total_minutes)
 
+    # -------------------------------------------------
+    # Master Work Order Status 
+    # -------------------------------------------------
 
     @frappe.whitelist()
     def start_material_transfer(self, rows=None):
@@ -381,16 +393,6 @@ class MasterWorkOrder(Document):
         if not self.actual_start_date:
             self.db_set("actual_start_date", frappe.utils.now_datetime())
 
-
-    @frappe.whitelist()
-    def create_master_job_card(self):
-        self.create_master_job_cards()
-
-        if self.status != "In Process":
-            self.db_set("status", "In Process")
-
-        if not self.actual_start_date:
-            self.db_set("actual_start_date", frappe.utils.now_datetime())
 
     def can_transfer_material(self):
         if self.skip_material_transfer_to_wip_warehouse:
@@ -402,11 +404,8 @@ class MasterWorkOrder(Document):
         return True
 
     def pending_transfer_by_work_order(self):
-        """
-        Read from the stored rows, deliberately -- not from self. The form posts its
-        own copy of the document, so a tab left open since before an earlier partial
-        transfer carries a stale Material Transfer Qty and would happily ask for more
-        than is actually left. Going to the database is what catches that."""
+        """Read from the database, not from self -- an old tab posts a stale
+        Material Transfer Qty and would ask for more than is left."""
         pending = {}
         for row in frappe.get_all(
             "Master Work Order Item",
@@ -508,6 +507,9 @@ class MasterWorkOrder(Document):
             )
 
         self.update_required_item_transfers()
+        # Transferring material puts the Work Orders In Process, so this order has to
+        # move with them -- it was sitting at Not Started until the Finish.
+        self.set_status_from_work_orders()
 
     def update_required_item_transfers(self):
         work_orders = self.linked_work_orders()
@@ -539,6 +541,9 @@ class MasterWorkOrder(Document):
                 "pending_transfer_qty": flt(row.requried_qty) - transfer_qty + return_qty,
             }, update_modified=False)
 
+    # -----------------------------------
+    # Create Master Job Card
+    # -----------------------------------
     def create_master_job_cards(self):
         created = []
 
@@ -554,7 +559,6 @@ class MasterWorkOrder(Document):
             master_job_card.fetch_from_master_work_order()
             master_job_card.insert()
 
-            op.db_set("master_job_card_number", master_job_card.name, update_modified=False)
             previous_master_job_card = master_job_card.name
             created.append(master_job_card.name)
 
@@ -598,15 +602,50 @@ class MasterWorkOrder(Document):
 
         return pending
 
-    def validate_master_job_cards_completed(self):
-        if not self.skip_material_transfer_to_wip_warehouse:
-            return
+    def master_job_cards(self):
+        """The Master Job Cards raised against this order, newest last."""
+        return frappe.get_all(
+            "Master Job Card",
+            filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
+            fields=["name", "operation_name", "status"],
+            order_by="creation",
+        )
 
+    @frappe.whitelist()
+    def pending_master_job_card_operations(self):
+        """Operations whose balance can be carried onto a fresh Master Job Card.
+
+        Read off the cards themselves, not the operation rows: a pending card carries
+        the same operation name, so sync_to_master_work_order() puts that row back to
+        Pending as soon as one is raised."""
+        if flt(self.total_manufacture_qty) == flt(self.total_qty_to_manufacture):
+            return []
+
+        cards = self.master_job_cards()
+        if not cards or any(card.status != "Completed" for card in cards):
+            return []
+
+        return [
+            {
+                "opration_name": op.opration_name,
+                "pending_qty": flt(op.pending_qty),
+            }
+            for op in self.operations
+            if op.manufacturing_type == "In-House" and flt(op.pending_qty) > 0
+        ]
+
+    def validate_master_job_cards_completed(self):
         in_house = [op for op in self.operations if op.manufacturing_type == "In-House"]
         if not in_house:
             return
 
-        missing = [op.opration_name for op in in_house if not op.master_job_card_number]
+        cards = self.master_job_cards()
+
+        missing = [
+            op.opration_name
+            for op in in_house
+            if op.opration_name not in {card.operation_name for card in cards}
+        ]
         if missing:
             frappe.throw(
                 ("No Master Job Card has been raised for: {0}.<br><br>"
@@ -616,12 +655,7 @@ class MasterWorkOrder(Document):
                 title="Operations Not Complete",
             )
 
-        cards = [op.master_job_card_number for op in in_house]
-        incomplete = frappe.get_all(
-            "Master Job Card",
-            filters={"name": ["in", cards], "status": ["!=", "Completed"]},
-            fields=["name", "operation_name", "status"],
-        )
+        incomplete = [card for card in cards if card.status != "Completed"]
         if not incomplete:
             return
 
@@ -705,8 +739,7 @@ class MasterWorkOrder(Document):
         self.update_manufactured_qty()
 
     def update_manufactured_qty(self):
-        """Bring this order's own tables back in step with what the Work Orders now
-        report, then let the status and the Production Plan follow from it."""
+        """Refresh this order's tables from what the Work Orders now report."""
         produced_total = 0.0
 
         for row in self.items_to_be_manufacture:
@@ -732,10 +765,35 @@ class MasterWorkOrder(Document):
 
         self.db_set("total_manufacture_qty", produced_total, update_modified=False)
 
-        # Consumed qty moves with a Manufacture entry, so the raw material table has
-        # to be refreshed too.
+        self.update_production_costs()
+
+        # A Manufacture entry consumes raw material, so refresh that table too.
         self.update_required_item_transfers()
         self.set_status_from_work_orders()
+
+    def update_production_costs(self):
+        """Cost of what was produced, off the Manufacture Stock Entries.
+
+        Only Manufacture entries -- a transfer to WIP moves material without
+        consuming it, and counting it would charge the same stock twice."""
+        entries = frappe.get_all(
+            "Stock Entry",
+            filters={
+                "master_work_order": self.name,
+                "purpose": "Manufacture",
+                "docstatus": 1,
+            },
+            fields=["total_outgoing_value", "total_additional_costs"],
+        )
+
+        self.db_set({
+            "total_raw_material_cost": sum(
+                flt(entry.total_outgoing_value) for entry in entries
+            ),
+            "total_operating_cost": sum(
+                flt(entry.total_additional_costs) for entry in entries
+            ),
+        }, update_modified=False)
 
     def item_status(self, work_order_status):
         """Map a Work Order status onto the shorter set the item rows carry."""
@@ -746,8 +804,7 @@ class MasterWorkOrder(Document):
         return "In Process"
 
     def set_status_from_work_orders(self):
-        """Completed only once every Work Order is, which is also when the actual end
-        date is known and the Production Plan can be brought up to date."""
+        """Completed only once every Work Order is."""
         work_orders = self.linked_work_orders()
         if not work_orders:
             return
@@ -768,10 +825,8 @@ class MasterWorkOrder(Document):
 
 
     def update_production_plan(self):
-        """Push produced qty back to the Production Plan.
-
-        The Work Orders raised here carry no production_plan link, so ERPNext's own
-        write-back never fires and the plan would sit at Submitted for ever."""
+        """Push produced qty back to the Production Plan. Our Work Orders carry no
+        production_plan link, so ERPNext never does this on its own."""
         if not self.production_plan_number:
             return
 
@@ -797,19 +852,14 @@ class MasterWorkOrder(Document):
             row.pending_qty = flt(row.planned_qty) - produced[row.name]
             row.db_update()
 
-        # The closing sequence ERPNext runs in update_produced_pending_qty: total
-        # first, then let the plan decide its own status. set_status() only persists
-        # when called with an explicit `close`, so store it here.
+        # set_status() does not save on its own, so store the status after it.
         production_plan.calculate_total_produced_qty()
         production_plan.set_status()
         production_plan.db_set("status", production_plan.status)
 
     def map_to_production_plan_items(self, production_plan):
-        """Pair each row back to the Production Plan Item it came from.
-
-        The rows don't store that reference, so match on item + BOM + sales order --
-        the same key fetch_production_plan_items copied across -- taking candidates in
-        row order so two rows for one item land on separate plan rows."""
+        """Pair each row back to its Production Plan Item. The link is not stored, so
+        match on item + BOM + sales order, in row order."""
         available = {}
         for row in production_plan.po_items:
             key = (row.item_code, row.bom_no, row.sales_order or None)
@@ -826,7 +876,7 @@ class MasterWorkOrder(Document):
         return mapping
 
     # ------------------------------------------------------------------
-    # Status -- Close / Stop / Re-open, applied to every linked Work Order
+    # Status -- Close / Stop / Re-open
     # ------------------------------------------------------------------
     @frappe.whitelist()
     def close_work_orders(self):

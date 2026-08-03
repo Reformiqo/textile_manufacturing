@@ -21,7 +21,6 @@
   "actual_time",
   "hour_rate",
   "operating_cost",
-  "master_job_card_number",
   "subcontracting_po_number",
   "total_qty_to_manufacture",
   "completed_qty",
@@ -69,28 +68,40 @@
    "label": "Opration Sequence No"
   },
   {
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Handled through a plain Subcontracting Purchase Order, not a Job Card.",
    "fieldname": "supplier",
    "fieldtype": "Link",
    "label": "Supplier",
    "options": "Supplier"
   },
   {
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Non-stock service item of the job work (Dyeing Charge, Washing Charge). This is what goes on the Purchase Order, in place of the BOM.",
    "fieldname": "service_item",
    "fieldtype": "Link",
    "label": "Service Item",
    "options": "Item"
   },
   {
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Rate per unit of the job work. Entered by hand, or fetched from the supplier's price list.",
    "fieldname": "job_work_rate",
    "fieldtype": "Currency",
    "label": "Job Work Rate"
   },
   {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Qty sent to the supplier, through a Stock Entry transferring material to the supplier warehouse.",
    "fieldname": "material_sent_qty",
    "fieldtype": "Float",
    "label": "Material Sent Qty"
   },
   {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Qty received back from the supplier, through a Stock Entry.",
    "fieldname": "received_qty",
    "fieldtype": "Float",
    "label": "Received Qty"
@@ -112,16 +123,13 @@
   },
   {
    "allow_on_submit": 1,
-   "fieldname": "master_job_card_number",
-   "fieldtype": "Link",
-   "label": "Master Job Card Number",
-   "options": "Master Job Card"
-  },
-  {
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Plain Purchase Order carrying the Service Item. No subcontracting BOM and no BOM validation.",
    "fieldname": "subcontracting_po_number",
    "fieldtype": "Link",
    "label": "Subcontracting PO Number",
-   "options": "Purchase Order"
+   "options": "Purchase Order",
+   "read_only": 1
   },
   {
    "fieldname": "total_qty_to_manufacture",
@@ -147,7 +155,8 @@
    "fieldname": "status",
    "fieldtype": "Select",
    "label": "Status",
-   "options": "\nPending\nWork In Progress\nCompleted"
+   "options": "\nPending\nWork In Progress\nCompleted",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
