@@ -24,26 +24,10 @@ SFG_STOCK_ENTRY_TYPE = {
     "Stock In": "Material Consumption for Manufacture",
 }
 
-# The one accounting this card recognises: every piece it was raised for is either
-# completed, lost to the process, rejected, or still pending. The four have to come
-# to the Qty to Manufacture, and nothing may be counted twice or go missing.
-ACCOUNTED_FIELDS = ("completed_qty", "process_loss_qty", "rejected_qty", "pending_qty")
-
-# The three of those the operation has actually used up. Pending is left out here on
-# purpose: it is the balance, derived from the other three by calculate_detail_rows(),
-# so adding it back would make every sum come to the order by construction.
-CONSUMED_FIELDS = ("completed_qty", "process_loss_qty", "rejected_qty")
-
+ACCOUNTED_FIELDS = ("completed_qty", "process_loss_qty", "rejected_qty")
 
 def accounted_qty(source):
-    """completed + process loss + rejected + pending, off a detail row or a
-    reported dict alike."""
     return sum(flt(source.get(field)) for field in ACCOUNTED_FIELDS)
-
-
-def consumed_qty(source):
-    """What the order has already been drawn down by -- see CONSUMED_FIELDS."""
-    return sum(flt(source.get(field)) for field in CONSUMED_FIELDS)
 
 
 class MasterJobCard(Document):
@@ -136,25 +120,6 @@ class MasterJobCard(Document):
         if status == "Completed":
             self.db_set("actual_end_date", now_datetime())
             self.push_ceiling_to_next_operation()
-
-
-        # master_job_cards = frappe.get_all(
-        #     "Master Job Card",
-        #     filters={"master_work_order_number": self.name},
-        #     fields=["name", "total_process_loss_qty", "status", "total_rejected_qty"],
-        # )
-
-        # total_process_loss_qty = sum(
-        #     flt(job_card.process_loss_qty) for job_card in master_job_cards
-        # )
-        # total_rejected_qty = sum(
-        #     flt(job_card.total_rejected_qty) for job_card in master_job_cards
-        # )
-        # frappe.db.set_value("Master Work Order", self.master_work_order_number, {
-        #     "total_process_loss" : total_process_loss_qty,
-        #     "total_rejected_qty" : total_rejected_qty
-        # })
-
 
 
     def sync_to_master_work_order(self):
@@ -615,7 +580,6 @@ class MasterJobCard(Document):
         if not rows:
             return
 
-        tolerance = 0.001
         detail = {
             row.job_card_number: row
             for row in (self.get("job_card_detail") or [])
@@ -632,9 +596,9 @@ class MasterJobCard(Document):
                 continue
 
             # What the row has already used up, plus everything this run reports.
-            total = consumed_qty(row) + accounted_qty(data)
+            total = accounted_qty(data)
 
-            if abs(total - ordered) <= tolerance:
+            if abs(total <= ordered):
                 continue
 
             frappe.throw(
@@ -1213,10 +1177,6 @@ class MasterJobCard(Document):
                     row.completed_qty = completed_by_jc[row.job_card_number]
                 if row.job_card_number in rejected_by_jc:
                     row.rejected_qty = rejected_by_jc[row.job_card_number]
-
-            # Pending is the balance of the order, and what makes the four terms add
-            # up: whatever was not completed, lost or rejected is still to be made.
-            row.pending_qty = flt(row.qty_to_manufacture) - consumed_qty(row)
 
 
     def calculate_scrap_items(self):

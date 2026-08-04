@@ -38,8 +38,6 @@
   "quality_inspection_template",
   "total_qty_to_manufacture",
   "total_completed_qty",
-  "total_process_loss_qty",
-  "total_rejected_qty",
   "total_standerd_time",
   "total_actual_time",
   "hour_rate",
@@ -55,8 +53,6 @@
   "remarks",
   "detail_tab",
   "job_card_detail",
-  "material_tab",
-  "required_item",
   "time_tab",
   "time_log",
   "section_break_mulk",
@@ -289,16 +285,6 @@
    "label": "Total Completed Qty"
   },
   {
-   "fieldname": "total_process_loss_qty",
-   "fieldtype": "Float",
-   "label": "Total Process Loss Qty"
-  },
-  {
-   "fieldname": "total_rejected_qty",
-   "fieldtype": "Float",
-   "label": "Total Rejected Qty"
-  },
-  {
    "fieldname": "total_standerd_time",
    "fieldtype": "Float",
    "label": "Total Standerd Time",
@@ -343,17 +329,6 @@
    "options": "Master Job Card Detail"
   },
   {
-   "fieldname": "material_tab",
-   "fieldtype": "Tab Break",
-   "label": "Material"
-  },
-  {
-   "fieldname": "required_item",
-   "fieldtype": "Table",
-   "label": "Required Item",
-   "options": "Master Job Card Required Item"
-  },
-  {
    "fieldname": "time_tab",
    "fieldtype": "Tab Break",
    "label": "Time"
@@ -394,6 +369,7 @@
    "label": "Scrap"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "scrap_item",
    "fieldtype": "Table",
    "label": "Scrap Item",
@@ -414,7 +390,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-04 22:10:39.946637",
+ "modified": "2026-08-04 22:32:13.470832",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",
