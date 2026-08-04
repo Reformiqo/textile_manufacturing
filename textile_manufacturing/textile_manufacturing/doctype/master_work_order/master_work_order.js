@@ -95,10 +95,11 @@ function add_start_button(frm) {
     if (frm.doc.skip_material_transfer_to_wip_warehouse || frm.doc.material_transfer_on === "Job Card") {
         return;
     }
-    if (!pending_transfer_rows(frm).length) return;
- 
+    const rows = pending_transfer_rows(frm);
+    if (!rows.length) return;
+
     frm.add_custom_button(__("Start"), () => {
-        transfer_qty_dialog(frm, pending_transfer_rows(frm));
+        transfer_qty_dialog(frm, rows);
     }, __("Create"));
 }
  
@@ -228,9 +229,6 @@ function transfer_qty_dialog(frm, rows) {
  
  
 function transfer_materials_dialog(frm, rows, materials) {
-    // rows already has {item_code, work_order_number, ...} per selected item.
-    // Group the raw materials by work_order_number so each finished item
-    // gets its own table instead of one flat mixed list.
     const groups = [];
     const groups_by_wo = {};
  
@@ -377,7 +375,15 @@ function pending_manufacture_rows(frm) {
     return (frm.doc.items_to_be_manufacture || [])
         .filter((row) => row.work_order_number)
         .map((row) => {
-            const ceiling = skip ? flt(row.qty_to_manufacture) : flt(row.mateial_transfer_qty);
+            // The row carries what is left to produce; when material has to reach
+            // WIP first, only what was transferred can be produced right now.
+            const pending = skip
+                ? flt(row.pending_qty)
+                : Math.min(
+                    flt(row.pending_qty),
+                    flt(row.mateial_transfer_qty) - flt(row.manufacture_qty),
+                );
+
             return {
                 work_order_number: row.work_order_number,
                 item_code: row.item_code,
@@ -385,7 +391,7 @@ function pending_manufacture_rows(frm) {
                 qty_to_manufacture: flt(row.qty_to_manufacture),
                 transferred_qty: flt(row.mateial_transfer_qty),
                 produced_qty: flt(row.manufacture_qty),
-                pending_qty: ceiling - flt(row.manufacture_qty),
+                pending_qty: pending,
             };
         })
         .filter((row) => row.pending_qty > 0)
@@ -394,10 +400,11 @@ function pending_manufacture_rows(frm) {
 
 
 function add_finish_button(frm) {
-    if (!pending_manufacture_rows(frm).length) return;
+    const rows = pending_manufacture_rows(frm);
+    if (!rows.length) return;
 
     frm.add_custom_button(__("Finish"), () => {
-        finish_qty_dialog(frm, pending_manufacture_rows(frm));
+        finish_qty_dialog(frm, rows);
     }, __("Create"));
 }
 
@@ -592,13 +599,6 @@ function pending_master_job_card_dialog(frm, pending_operations) {
     const d = new frappe.ui.Dialog({
         title: __("Create Master Job Card for Pending Qty"),
         fields: [
-            {
-                fieldtype: "HTML",
-                fieldname: "help",
-                options: `<p class="text-muted small">${__(
-                    "Leave the selection empty to cover every operation that still has pending qty."
-                )}</p>`,
-            },
             {
                 fieldtype: "MultiSelectPills",
                 fieldname: "operations",

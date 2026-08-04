@@ -159,22 +159,26 @@
   {
    "fieldname": "expected_start_date",
    "fieldtype": "Datetime",
-   "label": "Expected Start Date"
+   "label": "Expected Start Date",
+   "read_only": 1
   },
   {
    "fieldname": "expected_end_date",
    "fieldtype": "Datetime",
-   "label": "Expected End Date"
+   "label": "Expected End Date",
+   "read_only": 1
   },
   {
    "fieldname": "actual_start_date",
    "fieldtype": "Datetime",
-   "label": "Actual Start Date"
+   "label": "Actual Start Date",
+   "read_only": 1
   },
   {
    "fieldname": "actual_end_date",
    "fieldtype": "Datetime",
-   "label": "Actual End Date"
+   "label": "Actual End Date",
+   "read_only": 1
   },
   {
    "fetch_from": "master_work_order_number.material_transfer_on",
@@ -231,21 +235,24 @@
    "fieldname": "total_sfg_stock_out_qty",
    "fieldtype": "Float",
    "label": "Total SFG Stock Out Qty",
-   "precision": "2"
+   "precision": "2",
+   "read_only": 1
   },
   {
    "default": "0",
    "fieldname": "total_sfg_stock_in_qty",
    "fieldtype": "Float",
    "label": "Total SFG Stock In Qty",
-   "precision": "2"
+   "precision": "2",
+   "read_only": 1
   },
   {
    "default": "0",
    "fieldname": "sfg_balance_qty",
    "fieldtype": "Float",
    "label": "SFG Balance Qty",
-   "precision": "2"
+   "precision": "2",
+   "read_only": 1
   },
   {
    "fieldname": "project",
@@ -300,22 +307,26 @@
   {
    "fieldname": "total_standerd_time",
    "fieldtype": "Float",
-   "label": "Total Standerd Time"
+   "label": "Total Standerd Time",
+   "read_only": 1
   },
   {
    "fieldname": "total_actual_time",
    "fieldtype": "Float",
-   "label": "Total Actual Time"
+   "label": "Total Actual Time",
+   "read_only": 1
   },
   {
    "fieldname": "hour_rate",
    "fieldtype": "Currency",
-   "label": "Hour Rate"
+   "label": "Hour Rate",
+   "read_only": 1
   },
   {
    "fieldname": "total_operating_cost",
    "fieldtype": "Currency",
-   "label": "Total Operating Cost"
+   "label": "Total Operating Cost",
+   "read_only": 1
   },
   {
    "fieldname": "section_break_knyb",
@@ -377,6 +388,7 @@
    "label": "SFG"
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "sfg_stock",
    "fieldtype": "Table",
    "label": "SFG Stock",
@@ -408,7 +420,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-01 15:54:30.424794",
+ "modified": "2026-08-04 14:56:07.261626",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",

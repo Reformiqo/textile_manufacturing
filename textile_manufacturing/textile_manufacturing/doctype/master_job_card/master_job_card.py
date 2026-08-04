@@ -28,11 +28,16 @@ SFG_STOCK_ENTRY_TYPE = {
 class MasterJobCard(Document):
     def validate(self):
         self.validate_operation_is_in_house()
-        self.set_actual_dates()
         self.validate_quality_inspection()
         self.validate_rejection_reason()
 
     def before_save(self):
+        self.recalculate()
+
+    def before_update_after_submit(self):
+        self.recalculate()
+
+    def recalculate(self):
         # These only compute/derive values (they don't validate anything), so
         # they run on save rather than during validation.
         self.recalculate_time_logs()
@@ -122,6 +127,7 @@ class MasterJobCard(Document):
         # The single point both routes to Completed pass through -- on_submit(), and
         # complete_jobs() when material still holds the submit back.
         if status == "Completed":
+            self.db_set("actual_end_date", now_datetime())
             self.push_ceiling_to_next_operation()
 
     def sync_to_master_work_order(self):
@@ -533,6 +539,7 @@ class MasterJobCard(Document):
     def start_jobs(self, employees=None):
         self.start_operators(employees)
         self.drive_job_cards("start")
+        self.db_set("actual_start_date", now_datetime())
         self.set_card_status("Work In Progress")
 
     def start_operators(self, employees):
@@ -729,6 +736,14 @@ class MasterJobCard(Document):
                     data.get("process_loss_qty")
                 )
 
+            # The reason is reported beside the reject that needs it -- Pause is the
+            # only place a reject is entered, and validate_rejection_reason() refuses
+            # the save without one. Only overwritten when the dialog actually sends a
+            # reason, so a later run does not blank the reason of an earlier one.
+            reason = (data.get("rejection_reason") or "").strip()
+            if reason:
+                row.rejection_reason = reason
+
         self.save_after_submit()
 
     def job_cards_blocking_submit(self):
@@ -782,8 +797,10 @@ class MasterJobCard(Document):
         self.save_after_submit()
 
     def save_after_submit(self):
-        # This card keeps being updated after submit (time logs, totals), so skip
-        # the "cannot change after submit" guard and let before_save refresh totals.
+        # This card keeps being updated after submit (time logs, totals), so skip the
+        # "cannot change after submit" guard. Frappe routes this save through
+        # update_after_submit, so the totals are refreshed by
+        # before_update_after_submit() rather than before_save().
         self.flags.ignore_validate_update_after_submit = True
         self.save()
 
@@ -1289,12 +1306,6 @@ class MasterJobCard(Document):
         self.total_standerd_time = sum(flt(r.standerd_time) for r in detail)
         self.total_actual_time = sum(flt(r.time_in_mins) for r in self.time_log)
         self.total_operating_cost = (flt(self.total_actual_time) / 60.0) * flt(self.hour_rate)
-
-    def set_actual_dates(self):
-        from_times = [l.from_time for l in self.time_log if l.from_time]
-        to_times = [l.to_time for l in self.time_log if l.to_time]
-        self.actual_start_date = min(from_times) if from_times else None
-        self.actual_end_date = max(to_times) if to_times else None
 
     def set_status(self):
         # Respect manual / terminal states.

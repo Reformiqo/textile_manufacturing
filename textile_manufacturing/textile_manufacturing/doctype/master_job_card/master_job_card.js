@@ -126,8 +126,8 @@ function quality_inspection_dialog(frm, pending) {
 }
 
 
-// Stock Out puts the goods into store (a receipt); Stock In hands them back to
-// the floor to be worked (a consumption).
+// Stock Out puts the goods into store (a receipt); 
+// Stock In hands them back to the floor to be worked (a consumption).
 const SFG_ENTRY = {
     "Stock Out": {
         title: "SFG Stock Out -- Material Receipt",
@@ -251,7 +251,7 @@ function complete_jobs_dialog(frm) {
         primary_action_label: __("Complete"),
         primary_action(values) {
             const selected = values.rows || [];
-            if (!valid_qty_report(selected, ["pending_qty", "process_loss_qty"], true)) return;
+            if (!valid_qty_report(frm, selected, ["pending_qty", "process_loss_qty"], true)) return;
 
             d.hide();
             frm.call({
@@ -320,7 +320,7 @@ function pause_job_dialog(frm) {
         fields: [
             {
                 fieldtype: "Data",
-                label: __("Reason"),
+                label: __("Pause Reason"),
                 fieldname: "reason",
                 reqd: 1,
             },
@@ -330,12 +330,19 @@ function pause_job_dialog(frm) {
             qty_report_grid(rows, [
                 { fieldname: "completed_qty", label: __("Completed Quantity") },
                 { fieldname: "rejected_qty", label: __("Rejected Quantity") },
+                {
+                    fieldname: "rejection_reason",
+                    label: __("Rejection Reason"),
+                    fieldtype: "Data",
+                    columns: 3,
+                },
             ]),
         ],
         primary_action_label: __("Pause"),
         primary_action(values) {
             const selected = values.rows || [];
-            if (!valid_qty_report(selected, "rejected_qty")) return;
+            if (!valid_qty_report(frm, selected, "rejected_qty")) return;
+            if (!valid_rejection_reason(selected)) return;
 
             d.hide();
             frm.call({
@@ -363,13 +370,30 @@ function qty_report_rows(frm) {
                 job_card_number: row.job_card_number,
                 item_code: row.item_code,
                 qty_to_manufacture: ordered,
-                already_completed: done,
                 completed_qty: Math.max(ordered - accounted, 0),
                 pending_qty: 0,
                 rejected_qty: 0,
                 process_loss_qty: 0,
+                rejection_reason: row.rejection_reason || "",
             };
         });
+}
+
+
+function valid_rejection_reason(rows) {
+    const missing = rows.filter(
+        (row) => flt(row.rejected_qty) > 0 && !(row.rejection_reason || "").trim()
+    );
+    if (!missing.length) return true;
+
+    frappe.msgprint({
+        title: __("Rejection Reason Missing"),
+        message: __("Enter a Rejection Reason for: {0}", [
+            missing.map((row) => over_label(row)).join(", "),
+        ]),
+        indicator: "red",
+    });
+    return false;
 }
 
 
@@ -390,7 +414,7 @@ function qty_report_grid(rows, editable) {
                 options: "Item",
                 in_list_view: 1,
                 read_only: 1,
-                columns: 3,
+                columns: 2,
             },
             {
                 fieldtype: "Float",
@@ -400,20 +424,12 @@ function qty_report_grid(rows, editable) {
                 read_only: 1,
                 columns: 2,
             },
-            {
-                fieldtype: "Float",
-                fieldname: "already_completed",
-                label: __("Already Completed"),
-                in_list_view: 1,
-                read_only: 1,
-                columns: 2,
-            },
             ...editable.map((f) => ({
-                fieldtype: "Float",
+                fieldtype: f.fieldtype || "Float",
                 fieldname: f.fieldname,
                 label: f.label,
                 in_list_view: 1,
-                columns: 2,
+                columns: f.columns || 2,
             })),
             {
                 fieldtype: "Data",
@@ -426,17 +442,26 @@ function qty_report_grid(rows, editable) {
 }
 
 
-function valid_qty_report(rows, extra_fields, exact) {
+function valid_qty_report(frm, rows, extra_fields, exact) {
     const TOLERANCE = 0.001;
     const fields = Array.isArray(extra_fields) ? extra_fields : [extra_fields];
 
+    const detail = {};
+    (frm.doc.job_card_detail || []).forEach((row) => {
+        if (row.job_card_number) detail[row.job_card_number] = row;
+    });
+
     for (const row of rows) {
-        const ordered = flt(row.qty_to_manufacture);
+        // Read the qty already booked off the detail row rather than carrying it
+        // through the dialog -- reporting adds to what the card holds, it does not
+        // replace it, and this is the same sum complete_jobs() checks server side.
+        const source = detail[row.job_card_number] || {};
+        const ordered = flt(source.qty_to_manufacture);
         const reported = fields.reduce(
             (sum, f) => sum + flt(row[f]),
             flt(row.completed_qty),
         );
-        const total = flt(row.already_completed) + reported;
+        const total = flt(source.completed_qty) + reported;
 
         if (flt(row.completed_qty) < 0 || fields.some((f) => flt(row[f]) < 0)) {
             frappe.msgprint(__("Quantities cannot be negative."));

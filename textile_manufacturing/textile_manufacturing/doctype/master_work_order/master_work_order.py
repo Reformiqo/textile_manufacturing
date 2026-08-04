@@ -28,15 +28,11 @@ class MasterWorkOrder(Document):
 
 
     def on_submit(self):
-        # Work Orders first: submitting them is what raises the Job Cards the Master
-        # Job Cards then take up.
         self.create_work_orders()
         self.create_master_job_cards()
 
-        if not self.skip_material_transfer_to_wip_warehouse:
-            self.db_set("status", "Not Started")
-        else:
-            self.db_set("status", "In Process")
+        status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
+        self.db_set("status", status)
 
     def on_update_after_submit(self):
         self.propagate_new_operations()
@@ -106,9 +102,12 @@ class MasterWorkOrder(Document):
             self.set_in_house_operations(work_order)
 
             work_order.insert()
-            work_order.submit()
+            work_order.submit()   # This will trigger Job Card Creation
 
-            row.db_set("work_order_number", work_order.name, update_modified=False)
+            row.db_set({
+                "work_order_number": work_order.name,
+                "pending_qty": flt(row.qty_to_manufacture) - flt(row.manufacture_qty),
+            }, update_modified=False)
 
 
     def set_in_house_operations(self, work_order):
@@ -180,6 +179,7 @@ class MasterWorkOrder(Document):
                     "production_plan_number": self.production_plan_number,
                     "qty_to_manufacture": item.planned_qty,
                     "manufacture_qty" : item.produced_qty,
+                    "pending_qty": flt(item.planned_qty) - flt(item.produced_qty),
                     "bom_no": item.bom_no,
                     "source_warehouse": self.source_warehouse,
                     "fg_warehouse": self.fg_warehouse,
@@ -387,7 +387,7 @@ class MasterWorkOrder(Document):
         self.planned_end_date = frappe.utils.add_to_date(start, minutes=total_minutes)
 
     # -------------------------------------------------
-    # Master Work Order Status 
+    # Master Work Order Status
     # -------------------------------------------------
 
     @frappe.whitelist()
@@ -493,7 +493,6 @@ class MasterWorkOrder(Document):
     @frappe.whitelist()
     def get_transfer_materials(self, rows=None):
         """The raw material the transfer would move, for review before it happens.
-
         Nothing is saved here -- the draft is built only to read its items off."""
         if not self.can_transfer_material():
             return []
@@ -595,8 +594,6 @@ class MasterWorkOrder(Document):
             )
 
         self.update_required_item_transfers()
-        # Transferring material puts the Work Orders In Process, so this order has to
-        # move with them -- it was sitting at Not Started until the Finish.
         self.set_status_from_work_orders()
 
     def update_required_item_transfers(self):
@@ -633,14 +630,7 @@ class MasterWorkOrder(Document):
     # Operations added after the order is raised
     # -----------------------------------
     def propagate_new_operations(self):
-        """Carry an operation typed into the grid down to the shop floor.
-
-        A row added after submit exists on this order alone. The Work Orders need
-        their own operation row -- everything downstream keys off it -- then a Job
-        Card each, and a Master Job Card to take those up.
-
-        Having no Master Job Card is what marks a row as new, so this stays safe to
-        run on every update."""
+        # This is used to add operations after the master work order is submitted
         raised = {card.operation_name for card in self.master_job_cards()}
 
         for op in self.operations:
@@ -691,9 +681,6 @@ class MasterWorkOrder(Document):
         # split_qty_based_on_batch_size() before it reaches create_job_card(), and
         # the whole order goes on one card here.
         row.job_card_qty = flt(work_order.qty)
-
-        # ERPNext's own builder, so the card carries operation_id and everything
-        # else check_if_operations_completed() later looks for.
         create_job_card(work_order, row, auto_create=True)
 
     def make_master_job_card_for(self, operation):
@@ -1154,8 +1141,8 @@ class MasterWorkOrder(Document):
             purchase_order.append("items", {
                 # "item_code": row.item_code,
                 # "item_name": row.item_name,
-                # "qty": row.qty_to_manufacture,
                 "fg_item" : row.item_code,
+                "fg_item_qty": row.qty_to_manufacture,
                 "subcontracted_qty" : row.qty_to_manufacture,
                 "uom": uom,
                 "stock_uom": stock_uom,

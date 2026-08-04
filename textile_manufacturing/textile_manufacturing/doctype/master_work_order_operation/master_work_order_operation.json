@@ -25,7 +25,6 @@
   "total_qty_to_manufacture",
   "completed_qty",
   "pending_qty",
-  "pending_master_job_card",
   "status"
  ],
  "fields": [
@@ -154,11 +153,6 @@
    "fieldname": "pending_qty",
    "fieldtype": "Float",
    "label": "Pending Qty"
-  },
-  {
-   "fieldname": "pending_master_job_card",
-   "fieldtype": "Data",
-   "label": "Pending Master Job Card"
   },
   {
    "fieldname": "status",
