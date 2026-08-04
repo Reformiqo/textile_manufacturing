@@ -18,14 +18,6 @@ class MasterWorkOrder(Document):
                     )
                 )
 
-        for row in self.operations:
-            if not row.manufacturing_type:
-                frappe.throw(
-                    ("Row {0}: Manufacturing Type is not set for operation {1}").format(
-                        row.idx, row.opration_name
-                    )
-                )
-
 
     def on_submit(self):
         self.create_work_orders()
@@ -33,6 +25,9 @@ class MasterWorkOrder(Document):
 
         status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
         self.db_set("status", status)
+
+    def before_update_after_submit(self):
+        self.validate_manufacturing_type_not_rerouted()
 
     def on_update_after_submit(self):
         self.propagate_new_operations()
@@ -70,6 +65,32 @@ class MasterWorkOrder(Document):
             ),
             title="Master Work Order Already Exists",
         )
+
+    def validate_manufacturing_type_not_rerouted(self):
+        was = dict(frappe.get_all(
+            "Master Work Order Operation",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=["name", "manufacturing_type"],
+            as_list=True,
+        ))
+
+        for row in self.operations:
+            previous = was.get(row.name)
+            if not previous or row.manufacturing_type == previous:
+                continue
+
+            frappe.throw(
+                ("Row {0}: {1} is already running as {2}, so its Manufacturing Type "
+                 "cannot be changed to {3}.<br><br>The work has been raised against "
+                 "that choice -- cancel this order to route the operation "
+                 "differently.").format(
+                    row.idx,
+                    frappe.bold(row.opration_name or ""),
+                    frappe.bold(previous),
+                    frappe.bold(row.manufacturing_type or "empty"),
+                ),
+                title="Operation Already Routed",
+            )
 
     def validate_linked_docs_cancelled(self):
         pending = []
@@ -111,17 +132,20 @@ class MasterWorkOrder(Document):
 
 
     def set_in_house_operations(self, work_order):
-        """Pass only the In-House BOM operations to the Work Order."""
         if not work_order.bom_no:
             return
 
         work_order.set_work_order_operations()
 
-        in_house_operations = [
-            op for op in work_order.operations if not op.is_subcontracted
-        ]
+        in_house = {
+            op.opration_name
+            for op in self.operations
+            if op.manufacturing_type == "In-House" and op.opration_name
+        }
 
-        work_order.operations = in_house_operations
+        work_order.operations = [
+            op for op in work_order.operations if op.operation in in_house
+        ]
 
 
     # ------------------------------------------------------------------
@@ -210,7 +234,6 @@ class MasterWorkOrder(Document):
                 "workstation",
                 "workstation_type",
                 "time_in_mins",
-                "is_subcontracted",
             ],
             order_by="parent",
         )
@@ -239,7 +262,6 @@ class MasterWorkOrder(Document):
                 "workstation_type": op.workstation_type,
                 "standerd_time": 0,
                 "total_qty_to_manufacture": 0,
-                "manufacturing_type": "Out House" if op.is_subcontracted else "In-House",
                 "counted_boms": set(),
             })
             row["standerd_time"] += op.time_in_mins or 0
@@ -662,6 +684,12 @@ class MasterWorkOrder(Document):
             return
         if any(op.operation == operation.opration_name for op in work_order.operations):
             return
+        # if this operation is not in bom then we dont need to link this bom
+        if not frappe.db.exists(
+            "BOM Operation",
+            {"parent": work_order.bom_no, "operation": operation.opration_name}
+        ):
+            return
 
         row = work_order.append("operations", {
             "operation": operation.opration_name,
@@ -916,10 +944,16 @@ class MasterWorkOrder(Document):
             produced = flt(work_order.produced_qty)
             produced_total += produced
 
+            process_loss = flt(work_order.process_loss_qty)
+
             row.db_set({
                 "manufacture_qty": produced,
-                "process_loss_qty": flt(work_order.process_loss_qty),
-                "pending_qty": flt(row.qty_to_manufacture) - produced,
+                "process_loss_qty": process_loss,
+                # Same accounting the Master Job Card keeps: what was lost is not
+                # waiting to be made. Taking pending as ordered less produced left
+                # every loss standing here as an outstanding quantity, and the order
+                # then offered to raise fresh cards for pieces that no longer exist.
+                "pending_qty": flt(row.qty_to_manufacture) - produced - process_loss,
                 "status": self.item_status(work_order.status),
             }, update_modified=False)
 

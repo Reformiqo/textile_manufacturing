@@ -24,6 +24,27 @@ SFG_STOCK_ENTRY_TYPE = {
     "Stock In": "Material Consumption for Manufacture",
 }
 
+# The one accounting this card recognises: every piece it was raised for is either
+# completed, lost to the process, rejected, or still pending. The four have to come
+# to the Qty to Manufacture, and nothing may be counted twice or go missing.
+ACCOUNTED_FIELDS = ("completed_qty", "process_loss_qty", "rejected_qty", "pending_qty")
+
+# The three of those the operation has actually used up. Pending is left out here on
+# purpose: it is the balance, derived from the other three by calculate_detail_rows(),
+# so adding it back would make every sum come to the order by construction.
+CONSUMED_FIELDS = ("completed_qty", "process_loss_qty", "rejected_qty")
+
+
+def accounted_qty(source):
+    """completed + process loss + rejected + pending, off a detail row or a
+    reported dict alike."""
+    return sum(flt(source.get(field)) for field in ACCOUNTED_FIELDS)
+
+
+def consumed_qty(source):
+    """What the order has already been drawn down by -- see CONSUMED_FIELDS."""
+    return sum(flt(source.get(field)) for field in CONSUMED_FIELDS)
+
 
 class MasterJobCard(Document):
     def validate(self):
@@ -73,17 +94,6 @@ class MasterJobCard(Document):
     # Validation
     # ------------------------------------------------------------------
     def validate_rejection_reason(self):
-        """Rejected qty has to say why.
-
-        Without it the reject is a dead number -- nobody can tell later whether it was
-        a machine fault, bad yarn or an operator error, which is the only reason to
-        collect reject data at all.
-
-        The qty checked is the greater of the row's own value and what the time logs
-        add up to for that Job Card. Both are needed: validate() runs before
-        before_save(), so on the save that first books a reject the row has not been
-        rolled up yet -- and a figure typed straight onto the row would otherwise be
-        ignored, because the log total wins as soon as any log exists."""
         rejected_by_job_card = {}
         for log in self.time_log:
             if not log.job_card_number:
@@ -124,11 +134,29 @@ class MasterJobCard(Document):
         self.db_set("status", status)
         self.sync_to_master_work_order()
 
-        # The single point both routes to Completed pass through -- on_submit(), and
-        # complete_jobs() when material still holds the submit back.
         if status == "Completed":
             self.db_set("actual_end_date", now_datetime())
             self.push_ceiling_to_next_operation()
+
+
+        # master_job_cards = frappe.get_all(
+        #     "Master Job Card",
+        #     filters={"master_work_order_number": self.name},
+        #     fields=["name", "total_process_loss_qty", "status", "total_rejected_qty"],
+        # )
+
+        # total_process_loss_qty = sum(
+        #     flt(job_card.process_loss_qty) for job_card in master_job_cards
+        # )
+        # total_rejected_qty = sum(
+        #     flt(job_card.total_rejected_qty) for job_card in master_job_cards
+        # )
+        # frappe.db.set_value("Master Work Order", self.master_work_order_number, {
+        #     "total_process_loss" : total_process_loss_qty,
+        #     "total_rejected_qty" : total_rejected_qty
+        # })
+
+
 
     def sync_to_master_work_order(self):
         if not self.master_work_order_number or not self.operation_name:
@@ -147,11 +175,6 @@ class MasterJobCard(Document):
             return
 
         completed = flt(self.total_completed_qty)
-
-        # Actual time is logged in minutes, the rate is per hour. The rate is carried
-        # over as well so the cost on the operation row can always be read back off the
-        # two figures beside it -- a Workstation repriced mid-run would otherwise leave
-        # a cost there that its own hour rate no longer explains.
         actual_time = flt(self.total_actual_time)
         hour_rate = flt(self.hour_rate)
 
@@ -160,8 +183,8 @@ class MasterJobCard(Document):
             row,
             {
                 "status": OPERATION_STATUS.get(self.status, "Pending"),
+                "total_qty_to_manufacture": flt(self.total_qty_to_manufacture),
                 "completed_qty": completed,
-                "pending_qty": flt(self.total_qty_to_manufacture) - completed,
                 "actual_time": actual_time,
                 "hour_rate": hour_rate,
                 "operating_cost": (actual_time / 60.0) * hour_rate,
@@ -603,13 +626,6 @@ class MasterJobCard(Document):
 
     @frappe.whitelist()
     def complete_jobs(self, rows=None):
-        """Report the completed qty, then submit only if the Job Cards allow it.
-
-        ERPNext keeps those two apart: validate_transfer_qty() refuses to submit a Job
-        Card carrying its own material rows until that material has reached WIP. That
-        is the Material Transfer On = Job Card case -- work can be reported as done
-        while the card waits in draft for the transfer. So the operation is completed
-        here, and submitted only when nothing is holding it back."""
         self.validate_complete_qty(rows)
         self.book_reported_qty(rows)
         self.drive_job_cards("complete")
@@ -663,12 +679,8 @@ class MasterJobCard(Document):
             if not ordered:
                 continue
 
-            total = (
-                flt(row.completed_qty)
-                + flt(data.get("completed_qty"))
-                + flt(data.get("process_loss_qty"))
-                + flt(data.get("pending_qty"))
-            )
+            # What the row has already used up, plus everything this run reports.
+            total = consumed_qty(row) + accounted_qty(data)
 
             if abs(total - ordered) <= tolerance:
                 continue
@@ -832,12 +844,13 @@ class MasterJobCard(Document):
                 job_card.resume_job(start_time=now)
             elif action == "complete":
                 qty = flt(detail.completed_qty) or flt(job_card.for_quantity)
-                process_loss = flt(detail.process_loss_qty)
-                # ERPNext's validate_job_card() insists the three balance exactly:
-                # completed + process loss + pending == for quantity. The detail row's
-                # Pending Qty is already that balance -- calculate_detail_rows() keeps
-                # it -- and declaring it is what lets a part completion submit, with
-                # the remainder free to move onto a new card.
+                # ERPNext's validate_job_card() insists its own three balance exactly:
+                # completed + process loss + pending == for quantity. It has no notion
+                # of a reject, so one is handed over as process loss -- a rejected
+                # piece was consumed and not produced, which is what that field means
+                # there. Carrying it as pending instead would leave the Work Order
+                # expecting production that is never coming.
+                process_loss = flt(detail.process_loss_qty) + flt(detail.rejected_qty)
                 pending = max(flt(job_card.for_quantity) - qty - process_loss, 0.0)
 
                 job_card.complete_job_card(
@@ -1099,13 +1112,8 @@ class MasterJobCard(Document):
             qty = min(flt(row.qty_to_manufacture), flt(ceiling[row.work_order_number]))
 
             # Work already reported here sets its own floor: an operation cannot be
-            # told it was raised for less than has already been made on it.
-            qty = max(
-                qty,
-                flt(row.completed_qty)
-                + flt(row.process_loss_qty)
-                + flt(row.rejected_qty),
-            )
+            # told it was raised for less than it has already used up.
+            qty = max(qty, consumed_qty(row))
 
             if abs(qty - flt(row.qty_to_manufacture)) <= 0.001:
                 continue
@@ -1244,6 +1252,30 @@ class MasterJobCard(Document):
             else:
                 log.time_in_mins = 0
 
+    def _job_card_transferred_qty(self):
+        """How much material has reached WIP on each linked Job Card.
+
+        ERPNext keeps the figure on the Job Card, and job_cards_blocking_submit()
+        reads it there to decide whether the card may be submitted. Mirrored onto the
+        detail row so the same thing holding the submit back is visible on the row it
+        belongs to."""
+        names = [
+            row.job_card_number
+            for row in (self.get("job_card_detail") or [])
+            if row.job_card_number
+        ]
+        if not names:
+            return {}
+
+        return {
+            jc.name: flt(jc.transferred_qty)
+            for jc in frappe.get_all(
+                "Job Card",
+                filters={"name": ["in", names]},
+                fields=["name", "transferred_qty"],
+            )
+        }
+
     def calculate_detail_rows(self):
         # Roll up the time logs back to the detail row they belong to (by job card):
         # actual time, and the completed / rejected qty reported against it.
@@ -1263,20 +1295,20 @@ class MasterJobCard(Document):
                 rejected_by_jc.get(log.job_card_number, 0.0) + flt(log.rejected_qty)
             )
 
+        transferred_by_jc = self._job_card_transferred_qty()
+
         for row in (self.get("job_card_detail") or []):
             if row.job_card_number:
                 row.actual_time = actual_by_jc.get(row.job_card_number, 0.0)
+                row.transferred_qty = transferred_by_jc.get(row.job_card_number, 0.0)
                 if row.job_card_number in completed_by_jc:
                     row.completed_qty = completed_by_jc[row.job_card_number]
                 if row.job_card_number in rejected_by_jc:
                     row.rejected_qty = rejected_by_jc[row.job_card_number]
 
-            row.pending_qty = (
-                flt(row.qty_to_manufacture)
-                - flt(row.completed_qty)
-                - flt(row.process_loss_qty)
-                - flt(row.rejected_qty)
-            )
+            # Pending is the balance of the order, and what makes the four terms add
+            # up: whatever was not completed, lost or rejected is still to be made.
+            row.pending_qty = flt(row.qty_to_manufacture) - consumed_qty(row)
 
     def calculate_required_items(self):
         for row in self.required_item:
@@ -1302,31 +1334,12 @@ class MasterJobCard(Document):
         self.total_completed_qty = sum(flt(r.completed_qty) for r in detail)
         self.total_process_loss_qty = sum(flt(r.process_loss_qty) for r in detail)
         self.total_rejected_qty = sum(flt(r.rejected_qty) for r in detail)
-        self.total_pending_qty = flt(self.total_qty_to_manufacture) - flt(self.total_completed_qty)
+        # Off the rows, so the card totals obey the same four-term accounting they do
+        # -- taking it as qty less completed counted the losses and rejects as still
+        # to be made, and the card's own totals then disagreed with its detail.
         self.total_standerd_time = sum(flt(r.standerd_time) for r in detail)
         self.total_actual_time = sum(flt(r.time_in_mins) for r in self.time_log)
         self.total_operating_cost = (flt(self.total_actual_time) / 60.0) * flt(self.hour_rate)
-
-    def set_status(self):
-        # Respect manual / terminal states.
-        if self.status == "On Hold":
-            return
-        if self.docstatus == 2:
-            self.status = "Cancelled"
-            return
-        detail = (self.get("job_card_detail") or [])
-        if self.docstatus == 0 and not detail:
-            self.status = "Draft"
-            return
-
-        if detail and all(r.status == "Completed" for r in detail):
-            self.status = "Completed"
-        elif any(r.status == "Work In Progress" for r in detail) or self.time_log:
-            self.status = "Work In Progress"
-        elif any(flt(r.transferred_qty) for r in detail):
-            self.status = "Material Transferred"
-        else:
-            self.status = "Open"
 
     # ------------------------------------------------------------------
     # Validations

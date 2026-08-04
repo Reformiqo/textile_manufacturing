@@ -171,6 +171,7 @@ override_whitelisted_methods = {
 
 
 override_doctype_class = {
+    "Work Order": "textile_manufacturing.override.work_order.CustomWorkOrder",
 	"Job Card": "textile_manufacturing.override.job_card.CustomJobCard",
 }
 

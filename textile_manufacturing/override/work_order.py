@@ -1,4 +1,10 @@
 import frappe
+from erpnext.manufacturing.doctype.work_order.work_order import WorkOrder
+
+class CustomWorkOrder(WorkOrder):
+    # we have to bypass this operations sequence related logic
+    def validate_operations_sequence(self):
+        pass
 
 
 

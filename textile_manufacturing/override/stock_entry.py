@@ -24,9 +24,16 @@ def recompute_required_item_transfers(master_job_card, exclude_stock_entry=None)
     transferred = {}
     last_reference = {}
 
+    # Material Transfer only. The SFG Stock In/Out entries carry the same
+    # master_job_card link, and counting those as a transfer credited the operation
+    # with material it never received -- they move its output, not its input.
     stock_entries = frappe.get_all(
         "Stock Entry",
-        filters={"master_job_card": master_job_card, "docstatus": 1},
+        filters={
+            "master_job_card": master_job_card,
+            "purpose": "Material Transfer for Manufacture",
+            "docstatus": 1,
+        },
         pluck="name",
         order_by="creation",
     )
@@ -47,7 +54,9 @@ def recompute_required_item_transfers(master_job_card, exclude_stock_entry=None)
 
     for row in mjc.required_item:
         transfer_qty = transferred.get(row.item_code, 0.0)
-        pending = flt(row.requried_qty) - transfer_qty
+        # Same formula as calculate_required_items(), or the next save of the card
+        # would quietly move the figure this hook just wrote.
+        pending = flt(row.requried_qty) - transfer_qty + flt(row.return_qty)
         frappe.db.set_value(
             "Master Job Card Required Item",
             row.name,

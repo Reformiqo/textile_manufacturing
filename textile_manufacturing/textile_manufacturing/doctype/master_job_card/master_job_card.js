@@ -244,14 +244,14 @@ function complete_jobs_dialog(frm) {
         fields: [
             qty_report_grid(rows, [
                 { fieldname: "completed_qty", label: __("Completed Quantity") },
-                { fieldname: "pending_qty", label: __("Pending Quantity") },
+                { fieldname: "rejected_qty", label: __("Rejected Quantity") },
                 { fieldname: "process_loss_qty", label: __("Process Loss Quantity") },
             ]),
         ],
         primary_action_label: __("Complete"),
         primary_action(values) {
             const selected = values.rows || [];
-            if (!valid_qty_report(frm, selected, ["pending_qty", "process_loss_qty"], true)) return;
+            if (!valid_qty_report(frm, selected, true)) return;
 
             d.hide();
             frm.call({
@@ -341,7 +341,7 @@ function pause_job_dialog(frm) {
         primary_action_label: __("Pause"),
         primary_action(values) {
             const selected = values.rows || [];
-            if (!valid_qty_report(frm, selected, "rejected_qty")) return;
+            if (!valid_qty_report(frm, selected)) return;
             if (!valid_rejection_reason(selected)) return;
 
             d.hide();
@@ -363,14 +363,12 @@ function qty_report_rows(frm) {
         .filter((row) => row.job_card_number)
         .map((row) => {
             const ordered = flt(row.qty_to_manufacture);
-            const done = flt(row.completed_qty);
-            const accounted = done + flt(row.rejected_qty) + flt(row.process_loss_qty);
 
             return {
                 job_card_number: row.job_card_number,
                 item_code: row.item_code,
                 qty_to_manufacture: ordered,
-                completed_qty: Math.max(ordered - accounted, 0),
+                completed_qty: Math.max(ordered - consumed_qty(row), 0),
                 pending_qty: 0,
                 rejected_qty: 0,
                 process_loss_qty: 0,
@@ -421,7 +419,6 @@ function qty_report_grid(rows, editable) {
                 fieldname: "qty_to_manufacture",
                 label: __("Qty to Manufacture"),
                 in_list_view: 1,
-                read_only: 1,
                 columns: 2,
             },
             ...editable.map((f) => ({
@@ -442,46 +439,25 @@ function qty_report_grid(rows, editable) {
 }
 
 
-function valid_qty_report(frm, rows, extra_fields, exact) {
-    const TOLERANCE = 0.001;
-    const fields = Array.isArray(extra_fields) ? extra_fields : [extra_fields];
-
+function valid_qty_report(frm, rows, exact) {
     const detail = {};
     (frm.doc.job_card_detail || []).forEach((row) => {
         if (row.job_card_number) detail[row.job_card_number] = row;
     });
 
     for (const row of rows) {
-        // Read the qty already booked off the detail row rather than carrying it
-        // through the dialog -- reporting adds to what the card holds, it does not
-        // replace it, and this is the same sum complete_jobs() checks server side.
         const source = detail[row.job_card_number] || {};
         const ordered = flt(source.qty_to_manufacture);
-        const reported = fields.reduce(
-            (sum, f) => sum + flt(row[f]),
-            flt(row.completed_qty),
-        );
-        const total = flt(source.completed_qty) + reported;
+        const total = accounted_qty(row);
 
-        if (flt(row.completed_qty) < 0 || fields.some((f) => flt(row[f]) < 0)) {
+        if (ACCOUNTED_FIELDS.some((f) => flt(row[f]) < 0)) {
             frappe.msgprint(__("Quantities cannot be negative."));
             return false;
         }
 
-        if (total - ordered > TOLERANCE) {
+        if (total > ordered) {
             frappe.msgprint(
                 __("{0}: {1} reported against a Qty to Manufacture of {2}. It cannot be more.", [
-                    over_label(row),
-                    format_number(total),
-                    format_number(ordered),
-                ]),
-            );
-            return false;
-        }
-
-        if (exact && ordered - total > TOLERANCE) {
-            frappe.msgprint(
-                __("{0}: only {1} of {2} is accounted for. Add the balance as Completed, Process Loss, or Pending to carry it to a new Master Job Card.", [
                     over_label(row),
                     format_number(total),
                     format_number(ordered),
@@ -492,6 +468,12 @@ function valid_qty_report(frm, rows, extra_fields, exact) {
     }
 
     return true;
+}
+
+
+const ACCOUNTED_FIELDS = ["completed_qty", "process_loss_qty", "rejected_qty"];
+function accounted_qty(row) {
+    return ACCOUNTED_FIELDS.reduce((sum, f) => sum + flt(row[f]), 0);
 }
 
 

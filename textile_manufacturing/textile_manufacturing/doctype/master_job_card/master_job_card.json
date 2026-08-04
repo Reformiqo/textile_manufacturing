@@ -40,7 +40,6 @@
   "total_completed_qty",
   "total_process_loss_qty",
   "total_rejected_qty",
-  "total_pending_qty",
   "total_standerd_time",
   "total_actual_time",
   "hour_rate",
@@ -300,11 +299,6 @@
    "label": "Total Rejected Qty"
   },
   {
-   "fieldname": "total_pending_qty",
-   "fieldtype": "Float",
-   "label": "Total Pending Qty"
-  },
-  {
    "fieldname": "total_standerd_time",
    "fieldtype": "Float",
    "label": "Total Standerd Time",
@@ -420,7 +414,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-04 14:56:07.261626",
+ "modified": "2026-08-04 18:25:49.927780",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",
