@@ -7,7 +7,6 @@ frappe.ui.form.on("Master Job Card", {
             load_inhouse_operations(frm);
         }
         toggle_material_tab(frm);
-        add_action_buttons(frm);
         add_quality_inspection_button(frm);
         add_sfg_button(frm);
         set_job_card_dashboard(frm);
@@ -52,25 +51,6 @@ function set_time_in_mins(cdt, cdn) {
     } else {
         frappe.model.set_value(cdt, cdn, "time_in_mins", 0);
     }
-}
-
-
-function add_action_buttons(frm) {
-    if (frm.is_new() || frm.doc.docstatus !== 0 || frm.doc.material_transfer_on !== "Job Card") return;
-
-    frm.add_custom_button(__("Material Transfer for Manufacture"), () => {
-        frm.call({
-            method: "make_material_transfer_for_manufacture",
-            doc: frm.doc,
-            freeze: true,
-            freeze_message: __("Building material transfer entry..."),
-        }).then((r) => {
-            if (r.message) {
-                const doc = frappe.model.sync(r.message)[0];
-                frappe.set_route("Form", doc.doctype, doc.name);
-            }
-        });
-    }, __("Create"));
 }
 
 

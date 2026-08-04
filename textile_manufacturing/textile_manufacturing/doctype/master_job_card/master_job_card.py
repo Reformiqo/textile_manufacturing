@@ -63,7 +63,6 @@ class MasterJobCard(Document):
         # they run on save rather than during validation.
         self.recalculate_time_logs()
         self.calculate_detail_rows()
-        self.calculate_required_items()
         self.calculate_scrap_items()
         self.calculate_sfg_stock()
         self.calculate_totals()
@@ -392,9 +391,6 @@ class MasterJobCard(Document):
         incoming = entry_type == "Stock Out"
 
         stock_entry = frappe.new_doc("Stock Entry")
-        # Both, and not set_stock_entry_type(): that reads purpose to work out the
-        # type, and ERPNext only fills purpose in from the type after it has already
-        # decided which warehouse is mandatory.
         stock_entry.stock_entry_type = purpose
         stock_entry.purpose = purpose
         stock_entry.company = self.company
@@ -469,50 +465,6 @@ class MasterJobCard(Document):
         )
 
         return stock_entry.name
-
-    @frappe.whitelist()
-    def make_material_transfer_for_manufacture(self):
-        """Build ONE consolidated 'Material Transfer for Manufacture' Stock Entry
-        (Source -> WIP) covering the pending required items of all the linked Job
-        Cards of this operation. Returned unsaved so the user can review/submit."""
-        if not self.source_warehouse or not self.wip_warehouse:
-            frappe.throw(("Source and WIP warehouses are required for the transfer."))
-
-        from erpnext.stock.get_item_details import get_conversion_factor
-
-        stock_entry = frappe.new_doc("Stock Entry")
-        stock_entry.stock_entry_type = "Material Transfer for Manufacture"
-        stock_entry.purpose = "Material Transfer for Manufacture"
-        stock_entry.company = self.company
-        stock_entry.from_warehouse = self.source_warehouse
-        stock_entry.to_warehouse = self.wip_warehouse
-        stock_entry.master_job_card = self.name
-
-        for row in self.required_item:
-            pending = flt(row.pending_transfer_qty)
-            if pending <= 0:
-                continue
-
-            stock_uom = frappe.db.get_value("Item", row.item_code, "stock_uom")
-            uom = row.uom or stock_uom
-            conversion_factor = (
-                flt(get_conversion_factor(row.item_code, uom).get("conversion_factor")) or 1.0
-            )
-
-            stock_entry.append("items", {
-                "item_code": row.item_code,
-                "qty": pending,
-                "uom": uom,
-                "stock_uom": stock_uom,
-                "conversion_factor": conversion_factor,
-                "s_warehouse": self.source_warehouse,
-                "t_warehouse": self.wip_warehouse,
-            })
-
-        if not stock_entry.get("items"):
-            frappe.throw(("There is nothing pending to transfer."))
-
-        return stock_entry
 
     # ------------------------------------------------------------------
     # Quality Inspection
@@ -887,11 +839,9 @@ class MasterJobCard(Document):
         self._set_operation_details(mwo)
         self._set_detail_rows(mwo)
         self._apply_previous_operation_ceiling()
-        self._set_required_items(mwo)
         self._set_scrap_items()
 
         self.calculate_detail_rows()
-        self.calculate_required_items()
         self.calculate_scrap_items()
         self.calculate_totals()
 
@@ -1156,48 +1106,6 @@ class MasterJobCard(Document):
             "Job Card", row.job_card_number, "for_quantity", qty, update_modified=False
         )
 
-    def _set_required_items(self, mwo):
-        """Consolidate the required items of every work order (MWO item) whose
-        BOM runs through this operation."""
-        self.set("required_item", [])
-
-        consolidated = {}
-        for item in mwo.items_to_be_manufacture:
-            if not item.bom_no:
-                continue
-
-            bom = frappe.get_doc("BOM", item.bom_no)
-            # Skip work orders whose BOM does not include this operation.
-            if not any(op.operation == self.operation_name for op in bom.operations):
-                continue
-
-            bom_qty = flt(bom.quantity) or 1.0
-            scale = flt(item.qty_to_manufacture) / bom_qty
-
-            for bi in bom.items:
-                # Honour operation-wise material if BOM Items are tagged.
-                if bi.get("operation") and bi.operation != self.operation_name:
-                    continue
-                key = (bi.item_code, bi.get("uom"))
-                consolidated.setdefault(key, {
-                    "item_code": bi.item_code,
-                    "item_name": bi.item_name,
-                    "uom": bi.get("uom"),
-                    "requried_qty": 0.0,
-                })
-                consolidated[key]["requried_qty"] += flt(bi.qty) * scale
-
-        for data in consolidated.values():
-            rate = flt(frappe.db.get_value("Item", data["item_code"], "valuation_rate"))
-            self.append("required_item", {
-                "item_code": data["item_code"],
-                "item_name": data["item_name"],
-                "uom": data["uom"],
-                "source_warehouse": self.source_warehouse,
-                "requried_qty": data["requried_qty"],
-                "available_qty": self._source_warehouse_stock(data["item_code"]),
-                "rate": rate,
-            })
 
     def _source_warehouse_stock(self, item_code):
         """Available stock of the item in the source warehouse (shortage check)."""
@@ -1310,12 +1218,6 @@ class MasterJobCard(Document):
             # up: whatever was not completed, lost or rejected is still to be made.
             row.pending_qty = flt(row.qty_to_manufacture) - consumed_qty(row)
 
-    def calculate_required_items(self):
-        for row in self.required_item:
-            row.pending_transfer_qty = (
-                flt(row.requried_qty) - flt(row.transfer_qty) + flt(row.return_qty)
-            )
-            row.amount = flt(row.consumed_qty) * flt(row.rate)
 
     def calculate_scrap_items(self):
         for row in self.scrap_item:
