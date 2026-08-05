@@ -348,7 +348,7 @@ function qty_report_rows(frm) {
                 job_card_number: row.job_card_number,
                 item_code: row.item_code,
                 qty_to_manufacture: ordered,
-                completed_qty: Math.max(ordered - consumed_qty(row), 0),
+                completed_qty: Math.max(ordered - accounted_qty(row), 0),
                 pending_qty: 0,
                 rejected_qty: 0,
                 process_loss_qty: 0,

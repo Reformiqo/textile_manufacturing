@@ -24,6 +24,7 @@
    "options": "Item"
   },
   {
+   "fetch_from": "item_code.item_name",
    "fieldname": "item_name",
    "fieldtype": "Data",
    "label": "Item Name"
@@ -70,7 +71,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-07-31 17:03:30.219602",
+ "modified": "2026-08-05 02:27:41.988997",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card Scrap Item",

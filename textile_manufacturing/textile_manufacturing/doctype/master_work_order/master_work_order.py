@@ -1190,6 +1190,111 @@ class MasterWorkOrder(Document):
 
         return purchase_order
 
+    # --------------------------------
+    # Return Components
+    # --------------------------------
+
+    @frappe.whitelist()
+    def get_return_items(self):
+        result = []
+        for row in self.items_to_be_manufacture:
+            work_order = row.work_order_number
+            wo_doc = frappe.get_cached_doc("Work Order", work_order)
+
+            items = []
+            for d in wo_doc.required_items:
+                max_returnable = flt(d.transferred_qty) - flt(d.consumed_qty) - flt(d.returned_qty)
+                if max_returnable <= 0:
+                    continue
+                items.append({
+                    "item_code": d.item_code,
+                    "item_name": d.item_name,
+                    "transferred_qty": d.transferred_qty,
+                    "consumed_qty": d.consumed_qty,
+                    "returned_qty": d.returned_qty,
+                    "max_returnable": max_returnable,
+                    "qty": max_returnable,
+                    "work_order_number": work_order,
+                })
+
+            if items:
+                result.append({
+                    "work_order": work_order,
+                    "bom_no": wo_doc.bom_no,
+                    "items": items,
+                })
+
+        return result
+
+    @frappe.whitelist()
+    def create_return_stock_entry(self, items):
+        import json
+        from erpnext.stock.doctype.stock_entry.stock_entry import get_available_materials
+
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        # Group selected rows by work order, since one Stock Entry is created per WO.
+        rows_by_wo = {}
+        for r in items:
+            qty = flt(r.get("qty"))
+            if qty <= 0:
+                continue
+            rows_by_wo.setdefault(r.get("work_order_number"), []).append(r)
+
+        if not rows_by_wo:
+            frappe.throw("Enter a Qty to Return for at least one item.")
+
+        created_entries = []
+
+        for row in self.items_to_be_manufacture:
+            work_order = row.work_order_number
+            selected_rows = rows_by_wo.get(work_order)
+            if not selected_rows:
+                continue
+
+            non_consumed_items = get_available_materials(work_order)
+            if not non_consumed_items:
+                continue
+
+            qty_by_item = {r["item_code"]: flt(r["qty"]) for r in selected_rows}
+
+            wo_doc = frappe.get_cached_doc("Work Order", work_order)
+
+            stock_entry = frappe.new_doc("Stock Entry")
+            stock_entry.from_bom = 1
+            stock_entry.is_return = 1
+            stock_entry.work_order = work_order
+            stock_entry.purpose = "Material Transfer for Manufacture"
+            stock_entry.bom_no = wo_doc.bom_no
+            stock_entry.add_transfered_raw_materials_in_items()
+            stock_entry.set_stock_entry_type()
+
+            # Keep only user-selected items, cap qty at what's actually available.
+            filtered_items = []
+            for item in stock_entry.items:
+                selected_qty = qty_by_item.get(item.item_code)
+                if not selected_qty:
+                    continue
+                available = flt(item.qty)
+                item.qty = min(selected_qty, available)
+                item.transfer_qty = item.qty * flt(item.conversion_factor or 1)
+                filtered_items.append(item)
+
+            if not filtered_items:
+                continue
+
+            stock_entry.items = filtered_items
+            stock_entry.master_work_order = self.name
+            stock_entry.insert()
+            stock_entry.submit()
+            created_entries.append(stock_entry.name)
+
+        if not created_entries:
+            frappe.throw("No Stock Return Entry could be created for the selected quantities.")
+
+        return created_entries
+
 
 @frappe.whitelist()
 def make_master_work_order(production_plan_id):

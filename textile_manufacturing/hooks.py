@@ -146,8 +146,14 @@ doc_events = {
 		"on_update": "textile_manufacturing.override.work_order.on_update",
 	},
 	"Stock Entry": {
-		"on_submit": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
-		"on_cancel": "textile_manufacturing.override.stock_entry.update_master_job_card_transfer",
+		"on_submit": [
+            "textile_manufacturing.override.stock_entry.update_master_work_order_returns",
+            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
+        ],
+		"on_cancel": [
+            "textile_manufacturing.override.stock_entry.update_master_work_order_returns",
+            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
+        ],
 	},
 	"Subcontracting Order": {
 		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",

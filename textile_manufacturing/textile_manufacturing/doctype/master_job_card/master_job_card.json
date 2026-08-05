@@ -291,6 +291,7 @@
    "read_only": 1
   },
   {
+   "allow_on_submit": 1,
    "fieldname": "total_actual_time",
    "fieldtype": "Float",
    "label": "Total Actual Time",
@@ -390,7 +391,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-04 22:32:13.470832",
+ "modified": "2026-08-05 02:48:51.061399",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Job Card",

@@ -151,7 +151,7 @@ class MasterJobCard(Document):
                 "completed_qty": completed,
                 "actual_time": actual_time,
                 "hour_rate": hour_rate,
-                "operating_cost": (actual_time / 60.0) * hour_rate,
+                "operating_cost": flt((actual_time / 60.0) * hour_rate, 2),
             },
             update_modified=False,
         )
@@ -735,14 +735,13 @@ class MasterJobCard(Document):
     def drive_job_cards(self, action):
         details = [r for r in (self.get("job_card_detail") or []) if r.job_card_number]
         if not details:
-            frappe.throw(("No linked Job Cards to process."))
+            frappe.throw("No linked Job Cards to process.")
 
         employees = [{"employee": e.employee} for e in (self.get("employee") or []) if e.employee]
         if action == "start" and not employees:
-            frappe.throw(("Assign at least one Employee before starting."))
+            frappe.throw("Assign at least one Employee before starting.")
 
         now = frappe.utils.now()
-        processed = 0
 
         for detail in details:
             job_card = frappe.get_doc("Job Card", detail.job_card_number)
@@ -751,8 +750,6 @@ class MasterJobCard(Document):
                 continue
 
             if action == "start":
-                # The operators are already on the card -- sync_employees_to_job_cards()
-                # put them there when this card was saved a moment ago.
                 job_card.start_timer(start_time=now, employees=employees)
             elif action == "pause":
                 job_card.pause_job(end_time=now)
@@ -775,18 +772,12 @@ class MasterJobCard(Document):
                     process_loss_qty=process_loss,
                     pending_qty=pending,
                 )
-                # Not submitted here. Reporting the qty and submitting are separate
-                # steps -- submit_completed_job_cards() carries them over when this
-                # card is submitted, which cannot happen while material is pending.
-
-            processed += 1
 
         frappe.msgprint(
-            ("{0}: applied on {1} Job Card(s).").format(action.title(), processed),
+            (f"{action.title()} Master Job Card Successfully."),
             indicator="green",
             alert=True,
         )
-        return processed
 
 
     @frappe.whitelist()
@@ -1200,7 +1191,7 @@ class MasterJobCard(Document):
         # -- taking it as qty less completed counted the losses and rejects as still
         # to be made, and the card's own totals then disagreed with its detail.
         self.total_standerd_time = sum(flt(r.standerd_time) for r in detail)
-        self.total_actual_time = sum(flt(r.time_in_mins) for r in self.time_log)
+        self.total_actual_time = flt(sum(flt(r.time_in_mins) for r in self.time_log), 3)
         self.total_operating_cost = (flt(self.total_actual_time) / 60.0) * flt(self.hour_rate)
 
     # ------------------------------------------------------------------

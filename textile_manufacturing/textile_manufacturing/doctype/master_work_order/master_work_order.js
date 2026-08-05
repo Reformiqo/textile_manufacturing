@@ -11,6 +11,7 @@ frappe.ui.form.on("Master Work Order", {
         if (NO_FURTHER_WORK.includes(frm.doc.status)) return;
 
         add_create_buttons(frm);
+        add_return_buttons(frm);
     },
 
     production_plan_number: function (frm) {
@@ -375,14 +376,7 @@ function pending_manufacture_rows(frm) {
     return (frm.doc.items_to_be_manufacture || [])
         .filter((row) => row.work_order_number)
         .map((row) => {
-            // The row carries what is left to produce; when material has to reach
-            // WIP first, only what was transferred can be produced right now.
-            const pending = skip
-                ? flt(row.pending_qty)
-                : Math.min(
-                    flt(row.pending_qty),
-                    flt(row.mateial_transfer_qty) - flt(row.manufacture_qty),
-                );
+            const pending = flt(row.mateial_transfer_qty) - flt(row.manufacture_qty);
 
             return {
                 work_order_number: row.work_order_number,
@@ -467,14 +461,6 @@ function finish_qty_dialog(frm, rows) {
                     },
                     {
                         fieldtype: "Float",
-                        fieldname: "pending_qty",
-                        label: __("Pending"),
-                        in_list_view: 1,
-                        read_only: 1,
-                        columns: 1,
-                    },
-                    {
-                        fieldtype: "Float",
                         fieldname: "qty",
                         label: __("Qty to Produce"),
                         in_list_view: 1,
@@ -498,16 +484,16 @@ function finish_qty_dialog(frm, rows) {
                 return;
             }
 
-            const over = selected.find((row) => flt(row.qty) > flt(row.pending_qty));
-            if (over) {
-                frappe.msgprint(
-                    __("{0}: Qty to Produce must not be more than the pending {1}.", [
-                        over.item_code,
-                        format_number(over.pending_qty),
-                    ]),
-                );
-                return;
-            }
+            // const over = selected.find((row) => flt(row.qty) > (flt(row.produced_qty)));
+            // if (over) {
+            //     frappe.msgprint(
+            //         __("{0}: Qty to Produce must not be more than the Produced Qty {1}.", [
+            //             over.item_code,
+            //             format_number(over.pending_qty),
+            //         ]),
+            //     );
+            //     return;
+            // }
 
             d.hide();
             frm.call({
@@ -517,6 +503,151 @@ function finish_qty_dialog(frm, rows) {
                 freeze: true,
                 freeze_message: __("Producing finished goods..."),
                 callback: () => frm.reload_doc(),
+            });
+        },
+    });
+    d.show();
+}
+
+
+function add_return_buttons(frm) {
+    frm.call({
+        method: "get_return_items",
+        doc: frm.doc,
+        freeze: true,
+        freeze_message: __("Fetching returnable items..."),
+    }).then((r) => {
+        const groups = r.message || [];
+        if (!groups.length) return;
+        
+        frm.add_custom_button(__("Return Component"), () => {
+            show_return_dialog(frm, groups);
+        }, __("Create"));
+    });
+}
+
+function show_return_dialog(frm, groups) {
+    const table_fields = [];
+
+    groups.forEach((group, idx) => {
+        table_fields.push({
+            fieldtype: "Section Break",
+            label: __(`BOM: ${group.bom_no}`),
+        });
+        table_fields.push({
+            fieldtype: "Table",
+            fieldname: `rows_${idx}`,
+            cannot_add_rows: 1,
+            cannot_delete_rows: 1,
+            in_place_edit: false,
+            data: group.items,
+            get_data: () => group.items,
+            fields: [
+                {
+                    fieldtype: "Link",
+                    fieldname: "item_code",
+                    label: __("Item"),
+                    options: "Item",
+                    in_list_view: 1,
+                    read_only: 1,
+                    columns: 2,
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "transferred_qty",
+                    label: __("Transferred"),
+                    in_list_view: 1,
+                    read_only: 1,
+                    columns: 1,
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "consumed_qty",
+                    label: __("Consumed"),
+                    in_list_view: 1,
+                    read_only: 1,
+                    columns: 1,
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "returned_qty",
+                    label: __("Already Returned"),
+                    in_list_view: 1,
+                    read_only: 1,
+                    columns: 1,
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "max_returnable",
+                    label: __("Max Returnable"),
+                    in_list_view: 1,
+                    read_only: 1,
+                    columns: 1,
+                    hidden: 1
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "qty",
+                    label: __("Qty to Return"),
+                    in_list_view: 1,
+                    reqd: 1,
+                    columns: 1,
+                },
+                {
+                    fieldtype: "Data",
+                    fieldname: "work_order_number",
+                    label: __("Work Order"),
+                    hidden: 1,
+                },
+            ],
+        });
+    });
+
+    const d = new frappe.ui.Dialog({
+        title: __("Return Components"),
+        size: "extra-large",
+        fields: table_fields,
+        primary_action_label: __("Return"),
+        primary_action(values) {
+            const all_rows = groups.map((_, idx) => values[`rows_${idx}`] || []).flat();
+            const selected = all_rows.filter((row) => flt(row.qty) > 0);
+
+            if (!selected.length) {
+                frappe.msgprint(__("Enter a Qty to Return for at least one item."));
+                return;
+            }
+
+            const negative = selected.find((row) => flt(row.qty) < 0);
+            if (negative) {
+                frappe.msgprint(__("Qty to Return cannot be negative."));
+                return;
+            }
+
+            const over = selected.find((row) => flt(row.qty) > flt(row.max_returnable));
+            if (over) {
+                frappe.msgprint(
+                    __("{0} ({1}): Qty to Return must not be more than the returnable {2}.", [
+                        over.item_code,
+                        over.work_order_number,
+                        format_number(over.max_returnable),
+                    ]),
+                );
+                return;
+            }
+
+            d.hide();
+            frm.call({
+                method: "create_return_stock_entry",
+                doc: frm.doc,
+                args: { items: selected },
+                freeze: true,
+                freeze_message: __("Creating Stock Return Entries..."),
+            }).then((r) => {
+                const names = r.message || [];
+                if (names.length) {
+                    frappe.msgprint(__("Stock Return Entries created: {0}", [names.join(", ")]));
+                    frm.reload_doc();
+                }
             });
         },
     });
