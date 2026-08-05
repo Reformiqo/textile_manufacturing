@@ -131,6 +131,19 @@ def make_finished_goods_stock_entry(subcontract_order, order_doctype, master_wor
     stock_entry.to_warehouse = order.supplier_warehouse
     stock_entry.master_work_order = master_work_order
 
+    # The order this transfer was raised against. ERPNext sets it in the post_process
+    # of its own make_rm_stock_entry, and everything downstream reads it: the
+    # Subcontracting Order's Connections list the Stock Entry through this field, and
+    # update_subcontracting_order_status() moves the order on to Material Transferred.
+    #
+    # It also switches on validate_subcontract_order(), which insists every item
+    # transferred appears in the order's Raw Materials Supplied table -- empty here by
+    # design. CustomStockEntry skips that one check for a Master Work Order transfer.
+    if order_doctype == "Purchase Order":
+        stock_entry.purchase_order = order.name
+    else:
+        stock_entry.subcontracting_order = order.name
+
     for item in order.get("items"):
         qty = flt(item.qty)
         if qty <= 0:

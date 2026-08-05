@@ -30,9 +30,28 @@ def accounted_qty(source):
     return sum(flt(source.get(field)) for field in ACCOUNTED_FIELDS)
 
 
+def operation_status(card_statuses):
+    """One status for an operation running on several Master Job Cards.
+
+    Done only when every card is; started as soon as any one of them is."""
+    mapped = [OPERATION_STATUS.get(status, "Pending") for status in card_statuses]
+    if not mapped:
+        # Every card cancelled -- the operation is back to not having been run.
+        return "Pending"
+
+    if all(status == "Completed" for status in mapped):
+        return "Completed"
+    if any(status != "Pending" for status in mapped):
+        return "Work In Progress"
+
+    return "Pending"
+
+
 class MasterJobCard(Document):
+    def onload(self):
+        self.set_onload("qty_caps", self.qty_caps())
+
     def validate(self):
-        self.validate_operation_is_in_house()
         self.validate_quality_inspection()
         self.validate_rejection_reason()
 
@@ -43,8 +62,6 @@ class MasterJobCard(Document):
         self.recalculate()
 
     def recalculate(self):
-        # These only compute/derive values (they don't validate anything), so
-        # they run on save rather than during validation.
         self.recalculate_time_logs()
         self.calculate_detail_rows()
         self.calculate_scrap_items()
@@ -57,7 +74,133 @@ class MasterJobCard(Document):
 
     def on_update(self):
         self.sync_employees_to_job_cards()
+        self.sync_job_card_quantities()
+        self.sync_scrap_to_master_work_order()
         self.sync_to_master_work_order()
+
+    def scrap_rows_changed(self):
+        """Did this save touch the scrap table at all?"""
+        def snapshot(doc):
+            return sorted(
+                (row.item_code or "", flt(row.scrap_qty), row.uom or "",
+                 row.scrap_warehouse or "")
+                for row in (doc.get("scrap_item") or [])
+            )
+
+        before = self.get_doc_before_save()
+        if not before:
+            return bool(self.get("scrap_item"))
+
+        return snapshot(self) != snapshot(before)
+
+    def sync_scrap_to_master_work_order(self):
+        """Roll every card's scrap up onto the order, one row per scrap item."""
+        if not self.master_work_order_number or not self.scrap_rows_changed():
+            return
+
+        cards = frappe.get_all(
+            "Master Job Card",
+            filters={
+                "master_work_order_number": self.master_work_order_number,
+                "docstatus": ["<", 2],
+                "name": ["!=", self.name],
+            },
+            pluck="name",
+        )
+
+        rows = [row.as_dict() for row in (self.get("scrap_item") or [])]
+        if cards:
+            rows += frappe.get_all(
+                "Master Job Card Scrap Item",
+                filters={"parent": ["in", cards], "parenttype": "Master Job Card"},
+                fields=["item_code", "item_name", "uom", "scrap_qty", "scrap_warehouse"],
+            )
+
+        grouped = {}
+        for row in rows:
+            if not row.get("item_code"):
+                continue
+
+            entry = grouped.setdefault(row["item_code"], {
+                "item_code": row["item_code"],
+                "item_name": row.get("item_name"),
+                "uom": row.get("uom"),
+                "scrap_warehouse": row.get("scrap_warehouse"),
+                "scrap_qty": 0.0,
+            })
+            entry["scrap_qty"] += flt(row.get("scrap_qty"))
+
+        self.write_master_work_order_scrap(grouped)
+        self.write_master_work_order_item_scrap(
+            flt(sum(entry["scrap_qty"] for entry in grouped.values()), 3)
+        )
+
+    def write_master_work_order_item_scrap(self, total):
+        """Total scrap of the order, onto every Item to be Manufacture row.
+
+        A scrap row names no manufactured item, so there is nothing to split it by."""
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={
+                "parent": self.master_work_order_number,
+                "parenttype": "Master Work Order",
+            },
+            fields=["name", "scrap_qty"],
+        ):
+            if flt(row.scrap_qty) == total:
+                continue
+
+            frappe.db.set_value(
+                "Master Work Order Item", row.name, "scrap_qty", total,
+                update_modified=False,
+            )
+
+    def write_master_work_order_scrap(self, grouped):
+        existing = {
+            row.item_code: row
+            for row in frappe.get_all(
+                "Master Work Order Scrap Item",
+                filters={
+                    "parent": self.master_work_order_number,
+                    "parenttype": "Master Work Order",
+                },
+                fields=["name", "idx", "item_code", "item_name", "uom",
+                        "scrap_qty", "scrap_warehouse"],
+            )
+        }
+
+        for idx, entry in enumerate(grouped.values(), start=1):
+            row = existing.pop(entry["item_code"], None)
+            if not row:
+                self.insert_master_work_order_scrap(entry, idx)
+                continue
+
+            values = dict(entry, idx=idx)
+            changed = {
+                field: value for field, value in values.items() if row.get(field) != value
+            }
+            if changed:
+                frappe.db.set_value(
+                    "Master Work Order Scrap Item", row.name, changed, update_modified=False
+                )
+
+        # Only the rows for an item that is no longer scrapped anywhere.
+        if existing:
+            frappe.db.delete("Master Work Order Scrap Item", {
+                "name": ["in", [row.name for row in existing.values()]],
+            })
+
+    def insert_master_work_order_scrap(self, entry, idx):
+        row = frappe.new_doc("Master Work Order Scrap Item")
+        row.update(entry)
+        row.parent = self.master_work_order_number
+        row.parenttype = "Master Work Order"
+        row.parentfield = "scrap_item"
+        row.idx = idx
+        row.docstatus = frappe.db.get_value(
+            "Master Work Order", self.master_work_order_number, "docstatus"
+        )
+        row.db_insert()
 
     def before_submit(self):
         self.submit_completed_job_cards()
@@ -110,17 +253,166 @@ class MasterJobCard(Document):
             title="Rejection Reason Missing",
         )
 
+    def other_cards(self):
+        return frappe.get_all(
+            "Master Job Card",
+            filters={
+                "master_work_order_number": self.master_work_order_number,
+                "docstatus": ["<", 2],
+                "name": ["!=", self.name],
+            },
+            pluck="name",
+        )
+
+    def own_operation_loss(self):
+        """This card's own loss, but only once Process Loss Qty counts it."""
+        if not (self.docstatus == 1 and self.status == "Completed"):
+            return {}
+
+        lost = {}
+        for row in (self.get("job_card_detail") or []):
+            if not row.work_order_number:
+                continue
+            lost[row.work_order_number] = lost.get(row.work_order_number, 0.0) + (
+                flt(row.process_loss_qty) + flt(row.rejected_qty)
+            )
+
+        return lost
+
+    def qty_caps(self):
+        """Most each row may be raised for -- the order's qty less what the other
+        operations have lost, read off the item's Process Loss Qty.
+
+        A card's own loss must not shrink its own quantity, so it is taken back out
+        where the field already counts it."""
+        if not self.master_work_order_number:
+            return {}
+
+        own = self.own_operation_loss()
+
+        caps = {}
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={
+                "parent": self.master_work_order_number,
+                "parenttype": "Master Work Order",
+            },
+            fields=["work_order_number", "qty_to_manufacture", "process_loss_qty"],
+        ):
+            if not row.work_order_number:
+                continue
+
+            elsewhere = flt(row.process_loss_qty) - flt(own.get(row.work_order_number))
+            caps[row.work_order_number] = max(
+                flt(row.qty_to_manufacture) - elsewhere, 0.0
+            )
+
+        return caps
+
+    def sync_job_card_quantities(self):
+        for row in (self.get("job_card_detail") or []):
+            if row.job_card_number:
+                self._sync_job_card_quantity(row, flt(row.qty_to_manufacture))
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
     def set_card_status(self, status):
         self.db_set("status", status)
-        self.sync_to_master_work_order()
 
         if status == "Completed":
             self.db_set("actual_end_date", now_datetime())
-            self.push_ceiling_to_next_operation()
+            # The next operation's Qty to Manufacture is entered by hand, so it is not
+            # brought down from here -- that would overwrite what the operator typed.
+            # What this operation turned out still limits the one after it, but as a
+            # ceiling on the pending qty rather than a rewrite of the card:
+            # MasterWorkOrder.pending_by_operation() applies it.
+            # self.push_ceiling_to_next_operation()
 
+        # Only where the operation's figures actually move. A Start or a Pause reports
+        # no quantity, and the draft saves those actions make reach the Master Work
+        # Order through on_update anyway.
+        #
+        # Cancelled belongs here as much as Completed: frappe runs on_cancel instead of
+        # on_update, so nothing else would carry the release back, and the operation
+        # would keep counting quantity that has been handed back with the Job Cards.
+        if status in ("Completed", "Cancelled"):
+            self.sync_to_master_work_order()
+
+
+    def operation_cards(self):
+        """Every Master Job Card raised for this operation on the same order.
+
+        More than one once part production starts: the card the order was raised with,
+        and a pending card for each balance carried on from it."""
+        return frappe.get_all(
+            "Master Job Card",
+            filters={
+                "master_work_order_number": self.master_work_order_number,
+                "operation_name": self.operation_name,
+                "docstatus": ["<", 2],
+            },
+            fields=["name", "status", "total_actual_time"],
+            order_by="creation",
+        )
+
+    def operation_totals(self):
+        """What the operation as a whole has reported, over all of its cards.
+
+        This card is added up from the document in hand rather than from the database:
+        the sync runs on save, and the rows stored against it are still a step behind.
+        The others are read off their own detail rows.
+
+        Pending is not worked out here -- it depends on what every operation before
+        this one lost, which only the Master Work Order can see."""
+        totals = {
+            "completed_qty": 0.0,
+            "process_loss_qty": 0.0,
+            "rejected_qty": 0.0,
+            "actual_time": 0.0,
+        }
+        statuses = []
+
+        def add(rows):
+            for row in rows:
+                totals["completed_qty"] += flt(row.completed_qty)
+                totals["process_loss_qty"] += flt(row.process_loss_qty)
+                totals["rejected_qty"] += flt(row.rejected_qty)
+
+        cards = self.operation_cards()
+
+        # A cancelled card reported nothing in the end: the work it booked went back
+        # with the Job Cards it was holding, and the operation stands where it stood
+        # before the card was raised.
+        if self.docstatus != 2:
+            add(self.get("job_card_detail") or [])
+            totals["actual_time"] += flt(self.total_actual_time)
+            statuses.append(self.status)
+
+        others = [card for card in cards if card.name != self.name]
+
+        if others:
+            rows_by_card = {}
+            for row in frappe.get_all(
+                "Master Job Card Detail",
+                filters={
+                    "parent": ["in", [card.name for card in others]],
+                    "parenttype": "Master Job Card",
+                },
+                fields=[
+                    "parent", "completed_qty", "process_loss_qty", "rejected_qty",
+                ],
+            ):
+                rows_by_card.setdefault(row.parent, []).append(row)
+
+            for card in others:
+                add(rows_by_card.get(card.name) or [])
+                totals["actual_time"] += flt(card.total_actual_time)
+                statuses.append(card.status)
+
+        totals["status"] = operation_status(statuses)
+
+        return totals
 
     def sync_to_master_work_order(self):
         if not self.master_work_order_number or not self.operation_name:
@@ -138,25 +430,103 @@ class MasterJobCard(Document):
         if not row:
             return
 
-        completed = flt(self.total_completed_qty)
-        actual_time = flt(self.total_actual_time)
+        totals = self.operation_totals()
         hour_rate = flt(self.hour_rate)
 
+        # Total Qty to Manufacture is left alone: it is the order's own figure, set
+        # when the operations were fetched, so the row keeps showing what was asked
+        # for beside what was actually run.
         frappe.db.set_value(
             "Master Work Order Operation",
             row,
             {
-                "status": OPERATION_STATUS.get(self.status, "Pending"),
-                "total_qty_to_manufacture": flt(self.total_qty_to_manufacture),
-                "completed_qty": completed,
-                "actual_time": actual_time,
+                "status": totals["status"],
+                "completed_qty": totals["completed_qty"],
+                "process_loss_qty": totals["process_loss_qty"],
+                "actual_time": totals["actual_time"],
                 "hour_rate": hour_rate,
-                "operating_cost": flt((actual_time / 60.0) * hour_rate, 2),
+                "operating_cost": flt((totals["actual_time"] / 60.0) * hour_rate, 2),
             },
             update_modified=False,
         )
 
+        self.update_master_work_order_process_loss()
+
+        # Every operation, not just this one: a piece lost here never reaches any of
+        # the operations after it, so their pending qty moves too.
+        frappe.get_doc(
+            "Master Work Order", self.master_work_order_number
+        ).update_operation_pending()
+
         self.move_master_work_order_off_not_started()
+
+    def operation_loss_by_work_order(self):
+        """Loss the completed operations have reported, per Work Order.
+
+        Completed only: a card still running has reported nothing final, and its
+        figures move until it is finished."""
+        cards = frappe.get_all(
+            "Master Job Card",
+            filters={
+                "master_work_order_number": self.master_work_order_number,
+                "docstatus": 1,
+                "status": "Completed",
+            },
+            pluck="name",
+        )
+        if not cards:
+            return {}
+
+        lost = {}
+        for row in frappe.get_all(
+            "Master Job Card Detail",
+            filters={"parent": ["in", cards], "parenttype": "Master Job Card"},
+            fields=["work_order_number", "process_loss_qty", "rejected_qty"],
+        ):
+            if not row.work_order_number:
+                continue
+            lost[row.work_order_number] = lost.get(row.work_order_number, 0.0) + (
+                flt(row.process_loss_qty) + flt(row.rejected_qty)
+            )
+
+        return lost
+
+    def update_master_work_order_process_loss(self):
+        """Write the operations' loss onto the order: per item, and as a total.
+
+        The Master Job Cards are the only source of this figure."""
+        lost = self.operation_loss_by_work_order()
+        total = 0.0
+
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={
+                "parent": self.master_work_order_number,
+                "parenttype": "Master Work Order",
+            },
+            fields=["name", "work_order_number", "process_loss_qty", "qty_to_manufacture",
+                    "manufacture_qty"],
+        ):
+            value = flt(lost.get(row.work_order_number), 3)
+            total += value
+
+            if flt(row.process_loss_qty) == value:
+                continue
+
+            frappe.db.set_value(
+                "Master Work Order Item", row.name, {
+                    "process_loss_qty": value,
+                    "pending_qty": max(
+                        flt(row.qty_to_manufacture) - flt(row.manufacture_qty) - value, 0.0
+                    ),
+                },
+                update_modified=False,
+            )
+
+        frappe.db.set_value(
+            "Master Work Order", self.master_work_order_number,
+            "total_process_loss", flt(total, 3), update_modified=False,
+        )
 
     def move_master_work_order_off_not_started(self):
         """Work reported here means the order has started, whatever route the material
@@ -247,11 +617,12 @@ class MasterJobCard(Document):
             )
 
     def link_job_cards(self):
-        """Take up the Job Cards the Work Order already raised for this operation.
+        """Take up a Job Card of the Work Order for each row of this card.
 
-        ERPNext creates them when the Work Order is submitted, one per operation row,
-        so this card claims the ones matching its own item and operation rather than
-        raising any of its own."""
+        ERPNext raises one per operation row when the Work Order is submitted, so the
+        first Master Job Card of an operation claims those rather than raising any of
+        its own. A pending card finds them all taken -- the balance it carries was
+        never raised for -- and one is raised for it here, for its qty alone."""
         missing = []
 
         for row in (self.get("job_card_detail") or []):
@@ -272,7 +643,8 @@ class MasterJobCard(Document):
                 },
                 "name",
                 order_by="creation",
-            )
+            ) or self.raise_job_card(row)
+
             if not job_card:
                 missing.append(row)
                 continue
@@ -284,9 +656,9 @@ class MasterJobCard(Document):
 
         if missing:
             frappe.throw(
-                ("The Work Order has no Job Card left for {0}:<br><br>{1}<br><br>"
-                 "Every Job Card of this operation is already held by another Master "
-                 "Job Card.").format(
+                ("No Job Card could be raised for {0}:<br><br>{1}<br><br>"
+                 "The operation is not on the Work Order, so there is no operation row "
+                 "to book the work against.").format(
                     frappe.bold(self.operation_name),
                     "<br>".join(
                         "Row {0}: {1} -- {2}".format(
@@ -301,6 +673,34 @@ class MasterJobCard(Document):
                 ),
                 title="Job Card Not Available",
             )
+
+    def raise_job_card(self, row):
+        """A Job Card of the Work Order for this row's qty, for the part production the
+        Work Order has not raised one for.
+
+        Against the Work Order's own operation row, so ERPNext keeps counting the
+        operation the way it always has: get_current_operation_data() sums the
+        completed qty of every submitted card sharing an operation_id, and the balance
+        run here lands on the same total as the run before it."""
+        from erpnext.manufacturing.doctype.work_order.work_order import create_job_card
+
+        work_order = frappe.get_doc("Work Order", row.work_order_number)
+        if work_order.docstatus != 1:
+            return None
+
+        operation = next(
+            (op for op in work_order.operations if op.operation == self.operation_name),
+            None,
+        )
+        if not operation:
+            return None
+
+        # Not a stored field -- ERPNext sets it on the row in
+        # split_qty_based_on_batch_size() before create_job_card() reads it, and the
+        # whole of this card's qty goes on the one Job Card.
+        operation.job_card_qty = flt(row.qty_to_manufacture) or flt(work_order.qty)
+
+        return create_job_card(work_order, operation, auto_create=True).name
 
     def release_job_cards(self):
         """Hand the Job Cards back. They belong to the Work Order, not to this card,
@@ -531,7 +931,6 @@ class MasterJobCard(Document):
         progress of the run it interrupts."""
         self.book_reported_qty(rows)
         self.drive_job_cards("pause")
-        self.close_open_time_logs()
         self.db_set("hold_reason", reason)
         self.set_card_status("On Hold")
 
@@ -546,7 +945,12 @@ class MasterJobCard(Document):
         self.validate_complete_qty(rows)
         self.book_reported_qty(rows)
         self.drive_job_cards("complete")
-        self.close_open_time_logs()
+
+        completed = 0
+        for row in self.job_card_detail:
+            completed += row.completed_qty
+
+        self.db_set("total_completed_qty", completed)
 
         blocked = self.job_cards_blocking_submit()
         if not blocked:
@@ -586,19 +990,39 @@ class MasterJobCard(Document):
             if row.job_card_number
         }
 
+        caps = self.qty_caps()
+
         for data in rows:
             row = detail.get(data.get("job_card_number"))
             if not row:
                 continue
 
-            ordered = flt(row.qty_to_manufacture)
+            # The dialog's own figure when it sent one -- it is editable there, and
+            # what is reported has to fit inside what the run is being held to.
+            ordered = flt(data.get("qty_to_manufacture")) or flt(row.qty_to_manufacture)
             if not ordered:
                 continue
+
+            # The same ceiling the dialog applies, checked again here. The dialog is
+            # the only thing that was enforcing it, so a stale form or a direct call
+            # could book more than the order has left and leave the item reading a
+            # negative pending qty.
+            cap = caps.get(row.work_order_number)
+            if cap is not None and ordered > flt(cap) + 0.001:
+                frappe.throw(
+                    ("{0}: at most {1} can be made. The order asked for {2} and the "
+                     "other operations have lost the rest.").format(
+                        row.item_code or row.job_card_number,
+                        flt(cap, 3),
+                        flt(row.qty_to_manufacture, 3),
+                    ),
+                    title="Qty to Manufacture Too High",
+                )
 
             # What the row has already used up, plus everything this run reports.
             total = accounted_qty(data)
 
-            if abs(total <= ordered):
+            if total <= ordered + 0.001:
                 continue
 
             frappe.throw(
@@ -614,15 +1038,6 @@ class MasterJobCard(Document):
             )
 
     def book_reported_qty(self, rows):
-        """Write the qty reported in a dialog onto the open time logs and close them.
-
-        Onto the time logs rather than straight onto the detail rows, because
-        calculate_detail_rows() derives the detail qty from the logs -- a value written
-        to the detail row would simply be overwritten on the next save.
-
-        Shared by Pause and Complete: an operator stopping mid-run reports what has
-        been made so far in exactly the same terms as one finishing the operation, so
-        the progress is not lost until the very end."""
         rows = frappe.parse_json(rows) if rows else []
         if not rows:
             return
@@ -634,46 +1049,41 @@ class MasterJobCard(Document):
             return
 
         now = frappe.utils.now()
-        # The qty is reported once per Job Card, but a Job Card can have several open
-        # logs -- one per operator. Booking it on each would multiply it, since
-        # calculate_detail_rows() sums the logs, so only the first carries it.
         booked = set()
 
         for log in self.time_log:
+            if log.to_time:
+                continue
             data = by_job_card.get(log.job_card_number)
-            if not data or log.to_time:
+            if not data:
                 continue
 
-            if log.job_card_number in booked:
-                log.completed_qty = 0.0
-                log.rejected_qty = 0.0
-            else:
-                log.completed_qty = flt(data.get("completed_qty"))
-                log.rejected_qty = flt(data.get("rejected_qty"))
-                booked.add(log.job_card_number)
-
+            log.completed_qty = flt(data.get("completed_qty"))
+            log.rejected_qty = flt(data.get("rejected_qty"))
             log.to_time = now
 
-        # Process loss lives on the detail row, not the log. Added to what is there
-        # rather than replacing it, because the dialog reports this run only -- and
-        # left alone when the key is absent, since a Pause does not report it.
-        for row in (self.get("job_card_detail") or []):
-            data = by_job_card.get(row.job_card_number) or {}
-            if data.get("process_loss_qty") is not None:
-                row.process_loss_qty = flt(row.process_loss_qty) + flt(
-                    data.get("process_loss_qty")
-                )
+            booked.add(log.job_card_number)
 
-            # The reason is reported beside the reject that needs it -- Pause is the
-            # only place a reject is entered, and validate_rejection_reason() refuses
-            # the save without one. Only overwritten when the dialog actually sends a
-            # reason, so a later run does not blank the reason of an earlier one.
-            reason = (data.get("rejection_reason") or "").strip()
-            if reason:
-                row.rejection_reason = reason
+        for row in self.job_card_detail:
+            # A row the dialog did not report on keeps what it already had -- Pause
+            # sends only the Job Cards that were running.
+            data = by_job_card.get(row.job_card_number)
+            if not data:
+                continue
+
+            # Qty to Manufacture is editable in the dialog, so carry it back too.
+            # Without this the row keeps the figure the operation was raised for, the
+            # save has nothing to push, and the Job Card stays at its old For Quantity
+            # -- 10 where the run was only ever for 5, leaving 5 pending on it for good.
+            if data.get("qty_to_manufacture") is not None:
+                row.qty_to_manufacture = flt(data.get("qty_to_manufacture"))
+
+            row.completed_qty = flt(data.get("completed_qty"))
+            row.rejected_qty = flt(data.get("rejected_qty"))
+            row.process_loss_qty = flt(data.get("process_loss_qty"))
+            row.rejection_reason = data.get("rejection_reason")
 
         self.save_after_submit()
-
     def job_cards_blocking_submit(self):
         """Job Cards ERPNext will not let us submit yet.
 
@@ -756,13 +1166,7 @@ class MasterJobCard(Document):
             elif action == "resume":
                 job_card.resume_job(start_time=now)
             elif action == "complete":
-                qty = flt(detail.completed_qty) or flt(job_card.for_quantity)
-                # ERPNext's validate_job_card() insists its own three balance exactly:
-                # completed + process loss + pending == for quantity. It has no notion
-                # of a reject, so one is handed over as process loss -- a rejected
-                # piece was consumed and not produced, which is what that field means
-                # there. Carrying it as pending instead would leave the Work Order
-                # expecting production that is never coming.
+                qty = flt(detail.completed_qty)
                 process_loss = flt(detail.process_loss_qty) + flt(detail.rejected_qty)
                 pending = max(flt(job_card.for_quantity) - qty - process_loss, 0.0)
 
@@ -794,11 +1198,36 @@ class MasterJobCard(Document):
         self._set_operation_details(mwo)
         self._set_detail_rows(mwo)
         self._apply_previous_operation_ceiling()
-        self._set_scrap_items()
 
         self.calculate_detail_rows()
         self.calculate_scrap_items()
         self.calculate_totals()
+
+    def limit_to_pending_qty(self, pending):
+        """Hold this card to a balance, keyed by Work Order.
+
+        fetch_from_master_work_order() reads the quantity the order was raised for, and
+        a pending card is raised for what is left of it -- 5 where 10 were ordered and
+        the first run accounted for 5. A Work Order with nothing left drops out
+        entirely: there is no work there to raise a Job Card against."""
+        rows = []
+        for row in (self.get("job_card_detail") or []):
+            qty = flt(pending.get(row.work_order_number))
+            if qty <= 0:
+                continue
+
+            row.qty_to_manufacture = qty
+            rows.append(row)
+
+        if not rows:
+            frappe.throw(
+                ("Nothing is left to run through {0}.").format(
+                    frappe.bold(self.operation_name)
+                ),
+                title="Nothing Pending",
+            )
+
+        self.set("job_card_detail", rows)
 
     def _set_header_from_mwo(self, mwo):
         if not self.posting_date:
@@ -1018,7 +1447,7 @@ class MasterJobCard(Document):
 
             # Work already reported here sets its own floor: an operation cannot be
             # told it was raised for less than it has already used up.
-            qty = max(qty, consumed_qty(row))
+            qty = max(qty, accounted_qty(row))
 
             if abs(qty - flt(row.qty_to_manufacture)) <= 0.001:
                 continue
@@ -1071,39 +1500,6 @@ class MasterJobCard(Document):
             {"item_code": item_code, "warehouse": self.source_warehouse},
             "actual_qty",
         ))
-
-    def _set_scrap_items(self):
-        self.set("scrap_item", [])
-        bom_nos = list({r.bom_no for r in (self.get("job_card_detail") or []) if r.bom_no})
-        if not bom_nos:
-            return
-
-        scrap_rows = frappe.get_all(
-            "BOM Secondary Item",
-            filters={"parent": ["in", bom_nos], "parenttype": "BOM", "type": "Scrap"},
-            fields=["item_code", "item_name", "uom", "stock_uom", "qty"],
-        )
-        consolidated = {}
-        for s in scrap_rows:
-            consolidated.setdefault(s.item_code, {
-                "item_code": s.item_code,
-                "item_name": s.item_name,
-                "uom": s.uom or s.stock_uom,
-                "scrap_qty": 0.0,
-            })
-            consolidated[s.item_code]["scrap_qty"] += flt(s.qty)
-
-        for data in consolidated.values():
-            rate = flt(frappe.db.get_value("Item", data["item_code"], "valuation_rate"))
-            self.append("scrap_item", {
-                "item_code": data["item_code"],
-                "item_name": data["item_name"],
-                "uom": data["uom"],
-                "scrap_qty": data["scrap_qty"],
-                "rate": rate,
-                "amount": data["scrap_qty"] * rate,
-                "scrap_warehouse": self.scrap_warehouse,
-            })
 
     # ------------------------------------------------------------------
     # Auto-calculations
@@ -1162,7 +1558,12 @@ class MasterJobCard(Document):
 
         for row in (self.get("job_card_detail") or []):
             if row.job_card_number:
-                row.actual_time = actual_by_jc.get(row.job_card_number, 0.0)
+                # The timer owns this while the job is running. Once the card is
+                # submitted the figure stands as it is, so a correction typed on the
+                # row survives the next save -- a run left on overnight is put right
+                # by hand, and there are no logs to put it right through.
+                if self.docstatus == 0:
+                    row.actual_time = actual_by_jc.get(row.job_card_number, 0.0)
                 row.transferred_qty = transferred_by_jc.get(row.job_card_number, 0.0)
                 if row.job_card_number in completed_by_jc:
                     row.completed_qty = completed_by_jc[row.job_card_number]
@@ -1191,17 +1592,16 @@ class MasterJobCard(Document):
         # -- taking it as qty less completed counted the losses and rejects as still
         # to be made, and the card's own totals then disagreed with its detail.
         self.total_standerd_time = sum(flt(r.standerd_time) for r in detail)
-        self.total_actual_time = flt(sum(flt(r.time_in_mins) for r in self.time_log), 3)
+        # Off the rows rather than straight off the time logs, so an Actual Time put
+        # right by hand on a submitted card carries into the operating cost and into
+        # the Master Work Order. In draft the two are the same figure -- the rows are
+        # filled from those very logs a moment earlier, in calculate_detail_rows().
+        self.total_actual_time = flt(sum(flt(r.actual_time) for r in detail), 3)
         self.total_operating_cost = (flt(self.total_actual_time) / 60.0) * flt(self.hour_rate)
 
     # ------------------------------------------------------------------
     # Validations
     # ------------------------------------------------------------------
-    def validate_operation_is_in_house(self):
-        if self.manufacturing_type and self.manufacturing_type != "In-House":
-            frappe.throw("Master Job Card is created only for In-House operations.")
-
-
     def validate_quality_inspection(self):
         if not self.quality_inspection_requied:
             return

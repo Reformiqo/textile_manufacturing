@@ -26,6 +26,7 @@
   "skip_material_transfer_to_wip_warehouse",
   "total_qty_to_manufacture",
   "total_manufacture_qty",
+  "total_process_loss",
   "total_raw_material_cost",
   "total_operating_cost",
   "warehouse_section",
@@ -226,6 +227,15 @@
    "fieldtype": "Float",
    "label": "Total Manufacture Qty",
    "precision": "2"
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "0",
+   "fieldname": "total_process_loss",
+   "fieldtype": "Float",
+   "label": "Total Process Loss",
+   "precision": "2",
+   "read_only": 1
   },
   {
    "fieldname": "total_raw_material_cost",

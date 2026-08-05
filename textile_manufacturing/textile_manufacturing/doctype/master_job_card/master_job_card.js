@@ -223,15 +223,32 @@ function complete_jobs_dialog(frm) {
         size: "extra-large",
         fields: [
             qty_report_grid(rows, [
-                { fieldname: "completed_qty", label: __("Completed Quantity") },
-                { fieldname: "rejected_qty", label: __("Rejected Quantity") },
-                { fieldname: "process_loss_qty", label: __("Process Loss Quantity") },
+                { fieldname: "completed_qty", label: __("Completed Quantity"), columns: 2 },
+                { fieldname: "process_loss_qty", label: __("Process Loss Quantity"), columns: 2 },
+                { fieldname: "rejected_qty", label: __("Rejected Quantity"), columns: 1 },
+                {
+                    // Text, not a quantity -- qty_report_grid defaults to Float, and
+                    // the reason cannot be typed into a number field.
+                    fieldname: "rejection_reason",
+                    label: __("Rejection Reason"),
+                    fieldtype: "Data",
+                    columns: 2,
+                },
             ]),
         ],
         primary_action_label: __("Complete"),
         primary_action(values) {
             const selected = values.rows || [];
             if (!valid_qty_report(frm, selected, true)) return;
+
+            for (const row of selected) {
+                if (flt(row.rejected_qty) > 0 && !row.rejection_reason?.trim()) {
+                    frappe.msgprint(
+                        __("Rejection Reason is mandatory when Rejected Quantity is greater than 0.")
+                    );
+                    return;
+                }
+            }
 
             d.hide();
             frm.call({
@@ -339,6 +356,8 @@ function pause_job_dialog(frm) {
 
 
 function qty_report_rows(frm) {
+    const caps = frm.doc.__onload?.qty_caps || {};
+
     return (frm.doc.job_card_detail || [])
         .filter((row) => row.job_card_number)
         .map((row) => {
@@ -348,10 +367,12 @@ function qty_report_rows(frm) {
                 job_card_number: row.job_card_number,
                 item_code: row.item_code,
                 qty_to_manufacture: ordered,
+                // What the order has left after everything lost or scrapped on it.
+                max_qty: flt(caps[row.work_order_number]),
+                has_cap: row.work_order_number in caps,
                 completed_qty: Math.max(ordered - accounted_qty(row), 0),
-                pending_qty: 0,
-                rejected_qty: 0,
-                process_loss_qty: 0,
+                rejected_qty: row.rejected_qty,
+                process_loss_qty: row.process_loss_qty,
                 rejection_reason: row.rejection_reason || "",
             };
         });
@@ -420,18 +441,25 @@ function qty_report_grid(rows, editable) {
 
 
 function valid_qty_report(frm, rows, exact) {
-    const detail = {};
-    (frm.doc.job_card_detail || []).forEach((row) => {
-        if (row.job_card_number) detail[row.job_card_number] = row;
-    });
-
     for (const row of rows) {
-        const source = detail[row.job_card_number] || {};
-        const ordered = flt(source.qty_to_manufacture);
+        // Off the dialog row, so an edited Qty to Manufacture is what gets checked.
+        const ordered = flt(row.qty_to_manufacture);
         const total = accounted_qty(row);
 
         if (ACCOUNTED_FIELDS.some((f) => flt(row[f]) < 0)) {
             frappe.msgprint(__("Quantities cannot be negative."));
+            return false;
+        }
+
+        if (row.has_cap && ordered > flt(row.max_qty) + 0.001) {
+            frappe.msgprint({
+                title: __("Qty to Manufacture Too High"),
+                message: __("{0}: at most {1} can be made. The rest of the order has been lost.", [
+                    over_label(row),
+                    format_number(flt(row.max_qty)),
+                ]),
+                indicator: "red",
+            });
             return false;
         }
 

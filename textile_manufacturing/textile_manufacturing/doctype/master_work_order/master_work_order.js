@@ -52,10 +52,22 @@ frappe.ui.form.on("Master Work Order", {
 
 function add_create_buttons(frm) {
     add_start_button(frm);
-
+    add_finish_button(frm);
     add_pending_master_job_card_button(frm);
 
-    add_finish_button(frm);
+    add_subcontracted_po_button(frm);
+
+    frm.page.set_inner_btn_group_as_primary(__("Create"));
+}
+
+
+function add_subcontracted_po_button(frm) {
+    // Nothing goes out to a supplier unless an operation is routed Out House, so
+    // there is no Purchase Order to raise.
+    const out_house = (frm.doc.operations || []).some(
+        (row) => row.manufacturing_type === "Out House"
+    );
+    if (!out_house) return;
 
     frm.add_custom_button(__("Create Subcontracted PO"), () => {
         frm.call({
@@ -70,8 +82,6 @@ function add_create_buttons(frm) {
             },
         });
     }, __("Create"));
-
-    frm.page.set_inner_btn_group_as_primary(__("Create"));
 }
 
 
@@ -370,35 +380,27 @@ function transfer_materials_dialog(frm, rows, materials) {
     d.show();
 }
 
-function pending_manufacture_rows(frm) {
-    const skip = frm.doc.skip_material_transfer_to_wip_warehouse;
-
-    return (frm.doc.items_to_be_manufacture || [])
-        .filter((row) => row.work_order_number)
-        .map((row) => {
-            const pending = flt(row.mateial_transfer_qty) - flt(row.manufacture_qty);
-
-            return {
-                work_order_number: row.work_order_number,
-                item_code: row.item_code,
-                t_warehouse: row.fg_warehouse || frm.doc.fg_warehouse,
-                qty_to_manufacture: flt(row.qty_to_manufacture),
-                transferred_qty: flt(row.mateial_transfer_qty),
-                produced_qty: flt(row.manufacture_qty),
-                pending_qty: pending,
-            };
-        })
-        .filter((row) => row.pending_qty > 0)
-        .map((row) => ({ ...row, qty: row.pending_qty }));
-}
-
-
 function add_finish_button(frm) {
-    const rows = pending_manufacture_rows(frm);
+    // From onload: what may be finished is capped by what the last operation turned
+    // out, and that is not on the form.
+    const rows = frm.doc.__onload?.pending_manufacture_rows || [];
     if (!rows.length) return;
 
     frm.add_custom_button(__("Finish"), () => {
-        finish_qty_dialog(frm, rows);
+        // The order still has goods to produce, but the line has not turned them out
+        // yet. The button stays so the reason can be given -- hiding it leaves the
+        // operator with nothing to click and nothing to read.
+        const reason = frm.doc.__onload?.finish_blocked_reason;
+        if (reason) {
+            frappe.msgprint({
+                title: __("Operations Not Complete"),
+                message: reason,
+                indicator: "orange",
+            });
+            return;
+        }
+
+        finish_qty_dialog(frm, rows.filter((row) => flt(row.qty) > 0).map((row) => ({ ...row })));
     }, __("Create"));
 }
 
@@ -460,6 +462,16 @@ function finish_qty_dialog(frm, rows) {
                         columns: 1,
                     },
                     {
+                        // ERPNext takes this off the entry itself, so Qty to Produce is
+                        // the pieces put through: 10 with a loss of 5 books 5 as made.
+                        fieldtype: "Float",
+                        fieldname: "process_loss_qty",
+                        label: __("Process Loss"),
+                        in_list_view: 1,
+                        read_only: 1,
+                        columns: 1,
+                    },
+                    {
                         fieldtype: "Float",
                         fieldname: "qty",
                         label: __("Qty to Produce"),
@@ -484,16 +496,16 @@ function finish_qty_dialog(frm, rows) {
                 return;
             }
 
-            // const over = selected.find((row) => flt(row.qty) > (flt(row.produced_qty)));
-            // if (over) {
-            //     frappe.msgprint(
-            //         __("{0}: Qty to Produce must not be more than the Produced Qty {1}.", [
-            //             over.item_code,
-            //             format_number(over.pending_qty),
-            //         ]),
-            //     );
-            //     return;
-            // }
+            const over = selected.find((row) => flt(row.qty) > flt(row.pending_qty));
+            if (over) {
+                frappe.msgprint(
+                    __("{0}: only {1} can be produced -- that is what the last operation turned out and has not been booked yet.", [
+                        over.item_code,
+                        format_number(over.pending_qty),
+                    ]),
+                );
+                return;
+            }
 
             d.hide();
             frm.call({
@@ -714,44 +726,106 @@ function update_all_child_warehouses(frm) {
 
 
 function add_pending_master_job_card_button(frm) {
-    // The server decides: every Master Job Card completed, and the order still short.
-    frm.call("pending_master_job_card_operations").then((r) => {
-        const pending_operations = r.message || [];
-        if (!pending_operations.length) return;
+    // Whether anything is left to run is settled in onload, off the Master Job Cards
+    // -- the same way the Work Order settles its own Create Job Card button.
+    if (!frm.doc.__onload?.show_pending_master_job_card_button) return;
+    if (!(frm.doc.operations || []).length) return;
 
-        frm.add_custom_button(__("Pending Master Job Card"), () => {
-            pending_master_job_card_dialog(frm, pending_operations);
-        }, __("Create"));
-    });
+    frm.add_custom_button(__("Pending Master Job Card"), () => {
+        pending_master_job_card_dialog(frm);
+    }, __("Create"));
 }
 
 
-function pending_master_job_card_dialog(frm, pending_operations) {
-    const d = new frappe.ui.Dialog({
-        title: __("Create Master Job Card for Pending Qty"),
-        fields: [
-            {
-                fieldtype: "MultiSelectPills",
-                fieldname: "operations",
-                label: __("Operations"),
-                get_data: () =>
-                    pending_operations.map((op) => ({
-                        value: op.opration_name,
-                        description: __("Pending {0}", [format_number(op.pending_qty)]),
-                    })),
-            },
-        ],
-        primary_action_label: __("Create"),
-        primary_action(values) {
-            d.hide();
+function pending_master_job_card_dialog(frm) {
+    const operations_data = [];
+
+    const dialog = frappe.prompt(
+        {
+            fieldname: "operations",
+            fieldtype: "Table",
+            label: __("Operations"),
+            fields: [
+                {
+                    fieldtype: "Link",
+                    fieldname: "opration_name",
+                    label: __("Operation"),
+                    options: "Operation",
+                    read_only: 1,
+                    in_list_view: 1,
+                },
+                {
+                    fieldtype: "Link",
+                    fieldname: "workstation",
+                    label: __("Workstation"),
+                    options: "Workstation",
+                    read_only: 1,
+                    in_list_view: 1,
+                },
+                {
+                    fieldtype: "Float",
+                    fieldname: "qty",
+                    label: __("Pending Qty"),
+                    read_only: 1,
+                    in_list_view: 1,
+                },
+                {
+                    fieldtype: "Int",
+                    fieldname: "opration_sequence_no",
+                    label: __("Sequence Id"),
+                    read_only: 1,
+                },
+            ],
+            data: operations_data,
+            in_place_edit: true,
+            get_data: () => operations_data,
+        },
+        function () {
+            const selected_rows = dialog.fields_dict["operations"].grid.get_selected_children();
+            if (!selected_rows.length) {
+                frappe.msgprint(
+                    __("Please select atleast one operation to create a Master Job Card")
+                );
+                return;
+            }
+
             frm.call({
                 method: "make_pending_master_job_cards",
                 doc: frm.doc,
-                args: { operations: values.operations || [] },
+                args: { operations: selected_rows },
                 freeze: true,
-                freeze_message: __("Creating Master Job Card for the pending qty..."),
+                freeze_message: __("Raising Master Job Cards for the pending qty..."),
             }).then(() => frm.reload_doc());
         },
+        __("Pending Master Job Card"),
+        __("Create")
+    );
+
+    dialog.fields_dict["operations"].grid.grid_buttons.hide();
+
+    // What the order asked of each operation, less everything its Master Job Cards
+    // accounted for -- made, lost or rejected. Off the operation rows, where the
+    // Master Job Card writes it as its status moves, and taken from onload where that
+    // figure has not been written yet.
+    const pending_qty = {};
+    (frm.doc.__onload?.pending_master_job_card_operations || []).forEach((row) => {
+        pending_qty[row.opration_name] = flt(row.qty);
     });
-    d.show();
+
+    (frm.doc.operations || []).forEach((row) => {
+        if (row.manufacturing_type !== "In-House") return;
+
+        const qty = pending_qty[row.opration_name] ?? flt(row.pending_qty);
+        if (qty <= 0) return;
+
+        dialog.fields_dict.operations.df.data.push({
+            __checked: 1,
+            opration_name: row.opration_name,
+            workstation: row.workstation,
+            opration_sequence_no: row.opration_sequence_no,
+            qty: qty,
+        });
+    });
+
+    dialog.fields_dict.operations.grid.refresh();
 }

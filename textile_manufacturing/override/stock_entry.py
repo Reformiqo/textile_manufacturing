@@ -1,6 +1,8 @@
 import frappe
 from frappe.utils import flt
 
+from erpnext.stock.doctype.stock_entry.stock_entry import StockEntry
+
 
 # def update_master_job_card_transfer(doc, method=None):
 #     master_job_card = doc.get("master_job_card")
@@ -151,3 +153,24 @@ def update_master_work_order_consumed(doc, method=None):
         new_consumed = consumed_map.get(item.item_code, 0)
         if flt(item.consumed_qty) != new_consumed:
             frappe.db.set_value("Master Work Order Required Item", item.name, "consumed_qty", new_consumed)
+
+class CustomStockEntry(StockEntry):
+    def validate_subcontract_order(self):
+        """ERPNext's Raw Materials Supplied check does not apply to this app's transfers.
+
+        It insists every item on a Send to Subcontractor entry appears in the
+        Subcontracting Order's Raw Materials Supplied table. That table is emptied on
+        purpose here -- the supplier is sent the finished goods to work on, not raw
+        material to build them from -- so the check would refuse every transfer raised
+        against a Master Work Order.
+
+        Skipping it is what lets the entry carry its Subcontracting Order at all, and
+        that link is what the Connections panel follows and what
+        update_subcontracting_order_status() reads to move the order on.
+
+        Anything not driven by a Master Work Order is ordinary subcontracting, with a
+        Raw Materials Supplied table of its own, and is checked exactly as before."""
+        if self.get("master_work_order"):
+            return
+
+        super().validate_subcontract_order()

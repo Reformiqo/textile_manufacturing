@@ -7,6 +7,28 @@ from frappe.utils import cint, flt
 
 
 class MasterWorkOrder(Document):
+    def onload(self):
+        # Settled here so the form knows whether to offer the button by the time it
+        # draws, the way the Work Order settles Create Job Card in its own onload.
+        # The quantities travel with the flag: the operation rows carry a Pending Qty
+        # of their own, but only from the moment a card last reported against them,
+        # and the dialog should not open empty on an order that predates that.
+        pending = self.pending_master_job_card_operations()
+        self.set_onload("show_pending_master_job_card_button", bool(pending))
+        self.set_onload("pending_master_job_card_operations", pending)
+
+        # The Finish dialog's rows, and the ceiling on each: what the last operation
+        # turned out, which the form itself does not carry. The reason travels with
+        # them, for when the order has work left but the line has not turned it out.
+        rows = self.pending_manufacture_rows()
+        self.set_onload("pending_manufacture_rows", rows)
+        self.set_onload(
+            "finish_blocked_reason",
+            self.finish_blocked_reason()
+            if rows and not any(flt(row["qty"]) > 0 for row in rows)
+            else None,
+        )
+
     def validate(self):
         self.validate_unique_production_plan()
 
@@ -764,7 +786,57 @@ class MasterWorkOrder(Document):
     # ------------------------------------------------------------------
     # Finish -- produce the finished goods
     # ------------------------------------------------------------------
+    def work_order_process_loss(self):
+        """The process loss a Manufacture entry will take off, and the loss already
+        booked, per Work Order.
+
+        The Stock Entry's set_process_loss_qty() reads the highest process loss on any
+        of the Work Order's operation rows, and load_items_from_bom() then raises the
+        finished good for fg_completed_qty less that figure. So a Manufacture entry has
+        to be raised for the pieces put through the line, not the good ones that came
+        off it -- asking for 5 where 5 were also lost leaves 5 - 5 = 0 finished goods,
+        and ERPNext refuses the entry for having none.
+
+        Already booked is the Work Order's own process_loss_qty, which it keeps as the
+        sum over its submitted Manufacture entries. Without it the loss would look
+        outstanding for ever and the Finish would keep offering it."""
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return {}, {}
+
+        to_deduct = {}
+        for row in frappe.get_all(
+            "Work Order Operation",
+            filters={"parent": ["in", work_orders], "parenttype": "Work Order"},
+            fields=["parent", "process_loss_qty"],
+        ):
+            to_deduct[row.parent] = max(
+                to_deduct.get(row.parent, 0.0), flt(row.process_loss_qty)
+            )
+
+        booked = {
+            row.name: flt(row.process_loss_qty)
+            for row in frappe.get_all(
+                "Work Order",
+                filters={"name": ["in", work_orders]},
+                fields=["name", "process_loss_qty"],
+            )
+        }
+
+        return to_deduct, booked
+
     def pending_manufacture_by_work_order(self):
+        """Finished goods still to be booked, per Work Order -- good pieces only.
+
+        What the operator is asked for and what they type: nothing can be booked as
+        made beyond what came off the last operation. Part production is exactly this
+        case: 5 of 10 off the line means 5 to finish, and the other 5 only once a
+        pending Master Job Card has run them.
+
+        The process loss is not in this figure. It is added on the way into the Stock
+        Entry, in finish_work_orders(), because that is the only place it belongs."""
+        output = self.final_operation_output()
+
         pending = {}
         for row in frappe.get_all(
             "Master Work Order Item",
@@ -782,6 +854,9 @@ class MasterWorkOrder(Document):
             else:
                 ceiling = flt(row.mateial_transfer_qty)
 
+            if row.work_order_number in output:
+                ceiling = min(ceiling, output[row.work_order_number])
+
             qty = ceiling - flt(row.manufacture_qty)
             if qty <= 0:
                 continue
@@ -790,74 +865,425 @@ class MasterWorkOrder(Document):
 
         return pending
 
+    def hold_process_loss_to_actual(self, work_orders):
+        """Hold each Work Order's process loss to what was really lost.
+
+        ERPNext totals it over the Manufacture entries, and every one of those carries
+        the same figure -- set_process_loss_qty() stamps each entry with the highest
+        process loss on any operation row, taking no account of what earlier entries
+        already booked. With one entry that is right. Part production makes several,
+        and the same loss would then be counted once per entry, pushing produced plus
+        loss past the quantity ordered."""
+        to_deduct, _booked = self.work_order_process_loss()
+
+        for work_order in set(work_orders):
+            actual = flt(to_deduct.get(work_order))
+            booked = flt(frappe.db.get_value("Work Order", work_order, "process_loss_qty"))
+            if abs(booked - actual) <= 0.001:
+                continue
+
+            doc = frappe.get_doc("Work Order", work_order)
+            doc.db_set("process_loss_qty", actual)
+            doc.db_set("status", doc.get_status())
+
+    def outstanding_manufacture_by_work_order(self):
+        """What the order still has to produce, whatever state the line is in.
+
+        Not the same as what may be produced right now -- that is
+        pending_manufacture_by_work_order(), which holds the qty to what has actually
+        come off the last operation. This figure decides whether the Finish is offered
+        at all, so an order with work still to do keeps its button and is told why it
+        cannot go ahead, instead of the button quietly disappearing."""
+        _to_deduct, booked = self.work_order_process_loss()
+
+        outstanding = {}
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+
+            if self.skip_material_transfer_to_wip_warehouse:
+                ceiling = flt(row.qty_to_manufacture)
+            else:
+                ceiling = flt(row.mateial_transfer_qty)
+
+            qty = (
+                ceiling
+                - flt(row.manufacture_qty)
+                - flt(booked.get(row.work_order_number))
+            )
+            if qty > 0:
+                outstanding[row.work_order_number] = qty
+
+        return outstanding
+
+    def finish_blocked_reason(self):
+        """Why the Finish cannot go ahead, when something is still outstanding.
+
+        None when it can. The operations that have not turned anything out yet are
+        named, because that is the only thing the operator can do about it."""
+        in_house = self.in_house_operations()
+        if not in_house:
+            return None
+
+        waiting = []
+        for card in self.master_job_cards():
+            if card.status != "Completed":
+                waiting.append("{0} -- {1} is {2}".format(
+                    frappe.utils.get_link_to_form("Master Job Card", card.name),
+                    frappe.bold(card.operation_name or ""),
+                    card.status,
+                ))
+
+        if not waiting:
+            return (
+                "Nothing has come off {0} yet, so there is nothing to book as "
+                "finished."
+            ).format(frappe.bold(in_house[-1].opration_name or ""))
+
+        return (
+            "Nothing can be finished until the operations have run.<br><br>{0}"
+            "<br><br>Report the qty on those cards first -- the Finish is held to "
+            "what {1} actually turns out."
+        ).format("<br>".join(waiting), frappe.bold(in_house[-1].opration_name or ""))
+
+    def pending_manufacture_rows(self):
+        """The rows the Finish dialog offers, and the qty each may go up to.
+
+        Offered whenever the order has something left to produce. Qty to Produce is
+        held to what the line has turned out, so it can be zero -- the form then says
+        why rather than hiding the button."""
+        if self.docstatus != 1:
+            return []
+
+        outstanding = self.outstanding_manufacture_by_work_order()
+        if not outstanding:
+            return []
+
+        allowed = self.pending_manufacture_by_work_order()
+        to_deduct, _booked = self.work_order_process_loss()
+
+        rows = []
+        for row in self.items_to_be_manufacture:
+            if row.work_order_number not in outstanding:
+                continue
+
+            qty = flt(allowed.get(row.work_order_number))
+
+            rows.append({
+                "work_order_number": row.work_order_number,
+                "item_code": row.item_code,
+                "t_warehouse": row.fg_warehouse or self.fg_warehouse,
+                "qty_to_manufacture": flt(row.qty_to_manufacture),
+                "transferred_qty": flt(row.mateial_transfer_qty),
+                "produced_qty": flt(row.manufacture_qty),
+                # Shown beside the qty because the entry is raised for the pieces put
+                # through: ask for 5 with 5 lost and 5 finished goods are booked.
+                "process_loss_qty": flt(to_deduct.get(row.work_order_number)),
+                "outstanding_qty": flt(outstanding[row.work_order_number]),
+                "pending_qty": qty,
+                "qty": qty,
+            })
+
+        return rows
+
     def master_job_cards(self):
         """The Master Job Cards raised against this order, newest last."""
         return frappe.get_all(
             "Master Job Card",
             filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
-            fields=["name", "operation_name", "status"],
+            fields=["name", "operation_name", "status", "docstatus"],
             order_by="creation",
         )
 
-    @frappe.whitelist()
-    def pending_master_job_card_operations(self):
-        """Operations whose balance can be carried onto a fresh Master Job Card.
+    # ------------------------------------------------------------------
+    # Part production -- the balance an operation has still to run
+    # ------------------------------------------------------------------
+    def in_house_operations(self):
+        """In-House operations, in the order they run -- which is the order of the
+        rows in the table.
 
-        Read off the cards themselves, not the operation rows: a pending card carries
-        the same operation name, so sync_to_master_work_order() puts that row back to
-        Pending as soon as one is raised."""
-        if flt(self.total_manufacture_qty) == flt(self.total_qty_to_manufacture):
+        Not by Opration Sequence No: it comes from the BOM and is 0 on every row of
+        plenty of orders, so it cannot be relied on to say which operation runs first."""
+        return sorted(
+            (op for op in self.operations if op.manufacturing_type == "In-House"),
+            key=lambda op: cint(op.idx),
+        )
+
+    def operation_detail_rows(self, operation, fields):
+        cards = frappe.get_all(
+            "Master Job Card",
+            filters={
+                "master_work_order_number": self.name,
+                "operation_name": operation,
+                "docstatus": ["<", 2],
+            },
+            pluck="name",
+        )
+        if not cards:
+            return []
+
+        return frappe.get_all(
+            "Master Job Card Detail",
+            filters={"parent": ["in", cards], "parenttype": "Master Job Card"},
+            fields=fields,
+        )
+
+    def operation_balances(self):
+        """What each operation has made and lost, per Work Order.
+
+        Summed over every card of the operation -- the one the order was raised with
+        and any pending card carrying a balance on from it. Read in one pass over the
+        whole order, because onload asks this of every operation each time the form
+        opens."""
+        cards = frappe.get_all(
+            "Master Job Card",
+            filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
+            fields=["name", "operation_name"],
+        )
+        if not cards:
+            return {}
+
+        operation_by_card = {card.name: card.operation_name for card in cards}
+
+        balances = {}
+        for row in frappe.get_all(
+            "Master Job Card Detail",
+            filters={
+                "parent": ["in", list(operation_by_card)],
+                "parenttype": "Master Job Card",
+            },
+            fields=[
+                "parent", "work_order_number",
+                "completed_qty", "process_loss_qty", "rejected_qty",
+            ],
+        ):
+            operation = operation_by_card.get(row.parent)
+            if not operation or not row.work_order_number:
+                continue
+
+            balance = balances.setdefault(operation, {}).setdefault(
+                row.work_order_number, {"completed": 0.0, "loss": 0.0}
+            )
+            balance["completed"] += flt(row.completed_qty)
+            balance["loss"] += flt(row.process_loss_qty) + flt(row.rejected_qty)
+
+        return balances
+
+    def pending_by_operation(self):
+        """What each operation still has to run, per Work Order.
+
+        Measured against the order's own quantity, which never moves, less what this
+        operation made and lost and what was lost before it ever got here. That last
+        term is what separates a run that is merely unfinished from one that finished
+        short: 5 of 10 made upstream with nothing lost leaves 5 still coming, but 5
+        made and 5 lost leaves nothing -- those pieces are gone, and no operation
+        downstream can ever work them."""
+        ordered = {
+            row.work_order_number: flt(row.qty_to_manufacture)
+            for row in self.items_to_be_manufacture
+            if row.work_order_number
+        }
+        balances = self.operation_balances()
+
+        pending = {}
+        upstream = {}
+
+        for op in self.in_house_operations():
+            by_work_order = balances.get(op.opration_name) or {}
+
+            pending[op.opration_name] = {}
+            for work_order, balance in by_work_order.items():
+                qty = (
+                    flt(ordered.get(work_order))
+                    - balance["completed"]
+                    - balance["loss"]
+                    - flt(upstream.get(work_order))
+                )
+                if qty > 0.001:
+                    pending[op.opration_name][work_order] = qty
+
+            # Carried to everything after it: a piece lost here never arrives there.
+            for work_order, balance in by_work_order.items():
+                upstream[work_order] = flt(upstream.get(work_order)) + balance["loss"]
+
+        return pending
+
+    def update_operation_pending(self):
+        """Write Pending Qty on every In-House operation row.
+
+        All of them, not just the one that changed: loss at one operation moves the
+        pending qty of every operation after it."""
+        pending = self.pending_by_operation()
+
+        for op in self.operations:
+            if op.manufacturing_type != "In-House":
+                continue
+
+            value = flt(sum((pending.get(op.opration_name) or {}).values()), 3)
+            if flt(op.pending_qty) == value:
+                continue
+
+            frappe.db.set_value(
+                "Master Work Order Operation", op.name, "pending_qty", value,
+                update_modified=False,
+            )
+
+    def pending_master_job_card_operations(self):
+        """The operations a pending Master Job Card could be raised for.
+
+        Only once every card raised so far has finished and been submitted: a card
+        still open is where that work belongs, and a second one beside it would leave
+        two cards claiming the same pieces. Submitted as well as complete, because
+        until then the Work Order still counts the whole of the first card's quantity
+        as outstanding, and validate_job_card_qty() would refuse the second Job Card as
+        over-production."""
+        if self.docstatus != 1 or self.status in ("Completed", "Closed", "Stopped", "Cancelled"):
             return []
 
         cards = self.master_job_cards()
-        if not cards or any(card.status != "Completed" for card in cards):
+        if not cards:
+            return []
+        if any(card.status != "Completed" or card.docstatus != 1 for card in cards):
             return []
 
-        return [
-            {
+        # An operation left with no card at all -- its only one having been cancelled
+        # -- has to be raised again before anything downstream of it carries on. A
+        # pending card continues an operation that ran; it does not start one.
+        raised = {card.operation_name for card in cards}
+        if any(op.opration_name not in raised for op in self.in_house_operations()):
+            return []
+
+        by_operation = self.pending_by_operation()
+
+        pending = []
+        for op in self.in_house_operations():
+            qty = sum((by_operation.get(op.opration_name) or {}).values())
+            if qty <= 0.001:
+                continue
+
+            pending.append({
                 "opration_name": op.opration_name,
-                "pending_qty": flt(op.pending_qty),
-            }
-            for op in self.operations
-            if op.manufacturing_type == "In-House" and flt(op.pending_qty) > 0
-        ]
+                "qty": flt(qty, 3),
+            })
+
+        return pending
+
+    def show_pending_master_job_card_button(self):
+        """Whether any operation has quantity left to run.
+
+        The same question the Work Order answers in show_create_job_card_button(),
+        asked of the Master Job Cards instead: every operation is through, and the
+        order still asked for more than they accounted for."""
+        return bool(self.pending_master_job_card_operations())
+
+    @frappe.whitelist()
+    def make_pending_master_job_cards(self, operations=None):
+        """Raise a Master Job Card for each selected operation's outstanding balance.
+
+        Chained in the order the operations run, so the ceiling one operation puts on
+        the next applies to this run exactly as it did to the first."""
+        operations = frappe.parse_json(operations) if isinstance(operations, str) else (operations or [])
+
+        wanted = {row.get("opration_name") for row in operations if row.get("opration_name")}
+        if not wanted:
+            frappe.throw("Select at least one operation.", title="Nothing Selected")
+
+        available = {row["opration_name"] for row in self.pending_master_job_card_operations()}
+
+        unavailable = sorted(name for name in wanted if name not in available)
+        if unavailable:
+            frappe.throw(
+                ("Nothing is left to run through: {0}.<br><br>"
+                 "Refresh the Master Work Order -- work has been reported against it "
+                 "since this form was opened.").format(
+                    frappe.bold(", ".join(unavailable))
+                ),
+                title="Nothing Pending",
+            )
+
+        by_operation = self.pending_by_operation()
+
+        created = []
+        previous = None
+        for op in self.in_house_operations():
+            if op.opration_name not in wanted:
+                continue
+
+            previous = self.make_pending_master_job_card(
+                op.opration_name, by_operation.get(op.opration_name) or {}, previous
+            )
+            created.append(previous)
+
+        frappe.msgprint(
+            ("Raised {0} Master Job Card(s) for the pending qty:<br><br>{1}").format(
+                len(created),
+                "<br>".join(
+                    frappe.utils.get_link_to_form("Master Job Card", name)
+                    for name in created
+                ),
+            ),
+            title="Pending Master Job Card",
+            indicator="green",
+        )
+
+        return created
+
+    def make_pending_master_job_card(self, operation, pending, previous=None):
+        master_job_card = frappe.new_doc("Master Job Card")
+        master_job_card.master_work_order_number = self.name
+        master_job_card.operation_name = operation
+        master_job_card.previous_opration_master_job_card = previous
+        master_job_card.fetch_from_master_work_order()
+        master_job_card.limit_to_pending_qty(pending)
+        master_job_card.insert()
+
+        return master_job_card.name
+
+    def final_operation_output(self):
+        """What the last In-House operation turned out, per Work Order.
+
+        The ceiling on the Finish: goods that have not come off the end of the line
+        cannot be booked as made. Empty when no operation runs in house, and then the
+        Work Orders' own quantities are the only ceiling there is."""
+        in_house = self.in_house_operations()
+        if not in_house:
+            return {}
+
+        output = {}
+        for row in self.operation_detail_rows(
+            in_house[-1].opration_name, ["work_order_number", "completed_qty"]
+        ):
+            if not row.work_order_number:
+                continue
+            output[row.work_order_number] = (
+                output.get(row.work_order_number, 0.0) + flt(row.completed_qty)
+            )
+
+        return output
 
     def validate_master_job_cards_completed(self):
-        in_house = [op for op in self.operations if op.manufacturing_type == "In-House"]
+        """Every In-House operation has to have been raised for.
+
+        Not that every card has finished: part production leaves a pending card in
+        draft for the balance, and the 5 that are already through the line should not
+        wait on the 5 that are not. How far the Finish may go is
+        pending_manufacture_by_work_order()'s job, and it holds it to what the last
+        operation actually turned out."""
+        in_house = self.in_house_operations()
         if not in_house:
             return
 
-        cards = self.master_job_cards()
+        raised = {card.operation_name for card in self.master_job_cards()}
 
-        missing = [
-            op.opration_name
-            for op in in_house
-            if op.opration_name not in {card.operation_name for card in cards}
-        ]
-        if missing:
-            frappe.throw(
-                ("No Master Job Card has been raised for: {0}.<br><br>"
-                 "Create and complete them before finishing.").format(
-                    frappe.bold(", ".join(name for name in missing if name))
-                ),
-                title="Operations Not Complete",
-            )
-
-        incomplete = [card for card in cards if card.status != "Completed"]
-        if not incomplete:
+        missing = [op.opration_name for op in in_house if op.opration_name not in raised]
+        if not missing:
             return
 
-        lines = "<br>".join(
-            "{0} -- {1} is {2}".format(
-                frappe.utils.get_link_to_form("Master Job Card", row.name),
-                frappe.bold(row.operation_name or ""),
-                row.status,
-            )
-            for row in incomplete
-        )
         frappe.throw(
-            ("Operations are not complete for this Master Work Order.<br><br>{0}"
-             "<br><br>Complete them before finishing.").format(lines),
+            ("No Master Job Card has been raised for: {0}.<br><br>"
+             "Create and complete them before finishing.").format(
+                frappe.bold(", ".join(name for name in missing if name))
+            ),
             title="Operations Not Complete",
         )
 
@@ -869,6 +1295,13 @@ class MasterWorkOrder(Document):
 
         allowed = self.pending_manufacture_by_work_order()
         if not allowed:
+            # Two different situations, and they need different answers: the order is
+            # done, or the line has not turned anything out for it yet.
+            if self.outstanding_manufacture_by_work_order():
+                frappe.throw(
+                    self.finish_blocked_reason(), title="Operations Not Complete"
+                )
+
             frappe.throw(
                 "There is nothing left to produce.<br><br>"
                 "Refresh the Master Work Order -- goods have been produced against it "
@@ -880,6 +1313,15 @@ class MasterWorkOrder(Document):
             {"work_order_number": work_order, "qty": qty}
             for work_order, qty in allowed.items()
         ]
+
+        # ERPNext raises the finished good for fg_completed_qty less the highest
+        # process loss on the Work Order's operations. The quantity entered here is
+        # the good pieces wanted, so the loss is added on the way in and ERPNext takes
+        # it straight back off -- ask for 5 where 5 were lost and the entry is raised
+        # for 10, which books the 5. Entering 5 raw books 5 - 5 = nothing, and the
+        # entry is refused for having no finished good at all.
+        to_deduct, _booked = self.work_order_process_loss()
+        finished = []
 
         for row in rows:
             work_order = row.get("work_order_number")
@@ -917,13 +1359,20 @@ class MasterWorkOrder(Document):
                     )
                 )
 
-            stock_entry = frappe.get_doc(make_stock_entry(work_order, "Manufacture", qty))
+            stock_entry = frappe.get_doc(
+                make_stock_entry(
+                    work_order, "Manufacture", qty + flt(to_deduct.get(work_order))
+                )
+            )
             stock_entry.master_work_order = self.name
             if not stock_entry.get("project"):
                 stock_entry.project = self.get("project")
             stock_entry.insert()
             stock_entry.submit()
 
+            finished.append(work_order)
+
+        self.hold_process_loss_to_actual(finished)
         self.update_manufactured_qty()
 
     def update_manufactured_qty(self):
@@ -937,23 +1386,25 @@ class MasterWorkOrder(Document):
             work_order = frappe.db.get_value(
                 "Work Order",
                 row.work_order_number,
-                ["produced_qty", "process_loss_qty", "status"],
+                ["produced_qty", "status"],
                 as_dict=True,
             ) or frappe._dict()
 
             produced = flt(work_order.produced_qty)
             produced_total += produced
 
-            process_loss = flt(work_order.process_loss_qty)
-
+            # Process Loss Qty is the Master Job Cards' figure and is left alone here.
+            # The Finish only accepts a quantity; the Work Order's own loss is what
+            # ERPNext booked on the Manufacture entry, which takes the highest loss of
+            # any operation rather than their sum.
             row.db_set({
                 "manufacture_qty": produced,
-                "process_loss_qty": process_loss,
-                # Same accounting the Master Job Card keeps: what was lost is not
-                # waiting to be made. Taking pending as ordered less produced left
-                # every loss standing here as an outstanding quantity, and the order
-                # then offered to raise fresh cards for pieces that no longer exist.
-                "pending_qty": flt(row.qty_to_manufacture) - produced - process_loss,
+                # What was lost is not waiting to be made, so it comes off the pending
+                # qty as well as the produced qty. Never below zero: nothing is owed
+                # when more has been accounted for than was ever ordered.
+                "pending_qty": max(
+                    flt(row.qty_to_manufacture) - produced - flt(row.process_loss_qty), 0.0
+                ),
                 "status": self.item_status(work_order.status),
             }, update_modified=False)
 

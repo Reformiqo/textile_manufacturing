@@ -148,12 +148,12 @@
    "precision": "2"
   },
   {
+   "allow_on_submit": 1,
    "default": "0",
    "fieldname": "actual_time",
    "fieldtype": "Float",
    "label": "Actual Time",
-   "precision": "2",
-   "read_only": 1
+   "precision": "2"
   },
   {
    "allow_on_submit": 1,
