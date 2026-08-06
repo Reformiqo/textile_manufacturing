@@ -162,7 +162,11 @@ doc_events = {
 		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",
 	},
 	"Subcontracting Receipt": {
-		"validate": "textile_manufacturing.override.subcontracting_order.set_receipt_master_work_order",
+		"validate": "textile_manufacturing.override.subcontracting_receipt.set_receipt_master_work_order",
+		# The receipt is what carries the Subcontracting Order to Completed, which is
+		# what an Out House Master Work Order waits on before it can be finished.
+		"on_submit": "textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
+		"on_cancel": "textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
 	},
 	"Quality Inspection": {
 		"on_submit": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail",

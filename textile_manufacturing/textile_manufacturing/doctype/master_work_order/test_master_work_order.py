@@ -217,7 +217,11 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			made = room if completed is None else min(completed, room)
 			rows.append({
 				"job_card_number": row.job_card_number,
-				"qty_to_manufacture": ordered,
+				# What the run actually accounted for, which is what the operator is
+				# left with on the card: the Complete dialog's Qty to Manufacture is
+				# typed down to the run, so made + lost + rejected is the figure it
+				# saves. Every completed card on the site holds to that.
+				"qty_to_manufacture": made + lost + bad,
 				"completed_qty": made,
 				"process_loss_qty": lost,
 				"rejected_qty": bad,
@@ -408,6 +412,15 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				f"{where}: the item row's status must follow the Work Order's",
 			)
 
+	def expected_final_status(self, order):
+		"""What a fully run order should read once the line is done with it.
+
+		Completed, unless something is away at a supplier: an Out House operation
+		holds the order In Process until a completed Subcontracting Order brings the
+		qty back, and nothing here raises one. Which it is depends on the routing the
+		fixtures found, so it is asked rather than assumed."""
+		return "In Process" if order.out_house_operations() else "Completed"
+
 	def assert_order(self, order, status, made, lost, when=""):
 		"""The order's own header figures, and its links onward."""
 		order.reload()
@@ -516,10 +529,10 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		self.assert_items(order, made=4.0, lost=6.0, pending=0.0, status="Completed",
 			when="after the Finish")
-		self.assert_order(order, status="Completed", made=4.0, lost=6.0,
+		self.assert_order(order, status=self.expected_final_status(order), made=4.0, lost=6.0,
 			when="after the Finish")
 		# Nothing left to press: the order is closed to further work.
-		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=self.expected_final_status(order) != "Completed",
 			when="after the Finish")
 
 	# ------------------------------------------------------------------
@@ -559,9 +572,9 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		self.assert_items(order, made=10.0, lost=0.0, pending=0.0, status="Completed",
 			when="after the Finish")
-		self.assert_order(order, status="Completed", made=10.0, lost=0.0,
+		self.assert_order(order, status=self.expected_final_status(order), made=10.0, lost=0.0,
 			when="after the Finish")
-		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=self.expected_final_status(order) != "Completed",
 			when="after the Finish")
 
 	# ------------------------------------------------------------------
@@ -610,11 +623,20 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		# Pass two: each operation is offered exactly what its own row says it owes.
 		# This is the partial case working -- unfinished work is pending and
 		# offered, where destroyed cloth is neither.
+		# The formula, per operation:
+		#     Qty to Manufacture on the operation row
+		#       - the Qty to Manufacture of every card raised for that operation
+		#
+		# The first ran 10 of its 20 and its cards claim 10, so 10 is left. The
+		# second's cards claim only the 8 that reached it -- the 2 destroyed at the
+		# first operation are counted against that operation's cards, not this one --
+		# so it is offered 12. What the pieces the cloth can no longer supply comes
+		# off at completion instead, where qty_caps() holds the card down.
 		pending = {row["opration_name"]: flt(row["qty"])
 				   for row in order.pending_master_job_card_operations()}
 		self.assertEqual(pending, {
 			self.operations[0]: 10.0,
-			self.operations[1]: 10.0,
+			self.operations[1]: 12.0,
 		})
 
 		created = order.make_pending_master_job_cards(
@@ -656,9 +678,9 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		self.assert_items(order, made=8.0, lost=2.0, pending=0.0, status="Completed",
 			when="after the second Finish")
-		self.assert_order(order, status="Completed", made=8.0, lost=2.0,
+		self.assert_order(order, status=self.expected_final_status(order), made=8.0, lost=2.0,
 			when="after the second Finish")
-		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=self.expected_final_status(order) != "Completed",
 			when="after the second Finish")
 
 	# ------------------------------------------------------------------
@@ -711,9 +733,9 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		self.assert_items(order, made=5.0, lost=5.0, pending=0.0, status="Completed",
 			when="after the Finish")
-		self.assert_order(order, status="Completed", made=5.0, lost=5.0,
+		self.assert_order(order, status=self.expected_final_status(order), made=5.0, lost=5.0,
 			when="after the Finish")
-		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=self.expected_final_status(order) != "Completed",
 			when="after the Finish")
 
 	# ------------------------------------------------------------------
@@ -800,7 +822,7 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertEqual(
 			flt(order.items_to_be_manufacture[0].manufacture_qty), ORDER_QTY
 		)
-		self.assertEqual(order.status, "Completed")
+		self.assertEqual(order.status, self.expected_final_status(order))
 		self.assertEqual(order.pending_manufacture_rows(), [])
 
 	def test_subcontracted_po_carries_every_item_to_the_supplier(self):
@@ -850,6 +872,113 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				flt(row.qty), flt(row.subcontracted_qty),
 				f"{where}: this row would be dropped from the Subcontracting Order",
 			)
+
+	def test_an_order_with_nothing_out_house_is_finished_by_its_work_orders(self):
+		"""Nothing is away at a supplier, so the line alone settles it."""
+		order = self.make_order()
+		for row in order.operations:
+			row.manufacturing_type = "In-House"
+
+		self.assertFalse(
+			order.outstanding_out_house_qty(),
+			"an order with no Out House operation has nothing outstanding",
+		)
+
+	def test_out_house_work_holds_the_order_until_it_comes_back(self):
+		"""The cloth is away being worked on, so the order is not finished with it.
+
+		Every item is outstanding until a completed Subcontracting Order raised
+		against this Master Work Order accounts for the qty it was raised for."""
+		order = self.make_order()
+		order.operations[-1].manufacturing_type = "Out House"
+
+		outstanding = order.outstanding_out_house_qty()
+
+		self.assertEqual(
+			sorted(outstanding), sorted(row.item_code for row in order.items_to_be_manufacture),
+			"with no Subcontracting Order behind it, every item is still away",
+		)
+		for row in order.items_to_be_manufacture:
+			self.assertAlmostEqual(
+				flt(outstanding[row.item_code]), flt(row.qty_to_manufacture), places=3,
+				msg=f"{row.item_code}: the whole qty is outstanding",
+			)
+
+	def test_a_completed_subcontracting_order_settles_the_out_house_work(self):
+		"""Matched qty on a completed order clears it; short of that it still holds."""
+		order = self.make_order()
+		order.operations[-1].manufacturing_type = "Out House"
+		item = order.items_to_be_manufacture[0]
+
+		subcontracting_order = frappe.get_doc({
+			"doctype": "Subcontracting Order",
+			"master_work_order": order.name,
+			"status": "Completed",
+			"docstatus": 1,
+			"items": [{
+				"item_code": item.item_code,
+				"qty": flt(item.qty_to_manufacture),
+			}],
+		})
+		subcontracting_order.db_insert()
+		for row in subcontracting_order.items:
+			row.parent = subcontracting_order.name
+			row.parenttype = "Subcontracting Order"
+			row.parentfield = "items"
+			row.db_insert()
+
+		outstanding = order.outstanding_out_house_qty()
+
+		self.assertNotIn(
+			item.item_code, outstanding,
+			"the qty came back on a completed Subcontracting Order, so nothing is owed",
+		)
+		for row in order.items_to_be_manufacture[1:]:
+			self.assertIn(
+				row.item_code, outstanding,
+				f"{row.item_code}: nothing has come back for this one, so it still holds",
+			)
+
+	def test_a_card_typed_down_to_five_offers_the_other_five(self):
+		"""The formula the Pending Master Job Card button runs on, per operation:
+
+		    Qty to Manufacture on the Master Work Order operation row
+		      - the Qty to Manufacture of every Master Job Card raised for it
+
+		Nothing comes off for process loss or rejects. A card's Qty to Manufacture is
+		already what it accounted for -- completed + process loss + rejected -- so
+		they are inside it, and taking them off again would offer the same pieces
+		twice.
+
+		The case itself: an order for 10 whose card is typed down from 10 to 5. The
+		other 5 belong to nobody, so that is what the button offers -- and it offers
+		it straight away, without waiting for the card to be finished."""
+		order = self.make_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		operation = card.operation_name
+
+		for row in card.job_card_detail:
+			row.qty_to_manufacture = 5.0
+		card.save()
+		card.reload()
+
+		self.assertEqual(
+			flt(card.total_qty_to_manufacture), 5.0,
+			"the card has to hold the 5 it was typed down to",
+		)
+
+		offered = {
+			row["opration_name"]: flt(row["qty"])
+			for row in order.pending_master_job_card_operations()
+		}
+
+		self.assertEqual(
+			flt(offered.get(operation)), 5.0,
+			f"{operation}: 10 on the order less the 5 the card claims",
+		)
+		# The card is still open and has reported nothing -- the balance is offered
+		# on the strength of what it claims, not on it having finished.
+		self.assertEqual(card.status, "Open", "the card has not been started")
 
 	def test_a_card_can_be_run_with_nobody_named_on_it(self):
 		"""An operator is optional, and the run still has to add up without one.

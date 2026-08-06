@@ -45,6 +45,7 @@ frappe.ui.form.on("Master Work Order", {
     // Whenever parent warehouse fields change, push the update to all existing rows
     source_warehouse: function (frm) {
         update_all_child_warehouses(frm);
+        fetch_available_qty(frm);
     },
     fg_warehouse: function (frm) {
         update_all_child_warehouses(frm);
@@ -720,6 +721,19 @@ function set_child_warehouses(frm, child) {
     child.wip_warehouse = frm.doc.wip_warehouse;
     child.scrap_warehouse = frm.doc.scrap_warehouse;
 }
+
+function fetch_available_qty(frm) {
+    if (!frm.doc.source_warehouse) return;
+    if (!(frm.doc.required_items || []).length) return;
+
+    frm.call({
+        method: "set_available_qty",
+        doc: frm.doc,
+        freeze: true,
+        freeze_message: __("Reading stock in hand..."),
+    }).then(() => frm.refresh_field("required_items"));
+}
+
 
 function update_all_child_warehouses(frm) {
     (frm.doc.items_to_be_manufacture || []).forEach((child) => {

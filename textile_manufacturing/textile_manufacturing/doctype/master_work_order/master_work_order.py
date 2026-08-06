@@ -369,6 +369,11 @@ class MasterWorkOrder(Document):
                 "amount": data["requried_qty"] * rate,
             })
 
+    @frappe.whitelist()
+    def set_available_qty(self):
+        for row in self.required_items:
+            row.available_qty = self.get_source_warehouse_stock(row.item_code)
+
     def get_source_warehouse_stock(self, item_code):
         if not self.source_warehouse:
             return 0
@@ -1249,19 +1254,28 @@ class MasterWorkOrder(Document):
     def pending_master_job_card_operations(self):
         """The operations a pending Master Job Card could be raised for.
 
-        Only once every card raised so far has finished and been submitted: a card
-        still open is where that work belongs, and a second one beside it would leave
-        two cards claiming the same pieces. Submitted as well as complete, because
-        until then the Work Order still counts the whole of the first card's quantity
-        as outstanding, and validate_job_card_qty() would refuse the second Job Card as
-        over-production."""
+        What no card has claimed yet. Per operation:
+
+            Qty to Manufacture on the Master Work Order operation row
+              - the Qty to Manufacture of every Master Job Card raised for it
+
+        Nothing comes off for process loss or rejects. A card's Qty to Manufacture is
+        already what it accounted for -- completed + process loss + rejected -- so
+        those are inside it, and taking them off again would offer the same pieces to
+        be made twice.
+
+        A card being open does not stand in the way. It claims its own quantity and
+        nothing more, so the balance beside it belongs to nobody and can be raised
+        while the first is still being worked -- an order for 10 whose card is typed
+        down to 5 offers the other 5 at once. Two cards never claim the same pieces,
+        because what one takes is subtracted before the next is offered, and the sum
+        of them stays inside the order, which is the same sum ERPNext holds Job Cards
+        to in validate_job_card_qty()."""
         if self.docstatus != 1 or self.status in ("Completed", "Closed", "Stopped", "Cancelled"):
             return []
 
         cards = self.master_job_cards()
         if not cards:
-            return []
-        if any(card.status != "Completed" or card.docstatus != 1 for card in cards):
             return []
 
         # An operation left with no card at all -- its only one having been cancelled
@@ -1279,27 +1293,27 @@ class MasterWorkOrder(Document):
         if not self.outstanding_after_loss():
             return []
 
-        # Straight off the operations table. Every card writes its operation's
-        # Completed, Process Loss and Pending back there as it finishes -- see
-        # update_operation_rows() -- so the row is the figure, and the dialog
-        # offers exactly what the form shows rather than a second calculation the
-        # operator cannot see.
+        # What each operation still owes, straight off its own row. Every card writes
+        # its operation's Completed, Process Loss and Pending back there as it
+        # finishes -- see update_operation_rows() -- so the row is the figure, and the
+        # dialog offers exactly what the form shows.
         #
         # Read from the database rather than off self.operations: a card reporting
         # writes the row behind whatever document is in hand, so an instance loaded
         # before that would offer figures the form has already moved past.
-        stored = {
-            row.opration_name: flt(row.pending_qty)
+        ordered = {
+            row.opration_name: flt(row.total_qty_to_manufacture)
             for row in frappe.get_all(
                 "Master Work Order Operation",
                 filters={"parent": self.name, "parenttype": "Master Work Order"},
-                fields=["opration_name", "pending_qty"],
+                fields=["opration_name", "total_qty_to_manufacture"],
             )
         }
+        claimed = self.qty_claimed_by_operation()
 
         pending = []
         for op in self.in_house_operations():
-            qty = flt(stored.get(op.opration_name))
+            qty = flt(ordered.get(op.opration_name)) - flt(claimed.get(op.opration_name))
             if qty <= 0.001:
                 continue
 
@@ -1309,6 +1323,33 @@ class MasterWorkOrder(Document):
             })
 
         return pending
+
+    def qty_claimed_by_operation(self):
+        """The Qty to Manufacture of every card of an operation, added up.
+
+        The card's own figure, not the order's: a run of 5 off an order for 10 is
+        saved on the card as 5, so what it claims is the 5 it ran and not the 10 it
+        was raised for.
+
+        Nothing is taken off for process loss or rejects. A piece can only be
+        destroyed after it has been taken, so the loss is already inside the qty the
+        card claims -- subtracting it again would hand the same pieces back to be
+        made a second time.
+
+        A card being worked claims its qty just as a finished one does, which is what
+        lets a second be raised beside it for the balance. A cancelled card claims
+        nothing."""
+        claimed = {}
+        for card in frappe.get_all(
+            "Master Job Card",
+            filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
+            fields=["operation_name", "total_qty_to_manufacture"],
+        ):
+            claimed[card.operation_name] = (
+                flt(claimed.get(card.operation_name)) + flt(card.total_qty_to_manufacture)
+            )
+
+        return claimed
 
     def outstanding_after_loss(self):
         """Work Orders with cloth still to run, per Work Order.
@@ -1629,7 +1670,7 @@ class MasterWorkOrder(Document):
         return "In Process"
 
     def set_status_from_work_orders(self):
-        """Completed only once every Work Order is."""
+        """Completed once every Work Order is, and the Out House work has come back."""
         work_orders = self.linked_work_orders()
         if not work_orders:
             return
@@ -1640,13 +1681,51 @@ class MasterWorkOrder(Document):
         if not statuses:
             return
 
-        if all(status == "Completed" for status in statuses):
+        finished = all(status == "Completed" for status in statuses)
+
+        if finished and not self.outstanding_out_house_qty():
             self.db_set("status", "Completed")
             self.db_set("actual_end_date", frappe.utils.now_datetime())
         elif self.status == "Not Started":
             self.db_set("status", "In Process")
 
         self.update_production_plan()
+
+    def out_house_operations(self):
+        return [
+            row for row in self.operations if row.manufacturing_type == "Out House"
+        ]
+
+    def outstanding_out_house_qty(self):
+        if not self.out_house_operations():
+            return
+
+        orders = frappe.get_all(
+            "Subcontracting Order",
+            filters={
+                "master_work_order": self.name,
+                "docstatus": 1,
+                "status": "Completed",
+            },
+            pluck="name",
+        )
+
+        received = {}
+        if orders:
+            for row in frappe.get_all(
+                "Subcontracting Order Item",
+                filters={"parent": ["in", orders]},
+                fields=["item_code", "qty"],
+            ):
+                received[row.item_code] = flt(received.get(row.item_code)) + flt(row.qty)
+
+        outstanding = {}
+        for row in self.items_to_be_manufacture:
+            short = flt(row.qty_to_manufacture) - flt(received.get(row.item_code))
+            if short > 0.001:
+                outstanding[row.item_code] = short
+
+        return outstanding
 
 
     def update_production_plan(self):

@@ -112,22 +112,30 @@ const SFG_ENTRY = {
     "Stock Out": {
         title: "SFG Stock Out -- Material Receipt",
         warehouse_label: "Target Warehouse",
+        needs_submitted: true,
     },
     "Stock In": {
         title: "SFG Stock In -- Material Consumption for Manufacture",
         warehouse_label: "Source Warehouse",
+        needs_submitted: false,
     },
 };
 
 
 function add_sfg_button(frm) {
-    if (frm.doc.docstatus !== 1) return;
+    // Nothing to post against a card that has not been saved, or one that is cancelled.
+    if (frm.is_new() || frm.doc.docstatus === 2) return;
+
+    const offered = Object.keys(SFG_ENTRY).filter(
+        (entry_type) => frm.doc.docstatus === 1 || !SFG_ENTRY[entry_type].needs_submitted
+    );
+    if (!offered.length) return;
 
     frm.call({ method: "sfg_item_rows", doc: frm.doc }).then((r) => {
         const rows = r.message || [];
         if (!rows.length) return;
 
-        Object.keys(SFG_ENTRY).forEach((entry_type) => {
+        offered.forEach((entry_type) => {
             frm.add_custom_button(__("SFG {0}", [entry_type]), () => {
                 sfg_stock_dialog(frm, entry_type, rows);
             }, __("Create"));

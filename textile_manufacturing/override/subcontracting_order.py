@@ -27,59 +27,6 @@ def set_master_work_order(doc, method=None):
         doc.supplied_items = []
 
 
-def set_receipt_master_work_order(doc, method=None):
-    """Same story on the way back in.
-
-    The supplier was sent the finished goods to work on, so those are what he consumed
-    -- the BOM's raw material never reached him, and listing it here would write off
-    stock that never moved."""
-    # The Subcontracting Order is linked on the item rows, not on the receipt itself.
-    orders = {
-        item.get("subcontracting_order")
-        for item in (doc.get("items") or [])
-        if item.get("subcontracting_order")
-    }
-    if not orders:
-        return
-
-    master_work_order = next(
-        (
-            mwo
-            for mwo in (
-                frappe.db.get_value("Subcontracting Order", order, "master_work_order")
-                for order in orders
-            )
-            if mwo
-        ),
-        None,
-    )
-    if not master_work_order:
-        return
-
-    doc.master_work_order = master_work_order
-    doc.supplied_items = []
-
-    for item in doc.get("items"):
-        qty = flt(item.qty)
-        if qty <= 0:
-            continue
-
-        rate = flt(item.get("rate"))
-        doc.append("supplied_items", {
-            "main_item_code": item.item_code,
-            "rm_item_code": item.item_code,
-            "item_name": item.get("item_name"),
-            "stock_uom": item.get("stock_uom"),
-            "conversion_factor": 1.0,
-            "required_qty": qty,
-            "consumed_qty": qty,
-            "rate": rate,
-            "amount": qty * rate,
-            "reference_name": item.get("name"),
-            "subcontracting_order": item.get("subcontracting_order"),
-        })
-
-
 def master_work_order_of(subcontract_order, order_doctype="Subcontracting Order"):
     """The Master Work Order behind this order, if there is one."""
     if not subcontract_order:

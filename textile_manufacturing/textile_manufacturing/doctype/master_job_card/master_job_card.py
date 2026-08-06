@@ -280,8 +280,13 @@ class MasterJobCard(Document):
         return lost
 
     def qty_caps(self):
-        """Most each row may be raised for -- the order's qty less what the other
-        operations have lost, read off the item's Process Loss Qty.
+        """Most each row may be raised for:
+
+            order qty - what the other operations lost - what has been finished
+
+        Lost, because the cloth is gone. Finished, because those pieces have been
+        booked off the line as goods and are no longer work anybody can take -- a card
+        raised for them would be claiming pieces that have already left.
 
         A card's own loss must not shrink its own quantity, so it is taken back out
         where the field already counts it."""
@@ -297,14 +302,19 @@ class MasterJobCard(Document):
                 "parent": self.master_work_order_number,
                 "parenttype": "Master Work Order",
             },
-            fields=["work_order_number", "qty_to_manufacture", "process_loss_qty"],
+            fields=[
+                "work_order_number",
+                "qty_to_manufacture",
+                "process_loss_qty",
+                "manufacture_qty",
+            ],
         ):
             if not row.work_order_number:
                 continue
 
             elsewhere = flt(row.process_loss_qty) - flt(own.get(row.work_order_number))
             caps[row.work_order_number] = max(
-                flt(row.qty_to_manufacture) - elsewhere, 0.0
+                flt(row.qty_to_manufacture) - elsewhere - flt(row.manufacture_qty), 0.0
             )
 
         return caps
