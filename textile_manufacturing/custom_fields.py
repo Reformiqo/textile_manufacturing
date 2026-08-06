@@ -71,3 +71,4 @@ def make_custom_fields():
         ],
     }
     create_custom_fields(custom_fields, ignore_validate=True)
+    frappe.db.commit()
