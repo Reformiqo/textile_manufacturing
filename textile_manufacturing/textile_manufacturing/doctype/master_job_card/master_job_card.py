@@ -441,8 +441,10 @@ class MasterJobCard(Document):
             row,
             {
                 "status": totals["status"],
-                "completed_qty": totals["completed_qty"],
-                "process_loss_qty": totals["process_loss_qty"],
+                # Completed, Process Loss and Pending are written together a moment
+                # later, in update_operation_rows(), off one reckoning -- so the
+                # three always agree and Pending is never left over from an older
+                # one. Only what the card alone knows is set here.
                 "actual_time": totals["actual_time"],
                 "hour_rate": hour_rate,
                 "operating_cost": flt((totals["actual_time"] / 60.0) * hour_rate, 2),
@@ -453,10 +455,19 @@ class MasterJobCard(Document):
         self.update_master_work_order_process_loss()
 
         # Every operation, not just this one: a piece lost here never reaches any of
-        # the operations after it, so their pending qty moves too.
-        frappe.get_doc(
+        # the operations after it, so their pending qty moves too. The item rows'
+        # status comes with it -- an operation reporting is what moves them off Not
+        # Started, and the Finish is too late to wait for.
+        master_work_order = frappe.get_doc(
             "Master Work Order", self.master_work_order_number
-        ).update_operation_pending()
+        )
+        master_work_order.update_operation_rows()
+        # The loss reaches the Work Order here rather than waiting for the Finish:
+        # an order destroyed outright is never finished, so nothing else would ever
+        # carry it, and the Work Order would sit In Process for good.
+        master_work_order.hold_process_loss_to_actual()
+        master_work_order.refresh_item_status()
+        master_work_order.set_status_from_work_orders()
 
         self.move_master_work_order_off_not_started()
 
@@ -533,6 +544,21 @@ class MasterJobCard(Document):
         took. Only this step -- Completed is the Work Orders' call, on the Finish."""
         if OPERATION_STATUS.get(self.status, "Pending") == "Pending":
             return
+
+        # Work has begun, so the order is stamped with the date it began -- start
+        # and end are a pair on the form, and the end date is always stamped. Set
+        # here rather than only on the material transfer, which an order that skips
+        # the WIP warehouse never runs, leaving the field empty for the whole run.
+        if not frappe.db.get_value(
+            "Master Work Order", self.master_work_order_number, "actual_start_date"
+        ):
+            frappe.db.set_value(
+                "Master Work Order",
+                self.master_work_order_number,
+                "actual_start_date",
+                now_datetime(),
+                update_modified=False,
+            )
 
         if frappe.db.get_value(
             "Master Work Order", self.master_work_order_number, "status"

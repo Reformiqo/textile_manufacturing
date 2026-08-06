@@ -150,6 +150,10 @@ class MasterWorkOrder(Document):
             row.db_set({
                 "work_order_number": work_order.name,
                 "pending_qty": flt(row.qty_to_manufacture) - flt(row.manufacture_qty),
+                # Set from the off, not left blank until the first Finish: the row
+                # carries a status column and an empty one reads as a bug on a form
+                # whose Work Order is already running.
+                "status": self.item_status(work_order.status),
             }, update_modified=False)
 
 
@@ -865,24 +869,40 @@ class MasterWorkOrder(Document):
 
         return pending
 
-    def hold_process_loss_to_actual(self, work_orders):
-        """Hold each Work Order's process loss to what was really lost.
+    def hold_process_loss_to_actual(self, work_orders=None):
+        """Hold each Work Order's process loss to what was really lost, and re-read
+        its status from it.
 
-        ERPNext totals it over the Manufacture entries, and every one of those carries
-        the same figure -- set_process_loss_qty() stamps each entry with the highest
-        process loss on any operation row, taking no account of what earlier entries
-        already booked. With one entry that is right. Part production makes several,
-        and the same loss would then be counted once per entry, pushing produced plus
-        loss past the quantity ordered."""
-        to_deduct, _booked = self.work_order_process_loss()
+        ERPNext keeps the figure itself, in set_process_loss_qty(), by totalling
+        the loss over the submitted Manufacture entries -- and that is wrong here
+        three ways over. Over: every entry carries the same figure, so part
+        production counts the same loss once per entry. Under: the figure each
+        entry carries is the highest loss on any single operation row, and
+        different pieces die at different operations -- 5 rejected at one and 1
+        more at the next is 6 pieces gone, not 5, which left the Work Order a piece
+        short of Completed for good. Late: until the first Finish there are no
+        entries at all, so an order destroyed outright is never finished, never
+        corrected, and never leaves In Process.
 
-        for work_order in set(work_orders):
-            actual = flt(to_deduct.get(work_order))
-            booked = flt(frappe.db.get_value("Work Order", work_order, "process_loss_qty"))
+        The truth is the item row's own Process Loss Qty, the sum over every
+        completed card, so the Work Order is held to that whenever it moves and its
+        status re-read -- Completed once made plus lost accounts for the order.
+        work_orders narrows it to the ones a Finish has just touched; without it
+        every Work Order on the order is brought back into line."""
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+            if work_orders is not None and row.work_order_number not in set(work_orders):
+                continue
+
+            actual = flt(row.process_loss_qty)
+            booked = flt(frappe.db.get_value(
+                "Work Order", row.work_order_number, "process_loss_qty"
+            ))
             if abs(booked - actual) <= 0.001:
                 continue
 
-            doc = frappe.get_doc("Work Order", work_order)
+            doc = frappe.get_doc("Work Order", row.work_order_number)
             doc.db_set("process_loss_qty", actual)
             doc.db_set("status", doc.get_status())
 
@@ -976,9 +996,14 @@ class MasterWorkOrder(Document):
                 "qty_to_manufacture": flt(row.qty_to_manufacture),
                 "transferred_qty": flt(row.mateial_transfer_qty),
                 "produced_qty": flt(row.manufacture_qty),
-                # Shown beside the qty because the entry is raised for the pieces put
-                # through: ask for 5 with 5 lost and 5 finished goods are booked.
-                "process_loss_qty": flt(to_deduct.get(row.work_order_number)),
+                # The item row's own figure -- every operation's process loss and
+                # rejects added up, which is what the order really lost. Not
+                # to_deduct: that is ERPNext's, the highest loss on any single
+                # operation, and it reads 5 where 5 were rejected at one operation
+                # and 1 more at the next. It is still what the Manufacture entry is
+                # raised against below, because ERPNext takes exactly that much back
+                # off -- but it is the wrong number to show anybody.
+                "process_loss_qty": flt(row.process_loss_qty),
                 "outstanding_qty": flt(outstanding[row.work_order_number]),
                 "pending_qty": qty,
                 "qty": qty,
@@ -1069,15 +1094,41 @@ class MasterWorkOrder(Document):
 
         return balances
 
-    def pending_by_operation(self):
-        """What each operation still has to run, per Work Order.
+    def operation_figures(self):
+        """What each operation row should read, per Work Order.
 
-        Measured against the order's own quantity, which never moves, less what this
-        operation made and lost and what was lost before it ever got here. That last
-        term is what separates a run that is merely unfinished from one that finished
-        short: 5 of 10 made upstream with nothing lost leaves 5 still coming, but 5
-        made and 5 lost leaves nothing -- those pieces are gone, and no operation
-        downstream can ever work them."""
+        Completed, Process Loss and Pending, and they always account for the row's
+        Total Qty to Manufacture -- completed + loss + pending = total, on every
+        row, always. A row that does not add up is a row nobody can check.
+
+            Completed    = every card of this operation, added up
+            Process Loss = what never came out of this operation
+            Pending      = Qty to Manufacture - Completed - Process Loss
+
+        Qty to Manufacture never moves -- it is what the order asked of this
+        operation, and it stays that whatever happens on the floor. The three
+        always account for it, so every row adds up.
+
+        Completed and Pending are plain. Process Loss is the one that needs
+        saying: it is not only what this operation destroyed, but everything that
+        stopped it running the whole order. Its own rejects are gone, and so is
+        material destroyed at an operation the cloth passes before reaching here --
+        that never arrives and never will. 5 destroyed ahead of it and 1 rejected
+        here leaves the row 4 completed, 6 lost, nothing pending: 4 and 6 make the
+        10 it was asked for.
+
+        Which operations the cloth passes first is settled off the reported
+        quantities, not off any routing or sequence -- none is declared and the
+        floor keeps to none. What each operation receives it passes on, so an
+        operation that has handled more of the order is one the cloth reaches
+        earlier, and handled is Completed and destroyed together. An operation that
+        has handled the same or less is behind or alongside this one, and what it
+        destroyed had already come through here -- so it is not charged here, and
+        5 run of 10 with 1 rejected further down still leaves 5 to run, not 4.
+
+        Added up over every card the operation was run on, the card the order was
+        raised with and each pending card after it, so 4 made on one and 4 on the
+        next reads as 8 and not 4."""
         ordered = {
             row.work_order_number: flt(row.qty_to_manufacture)
             for row in self.items_to_be_manufacture
@@ -1085,46 +1136,113 @@ class MasterWorkOrder(Document):
         }
         balances = self.operation_balances()
 
-        pending = {}
-        upstream = {}
-
+        figures = {}
         for op in self.in_house_operations():
-            by_work_order = balances.get(op.opration_name) or {}
+            name = op.opration_name
+            figures[name] = {}
 
-            pending[op.opration_name] = {}
-            for work_order, balance in by_work_order.items():
-                qty = (
-                    flt(ordered.get(work_order))
-                    - balance["completed"]
-                    - balance["loss"]
-                    - flt(upstream.get(work_order))
-                )
-                if qty > 0.001:
-                    pending[op.opration_name][work_order] = qty
+            for work_order, balance in (balances.get(name) or {}).items():
+                handled = balance["completed"] + balance["loss"]
 
-            # Carried to everything after it: a piece lost here never arrives there.
-            for work_order, balance in by_work_order.items():
-                upstream[work_order] = flt(upstream.get(work_order)) + balance["loss"]
+                # Destroyed where the cloth passes before it gets here.
+                never_arrived = 0.0
+                for other_name, by_work_order in balances.items():
+                    if other_name == name:
+                        continue
+                    other = by_work_order.get(work_order)
+                    if not other:
+                        continue
+                    if other["completed"] + other["loss"] > handled + 0.001:
+                        never_arrived += other["loss"]
 
-        return pending
+                loss = balance["loss"] + never_arrived
+                figures[name][work_order] = {
+                    "completed": balance["completed"],
+                    "loss": loss,
+                    "pending": max(
+                        flt(ordered.get(work_order)) - balance["completed"] - loss,
+                        0.0,
+                    ),
+                }
 
-    def update_operation_pending(self):
-        """Write Pending Qty on every In-House operation row.
+        return figures
 
-        All of them, not just the one that changed: loss at one operation moves the
-        pending qty of every operation after it."""
-        pending = self.pending_by_operation()
+    def pending_by_operation(self):
+        """What each operation still has to run, per Work Order.
+
+        The Pending column of operation_figures(), which is where the arithmetic
+        and its reasoning live. Kept apart because this is the figure the pending
+        Master Job Card dialog offers, and it is only ever the part of the row that
+        is still work."""
+        return {
+            name: {
+                work_order: figure["pending"]
+                for work_order, figure in by_work_order.items()
+                if figure["pending"] > 0.001
+            }
+            for name, by_work_order in self.operation_figures().items()
+        }
+
+    def refresh_item_status(self):
+        """Bring every item row's status back in line with its Work Order.
+
+        Called whenever a Master Job Card reports, not only at the Finish: an
+        operation running is exactly when the row moves off Not Started, and
+        leaving it until goods are booked strands the column for the whole run."""
+        for row in self.items_to_be_manufacture:
+            if not row.work_order_number:
+                continue
+
+            status = self.item_status(
+                frappe.db.get_value("Work Order", row.work_order_number, "status")
+            )
+            if row.status == status:
+                continue
+
+            frappe.db.set_value(
+                "Master Work Order Item", row.name, "status", status,
+                update_modified=False,
+            )
+
+    def update_operation_rows(self):
+        """Write Completed, Process Loss and Pending on every In-House operation row.
+
+        The three figures a card reporting can move, written together off
+        operation_figures() so they always agree:
+
+            Completed    = every card of that operation added up
+            Process Loss = every card of that operation added up
+            Pending      = Qty to Manufacture - Completed - Process Loss
+
+        Qty to Manufacture is not touched. It is what the order asked of the
+        operation and it stays that.
+
+        Every row, not only the one whose card reported, so a cancelled card
+        elsewhere cannot leave a stale figure behind."""
+        figures = self.operation_figures()
 
         for op in self.operations:
             if op.manufacturing_type != "In-House":
                 continue
 
-            value = flt(sum((pending.get(op.opration_name) or {}).values()), 3)
-            if flt(op.pending_qty) == value:
+            by_work_order = figures.get(op.opration_name) or {}
+            values = {
+                "completed_qty": flt(
+                    sum(f["completed"] for f in by_work_order.values()), 3
+                ),
+                "process_loss_qty": flt(
+                    sum(f["loss"] for f in by_work_order.values()), 3
+                ),
+                "pending_qty": flt(
+                    sum(f["pending"] for f in by_work_order.values()), 3
+                ),
+            }
+
+            if all(flt(op.get(field)) == value for field, value in values.items()):
                 continue
 
             frappe.db.set_value(
-                "Master Work Order Operation", op.name, "pending_qty", value,
+                "Master Work Order Operation", op.name, values,
                 update_modified=False,
             )
 
@@ -1153,11 +1271,35 @@ class MasterWorkOrder(Document):
         if any(op.opration_name not in raised for op in self.in_house_operations()):
             return []
 
-        by_operation = self.pending_by_operation()
+        # Nothing may be raised once there is no cloth left to run. What has come
+        # off the end of the line, plus what every operation destroyed, accounts
+        # for the whole order: the rest is gone, and a card raised for it could
+        # never be finished. The rows should read nothing pending by then anyway --
+        # this is the order-level check behind the per-operation one.
+        if not self.outstanding_after_loss():
+            return []
+
+        # Straight off the operations table. Every card writes its operation's
+        # Completed, Process Loss and Pending back there as it finishes -- see
+        # update_operation_rows() -- so the row is the figure, and the dialog
+        # offers exactly what the form shows rather than a second calculation the
+        # operator cannot see.
+        #
+        # Read from the database rather than off self.operations: a card reporting
+        # writes the row behind whatever document is in hand, so an instance loaded
+        # before that would offer figures the form has already moved past.
+        stored = {
+            row.opration_name: flt(row.pending_qty)
+            for row in frappe.get_all(
+                "Master Work Order Operation",
+                filters={"parent": self.name, "parenttype": "Master Work Order"},
+                fields=["opration_name", "pending_qty"],
+            )
+        }
 
         pending = []
         for op in self.in_house_operations():
-            qty = sum((by_operation.get(op.opration_name) or {}).values())
+            qty = flt(stored.get(op.opration_name))
             if qty <= 0.001:
                 continue
 
@@ -1167,6 +1309,39 @@ class MasterWorkOrder(Document):
             })
 
         return pending
+
+    def outstanding_after_loss(self):
+        """Work Orders with cloth still to run, per Work Order.
+
+        An order of 10 that has turned 4 off the end of the line and destroyed 6
+        has nothing left: 4 and 6 account for it. One that has turned 4 out and
+        destroyed 1 has 5 still to run. Measured off what has cleared every
+        operation -- final_operation_output() -- rather than off any one of them,
+        because a piece is only through when all of them have had it.
+
+        The item rows are read from the database rather than off this document: a
+        card reporting writes Process Loss Qty behind whatever instance is in hand,
+        and an older one would still think the cloth was there."""
+        output = self.final_operation_output()
+
+        outstanding = {}
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=["work_order_number", "qty_to_manufacture", "process_loss_qty"],
+        ):
+            if not row.work_order_number:
+                continue
+
+            qty = (
+                flt(row.qty_to_manufacture)
+                - flt(output.get(row.work_order_number))
+                - flt(row.process_loss_qty)
+            )
+            if qty > 0.001:
+                outstanding[row.work_order_number] = qty
+
+        return outstanding
 
     def show_pending_master_job_card_button(self):
         """Whether any operation has quantity left to run.
@@ -1240,24 +1415,29 @@ class MasterWorkOrder(Document):
         return master_job_card.name
 
     def final_operation_output(self):
-        """What the last In-House operation turned out, per Work Order.
+        """What the line has turned all the way out, per Work Order.
 
-        The ceiling on the Finish: goods that have not come off the end of the line
-        cannot be booked as made. Empty when no operation runs in house, and then the
-        Work Orders' own quantities are the only ceiling there is."""
+        The ceiling on the Finish: a piece is only made once it has cleared every
+        In-House operation that runs it, so the ceiling is the least any of them
+        has completed -- which needs no notion of which operation runs last. Held
+        to the operations that actually run the Work Order: the cards carry a row
+        per Work Order they run, and an item is not held to an operation it never
+        visits. Empty when no operation runs in house, and then the Work Orders'
+        own quantities are the only ceiling there is."""
         in_house = self.in_house_operations()
         if not in_house:
             return {}
 
+        balances = self.operation_balances()
+
         output = {}
-        for row in self.operation_detail_rows(
-            in_house[-1].opration_name, ["work_order_number", "completed_qty"]
-        ):
-            if not row.work_order_number:
-                continue
-            output[row.work_order_number] = (
-                output.get(row.work_order_number, 0.0) + flt(row.completed_qty)
-            )
+        for op in in_house:
+            for work_order, balance in (balances.get(op.opration_name) or {}).items():
+                completed = flt(balance["completed"])
+                if work_order in output:
+                    output[work_order] = min(output[work_order], completed)
+                else:
+                    output[work_order] = completed
 
         return output
 

@@ -53,9 +53,10 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			self.skipTest("no submitted Master Work Order to take warehouses from")
 		self.reference = reference[0]
 
-		self.bom, self.item = self.find_bom()
-		if not self.bom:
+		boms = self.find_boms()
+		if not boms:
 			self.skipTest("no submitted BOM with at least two operations")
+		self.bom, self.item = boms[0]
 
 		self.plan = self.make_production_plan()
 
@@ -66,11 +67,17 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		found = frappe.get_all(doctype, filters=filters or {}, pluck="name", limit=1)
 		return found[0] if found else None
 
-	def find_bom(self):
-		"""An active BOM that runs at least two operations."""
+	def find_boms(self, count=1):
+		"""Active BOMs sharing one at-least-two-operation routing, one per item.
+
+		The same routing, because the order's operations table is the union over
+		its items -- two items with different routings would leave operations that
+		only one of them runs, and the tests' per-operation arithmetic with it.
+		One per item, because the Production Plan merges rows of the same item."""
 		rows = frappe.db.sql(
 			"""
-			select b.name, b.item
+			select b.name, b.item,
+				group_concat(bo.operation order by bo.idx) as routing
 			from `tabBOM` b
 			join `tabBOM Operation` bo on bo.parent = b.name
 			where b.docstatus = 1 and b.is_active = 1 and b.with_operations = 1
@@ -78,38 +85,46 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			group by b.name, b.item
 			having count(bo.name) >= %(minimum)s
 			order by b.modified desc
-			limit 1
 			""",
 			{"company": self.reference.company, "minimum": IN_HOUSE},
 			as_dict=True,
 		)
-		return (rows[0].name, rows[0].item) if rows else (None, None)
 
-	def make_production_plan(self):
+		by_routing = {}
+		for row in rows:
+			by_routing.setdefault(row.routing, {}).setdefault(row.item, row.name)
+
+		for group in by_routing.values():
+			if len(group) >= count:
+				return [(name, item) for item, name in list(group.items())[:count]]
+
+		return []
+
+	def make_production_plan(self, boms=None):
 		plan = frappe.get_doc({
 			"doctype": "Production Plan",
 			"company": self.reference.company,
 			"posting_date": frappe.utils.nowdate(),
 			"po_items": [{
-				"item_code": self.item,
-				"bom_no": self.bom,
+				"item_code": item,
+				"bom_no": bom,
 				"planned_qty": ORDER_QTY,
-				"stock_uom": frappe.db.get_value("Item", self.item, "stock_uom"),
+				"stock_uom": frappe.db.get_value("Item", item, "stock_uom"),
 				"planned_start_date": frappe.utils.now_datetime(),
 				"warehouse": self.reference.fg_warehouse,
-			}],
+			} for bom, item in (boms or [(self.bom, self.item)])],
 		})
 		plan.insert()
 		plan.submit()
 		return plan.name
 
-	def make_order(self):
+	def make_order(self, plan=None):
 		"""A submitted Master Work Order with the first operations run in house."""
 		from textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order import (
 			make_master_work_order,
 		)
 
-		order = frappe.get_doc("Master Work Order", make_master_work_order(self.plan))
+		order = frappe.get_doc("Master Work Order", make_master_work_order(plan or self.plan))
 		for idx, op in enumerate(order.operations):
 			op.manufacturing_type = "In-House" if idx < IN_HOUSE else "Out House"
 
@@ -125,31 +140,61 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		order.submit()
 		order.reload()
 
+		# The order the tests drive the cards in, and nothing more. No routing is
+		# read anywhere -- the floor runs the operations in whatever order it
+		# likes, and the arithmetic under test settles everything off the reported
+		# quantities. self.operations[0] simply means "the one driven first".
 		self.operations = [op.opration_name for op in order.in_house_operations()]
 		self.assertEqual(len(self.operations), IN_HOUSE)
+		return order
+
+	def two_item_order(self):
+		"""A submitted order for two items of 10, both on the same routing.
+
+		Two items because that is where the ledgers come apart: the operation rows
+		carry both added together while the item rows and Work Orders stay
+		separate, and a figure written to the wrong one still looks right on a
+		single-item order."""
+		boms = self.find_boms(count=2)
+		if len(boms) < 2:
+			self.skipTest("no two BOMs sharing the same two-operation routing")
+
+		order = self.make_order(plan=self.make_production_plan(boms=boms))
+		self.assertEqual(len(order.items_to_be_manufacture), 2)
 		return order
 
 	# ------------------------------------------------------------------
 	# Helpers
 	# ------------------------------------------------------------------
 	def cards_of(self, order):
-		return frappe.get_all(
+		"""Every card on the order, matched to the order the tests drive them in."""
+		cards = frappe.get_all(
 			"Master Job Card",
 			filters={"master_work_order_number": order.name, "docstatus": ["<", 2]},
 			fields=["name", "operation_name"],
 			order_by="creation",
 		)
+		position = {name: idx for idx, name in enumerate(self.operations)}
+		return sorted(
+			cards, key=lambda card: position.get(card.operation_name, len(position))
+		)
 
-	def run_card(self, name, completed=None, loss=0.0):
+	def run_card(self, name, completed=None, loss=0.0, rejected=0.0, qty=None):
 		"""Start a card and complete it, reporting against each row's own qty.
 
-		Qty to Manufacture is held to the cap first, the way the dialog forces the
-		operator to when an earlier operation has lost material."""
+		qty stands in for the operator typing a smaller Qty to Manufacture into the
+		dialog -- a run of 5 off an order for 10. Whatever it is left at, it is held
+		to the cap first, the way the dialog forces the operator to when an earlier
+		operation has lost material."""
 		card = frappe.get_doc("Master Job Card", name)
 
 		caps = card.qty_caps()
 		lowered = False
 		for row in card.job_card_detail:
+			if qty is not None and flt(row.qty_to_manufacture) != flt(qty):
+				row.qty_to_manufacture = flt(qty)
+				lowered = True
+
 			cap = flt(caps.get(row.work_order_number, flt(row.qty_to_manufacture)))
 			if flt(row.qty_to_manufacture) > cap:
 				row.qty_to_manufacture = cap
@@ -167,14 +212,16 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				continue
 			ordered = flt(row.qty_to_manufacture)
 			lost = min(loss, ordered)
-			made = ordered - lost if completed is None else min(completed, ordered - lost)
+			bad = min(rejected, ordered - lost)
+			room = ordered - lost - bad
+			made = room if completed is None else min(completed, room)
 			rows.append({
 				"job_card_number": row.job_card_number,
 				"qty_to_manufacture": ordered,
 				"completed_qty": made,
 				"process_loss_qty": lost,
-				"rejected_qty": 0.0,
-				"rejection_reason": "",
+				"rejected_qty": bad,
+				"rejection_reason": "Failed inspection" if bad else "",
 			})
 
 		card.complete_jobs(rows=rows)
@@ -200,181 +247,477 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			"Master Work Order Operation",
 			{"parent": order.name, "opration_name": operation},
 			["total_qty_to_manufacture", "completed_qty", "process_loss_qty",
-			 "pending_qty", "status"],
+			 "pending_qty", "status", "actual_time", "hour_rate", "operating_cost",
+			 "manufacturing_type"],
 			as_dict=True,
 		)
 
-	def assert_item_balances(self, order):
-		"""Made plus lost must account for the order, and pending is never negative."""
+	# ------------------------------------------------------------------
+	# Assertions -- every field the cycle writes, and every button it governs
+	# ------------------------------------------------------------------
+	def buttons(self, order):
+		"""What the form would draw, read the way the form reads it.
+
+		Both buttons are decided in onload and nowhere else, so this asks onload
+		rather than re-deriving the answer -- a test that called the underlying
+		method directly would pass while the button itself stayed wrong."""
+		doc = frappe.get_doc("Master Work Order", order.name)
+		doc.onload()
+		onload = doc.get("__onload") or frappe._dict()
+
+		return frappe._dict({
+			# add_finish_button(): drawn whenever onload offers any row at all.
+			"finish": bool(onload.get("pending_manufacture_rows")),
+			# add_pending_master_job_card_button(): the flag, and the form also
+			# requires the operations table to be non-empty.
+			"pending_card": bool(onload.get("show_pending_master_job_card_button"))
+				and bool(doc.operations),
+			# add_status_buttons(): Close and Stop go once the order is finished.
+			"close_stop": doc.status not in ("Completed", "Cancelled", "Closed"),
+			"blocked_reason": onload.get("finish_blocked_reason"),
+			"rows": onload.get("pending_manufacture_rows") or [],
+			"operations": onload.get("pending_master_job_card_operations") or [],
+		})
+
+	def assert_buttons(self, order, finish, pending_card, close_stop=True, when=""):
+		actual = self.buttons(order)
+		self.assertEqual(actual.finish, finish, f"{when}: Finish button")
+		self.assertEqual(
+			actual.pending_card, pending_card, f"{when}: Pending Master Job Card button"
+		)
+		self.assertEqual(actual.close_stop, close_stop, f"{when}: Close/Stop buttons")
+
+	def assert_operation(self, order, operation, completed, lost, pending, status,
+						 ordered=ORDER_QTY, when=""):
+		"""Every figure the operation row carries, and the cost derived from them."""
+		row = self.operation_row(order, operation)
+		where = f"{when}: operation {operation}"
+
+		self.assertEqual(row.manufacturing_type, "In-House", f"{where}: manufacturing type")
+		self.assertAlmostEqual(
+			flt(row.total_qty_to_manufacture), ordered, places=3,
+			msg=f"{where}: Total Qty to Manufacture must keep the order's own figure",
+		)
+		self.assertAlmostEqual(flt(row.completed_qty), completed, places=3,
+			msg=f"{where}: completed qty")
+		self.assertAlmostEqual(flt(row.process_loss_qty), lost, places=3,
+			msg=f"{where}: process loss qty (process loss and rejects together)")
+		self.assertAlmostEqual(flt(row.pending_qty), pending, places=3,
+			msg=f"{where}: pending qty")
+		self.assertEqual(row.status, status, f"{where}: status")
+
+		# The law every operation row obeys, whatever the scenario: what it made,
+		# what was lost to it and what it still owes account for what it was asked
+		# for. A row that does not add up is a row nobody can check.
+		self.assertAlmostEqual(
+			flt(row.completed_qty) + flt(row.process_loss_qty) + flt(row.pending_qty),
+			flt(row.total_qty_to_manufacture), places=3,
+			msg=f"{where}: completed {flt(row.completed_qty)} + loss "
+				f"{flt(row.process_loss_qty)} + pending {flt(row.pending_qty)} does "
+				f"not account for {flt(row.total_qty_to_manufacture)}",
+		)
+		self.assertGreaterEqual(flt(row.pending_qty), 0, f"{where}: pending negative")
+		self.assertGreaterEqual(flt(row.process_loss_qty), 0, f"{where}: loss negative")
+
+		# Time is real elapsed time, so only its shape can be asserted -- but the
+		# cost must always be the row's own two figures multiplied out.
+		self.assertGreaterEqual(flt(row.actual_time), 0, f"{where}: actual time")
+		self.assertAlmostEqual(
+			flt(row.operating_cost),
+			flt((flt(row.actual_time) / 60.0) * flt(row.hour_rate), 2),
+			places=2,
+			msg=f"{where}: operating cost must be actual time / 60 x hour rate",
+		)
+
+	def assert_untouched_operations(self, order, when=""):
+		"""The Out House rows the order also carries must stay at nothing.
+
+		They are on the same table as the In-House ones, and a sync that wrote to
+		the wrong row would otherwise go unnoticed."""
+		for op in order.operations:
+			if op.manufacturing_type == "In-House":
+				continue
+			row = self.operation_row(order, op.opration_name)
+			where = f"{when}: out-house operation {op.opration_name}"
+			self.assertAlmostEqual(flt(row.completed_qty), 0, places=3, msg=where)
+			self.assertAlmostEqual(flt(row.process_loss_qty), 0, places=3, msg=where)
+			self.assertAlmostEqual(flt(row.pending_qty), 0, places=3, msg=where)
+
+	def assert_items(self, order, made, lost, pending, status, when=""):
+		"""Every item row, and the Work Order behind each of them.
+
+		The same figures are kept in three places -- the item row, the Work Order
+		and the order's own totals -- and the bug this guards against is exactly
+		one of them disagreeing."""
 		order.reload()
+		self.assertTrue(order.items_to_be_manufacture, f"{when}: order has no items")
+
 		for row in order.items_to_be_manufacture:
-			made = flt(row.manufacture_qty)
-			lost = flt(row.process_loss_qty)
-			self.assertGreaterEqual(
-				flt(row.pending_qty), 0, f"{row.item_code}: pending went negative"
+			where = f"{when}: item {row.item_code}"
+
+			self.assertTrue(row.work_order_number, f"{where}: no Work Order raised")
+			self.assertTrue(row.bom_no, f"{where}: no BOM")
+			self.assertEqual(
+				row.production_plan_number, order.production_plan_number,
+				f"{where}: Production Plan link",
 			)
+			self.assertAlmostEqual(flt(row.qty_to_manufacture), ORDER_QTY, places=3,
+				msg=f"{where}: Qty to Manufacture must never move")
+			self.assertAlmostEqual(flt(row.manufacture_qty), made, places=3,
+				msg=f"{where}: Manufacture Qty")
+			self.assertAlmostEqual(flt(row.process_loss_qty), lost, places=3,
+				msg=f"{where}: Process Loss Qty")
+			self.assertAlmostEqual(flt(row.pending_qty), pending, places=3,
+				msg=f"{where}: Pending Qty")
+			self.assertEqual(row.status, status, f"{where}: status")
+
+			# The same law on the item row: made, lost and still to come account
+			# for what was ordered.
+			self.assertGreaterEqual(flt(row.pending_qty), 0, f"{where}: pending negative")
 			self.assertAlmostEqual(
-				made + lost, flt(row.qty_to_manufacture), places=3,
-				msg=f"{row.item_code}: made {made} + lost {lost} does not account for "
-					f"{flt(row.qty_to_manufacture)}",
+				flt(row.manufacture_qty) + flt(row.process_loss_qty)
+				+ flt(row.pending_qty),
+				ORDER_QTY, places=3,
+				msg=f"{where}: made {flt(row.manufacture_qty)} + lost "
+					f"{flt(row.process_loss_qty)} + pending {flt(row.pending_qty)} "
+					f"does not account for {ORDER_QTY}",
 			)
 
+			work_order = frappe.db.get_value(
+				"Work Order", row.work_order_number,
+				["status", "qty", "produced_qty", "process_loss_qty"], as_dict=True,
+			)
+			self.assertAlmostEqual(flt(work_order.qty), ORDER_QTY, places=3,
+				msg=f"{where}: Work Order qty")
+			self.assertAlmostEqual(flt(work_order.produced_qty), made, places=3,
+				msg=f"{where}: Work Order produced qty must match the item row")
+			self.assertAlmostEqual(
+				flt(work_order.process_loss_qty), lost, places=3,
+				msg=f"{where}: the Work Order must carry the loss combined over every "
+					f"operation, not the highest single one",
+			)
+			# The Work Order's own rule, and the one that decides the order's status:
+			# Completed exactly when produced plus lost accounts for the quantity.
+			expected = ("Completed"
+				if flt(work_order.produced_qty) + flt(work_order.process_loss_qty)
+					>= ORDER_QTY - 0.001
+				else "In Process")
+			self.assertEqual(work_order.status, expected, f"{where}: Work Order status")
+			self.assertEqual(
+				row.status, order.item_status(work_order.status),
+				f"{where}: the item row's status must follow the Work Order's",
+			)
+
+	def assert_order(self, order, status, made, lost, when=""):
+		"""The order's own header figures, and its links onward."""
+		order.reload()
+		where = f"{when}: order"
+
+		count = len(order.items_to_be_manufacture)
+		self.assertEqual(order.status, status, f"{where}: status")
+		self.assertAlmostEqual(
+			flt(order.total_manufacture_qty), made * count, places=3,
+			msg=f"{where}: Total Manufacture Qty must be the item rows summed",
+		)
+		self.assertAlmostEqual(
+			flt(order.total_process_loss), lost * count, places=3,
+			msg=f"{where}: Total Process Loss must be the item rows summed",
+		)
+		self.assertAlmostEqual(
+			flt(order.total_qty_to_manufacture), ORDER_QTY * count, places=3,
+			msg=f"{where}: Total Qty to Manufacture",
+		)
+		self.assertTrue(order.actual_start_date, f"{where}: actual start date")
+
+		if status == "Completed":
+			self.assertTrue(
+				order.actual_end_date,
+				f"{where}: a completed order must be stamped with an end date",
+			)
+			self.assertEqual(
+				order.pending_manufacture_rows(), [],
+				f"{where}: a completed order has nothing left to finish",
+			)
+
+		# Costs are only ever booked off submitted Manufacture entries.
+		if made > 0:
+			self.assertGreater(
+				flt(order.total_raw_material_cost), 0,
+				f"{where}: goods were produced, so raw material cost must be booked",
+			)
+		else:
+			self.assertAlmostEqual(flt(order.total_raw_material_cost), 0, places=2,
+				msg=f"{where}: nothing produced, so no raw material cost")
+
+	def assert_cards_completed(self, order, count=None, when=""):
+		"""Every Master Job Card raised is submitted and Completed."""
+		cards = frappe.get_all(
+			"Master Job Card",
+			filters={"master_work_order_number": order.name, "docstatus": ["<", 2]},
+			fields=["name", "status", "docstatus"],
+		)
+		if count is not None:
+			self.assertEqual(len(cards), count, f"{when}: number of Master Job Cards")
+		for card in cards:
+			self.assertEqual(card.docstatus, 1, f"{when}: {card.name} not submitted")
+			self.assertEqual(card.status, "Completed", f"{when}: {card.name} status")
+
 	# ------------------------------------------------------------------
-	# 1 -- the straight run
+	# 1 -- rejection at both operations, two items, and the Finish closes it
+	# ------------------------------------------------------------------
+	def test_rejection_at_both_operations_completes_both_items(self):
+		"""Two items of 10; the first operation rejects 5 of each, the second 1
+		more. The Finish must then square every ledger at once: the item rows, the
+		operation rows, the Work Orders and the order's own status.
+
+		The trap is in the Work Order: ERPNext holds its loss to the highest single
+		operation's (5), which leaves it a piece short of Completed for good -- the
+		loss is 6, spread 5 and 1 over two operations, and the order can then never
+		leave In Process."""
+		order = self.two_item_order()
+
+		first, second = self.cards_of(order)
+		self.run_card(first.name, rejected=5.0)
+		# The second card is held to the 5 that survived; 1 more dies there.
+		self.run_card(second.name, rejected=1.0)
+
+		self.assert_cards_completed(order, count=2, when="both operations run")
+
+		# Two items, so the operation rows carry both added together. Each row is
+		# its own sums: the first ran all 20, 10 out and 10 rejected, and is
+		# through. The second ran the 10 that reached it, 8 out and 2 rejected, so
+		# against its 20 it still reads 10 pending.
+		self.assert_operation(order, self.operations[0], completed=10.0, lost=10.0,
+			pending=0.0, status="Completed", ordered=20.0, when="rejected at both")
+		self.assert_operation(order, self.operations[1], completed=8.0, lost=12.0,
+			pending=0.0, status="Completed", ordered=20.0, when="rejected at both")
+		self.assert_untouched_operations(order, when="rejected at both")
+
+		# No cloth left -- 4 apiece off the line and 6 apiece destroyed accounts for
+		# the order -- so no card is offered even though the second row reads 10.
+		self.assert_buttons(order, finish=True, pending_card=False,
+			when="before the Finish")
+		self.assertEqual(order.outstanding_after_loss(), {},
+			"made plus destroyed accounts for the order -- nothing left to run")
+		self.assertIsNone(
+			self.buttons(order).blocked_reason,
+			"the line has turned goods out, so the Finish must not be blocked",
+		)
+
+		self.assert_items(order, made=0.0, lost=6.0, pending=4.0, status="In Process",
+			when="before the Finish")
+
+		offered = self.finish(order)
+		self.assertEqual([flt(row["qty"]) for row in offered], [4.0, 4.0])
+		# The dialog shows what the order really lost -- 5 rejected at one
+		# operation and 1 at the next -- not ERPNext's highest-single-operation 5.
+		self.assertEqual([flt(row["process_loss_qty"]) for row in offered], [6.0, 6.0])
+		self.assertEqual([flt(row["qty_to_manufacture"]) for row in offered], [10.0, 10.0])
+
+		self.assert_items(order, made=4.0, lost=6.0, pending=0.0, status="Completed",
+			when="after the Finish")
+		self.assert_order(order, status="Completed", made=4.0, lost=6.0,
+			when="after the Finish")
+		# Nothing left to press: the order is closed to further work.
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+			when="after the Finish")
+
+	# ------------------------------------------------------------------
+	# 2 -- the straight run: nothing partial, nothing lost
 	# ------------------------------------------------------------------
 	def test_full_run_without_loss(self):
-		order = self.make_order()
+		"""Two items of 10 straight through both operations. Every figure ends at
+		the quantity ordered, every status at Completed, and neither the pending
+		card nor the Finish is left offered."""
+		order = self.two_item_order()
 
 		cards = self.cards_of(order)
 		self.assertEqual(len(cards), len(self.operations))
-
-		work_order = order.items_to_be_manufacture[0].work_order_number
-		self.assertTrue(work_order, "the order should have raised a Work Order")
 
 		for card in cards:
 			completed = self.run_card(card.name)
 			self.assertEqual(completed.docstatus, 1)
 			self.assertEqual(completed.status, "Completed")
+			self.assertAlmostEqual(flt(completed.total_completed_qty), 20.0, places=3)
+			self.assertAlmostEqual(flt(completed.total_process_loss_qty), 0.0, places=3)
+			self.assertAlmostEqual(flt(completed.total_rejected_qty), 0.0, places=3)
+
+		self.assert_cards_completed(order, count=2, when="both operations run")
 
 		for name in self.operations:
-			row = self.operation_row(order, name)
-			self.assertEqual(flt(row.completed_qty), ORDER_QTY)
-			self.assertEqual(flt(row.process_loss_qty), 0)
-			self.assertEqual(flt(row.pending_qty), 0)
-			self.assertEqual(row.status, "Completed")
+			self.assert_operation(order, name, completed=20.0, lost=0.0, pending=0.0,
+				status="Completed", ordered=20.0, when="run in full")
+		self.assert_untouched_operations(order, when="run in full")
 
-		order.reload()
-		self.assertFalse(
-			order.show_pending_master_job_card_button(),
-			"nothing is outstanding, so no pending card should be offered",
-		)
+		self.assert_buttons(order, finish=True, pending_card=False,
+			when="before the Finish")
+		self.assert_items(order, made=0.0, lost=0.0, pending=10.0, status="In Process",
+			when="before the Finish")
 
 		offered = self.finish(order)
-		self.assertEqual(flt(offered[0]["qty"]), ORDER_QTY)
+		self.assertEqual([flt(row["qty"]) for row in offered], [ORDER_QTY, ORDER_QTY])
 
-		order.reload()
-		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), ORDER_QTY)
-		self.assertEqual(order.status, "Completed")
-		self.assertEqual(frappe.db.get_value("Work Order", work_order, "status"), "Completed")
-		self.assertEqual(order.pending_manufacture_rows(), [])
-		self.assert_item_balances(order)
-
-	# ------------------------------------------------------------------
-	# 2 -- half now, the rest on a pending card
-	# ------------------------------------------------------------------
-	def test_part_production_raises_pending_cards(self):
-		order = self.make_order()
-		half = ORDER_QTY / 2
-		work_order = order.items_to_be_manufacture[0].work_order_number
-
-		for card in self.cards_of(order):
-			self.run_card(card.name, completed=half)
-
-		for name in self.operations:
-			row = self.operation_row(order, name)
-			self.assertEqual(flt(row.completed_qty), half)
-			self.assertEqual(flt(row.pending_qty), half, f"{name} should have half left")
-
-		# The Finish books only what came off the line.
-		offered = self.finish(order)
-		self.assertEqual(flt(offered[0]["qty"]), half)
-		order.reload()
-		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), half)
-		self.assertNotEqual(order.status, "Completed")
-
-		# Now the balance.
-		order.reload()
-		self.assertTrue(order.show_pending_master_job_card_button())
-
-		pending = order.pending_master_job_card_operations()
-		self.assertEqual(len(pending), len(self.operations))
-		for row in pending:
-			self.assertEqual(flt(row["qty"]), half)
-
-		before = {card.name for card in self.cards_of(order)}
-		job_cards_before = frappe.db.count("Job Card", {"work_order": work_order})
-
-		created = order.make_pending_master_job_cards(operations=pending)
-		self.assertEqual(len(created), len(self.operations))
-		self.assertFalse(before & set(created), "pending cards must be new documents")
-
-		# Each pending card raises a Job Card of its own, for the balance alone.
-		self.assertEqual(
-			frappe.db.count("Job Card", {"work_order": work_order}),
-			job_cards_before + len(self.operations),
-		)
-		for name in created:
-			card = frappe.get_doc("Master Job Card", name)
-			self.assertEqual(flt(card.total_qty_to_manufacture), half)
-			for row in card.job_card_detail:
-				self.assertEqual(
-					flt(frappe.db.get_value("Job Card", row.job_card_number, "for_quantity")),
-					half,
-				)
-
-		for name in created:
-			self.run_card(name)
-
-		for name in self.operations:
-			row = self.operation_row(order, name)
-			self.assertEqual(flt(row.completed_qty), ORDER_QTY)
-			self.assertEqual(flt(row.pending_qty), 0)
-
-		order.reload()
-		self.assertFalse(order.show_pending_master_job_card_button())
-
-		offered = self.finish(order)
-		self.assertEqual(flt(offered[0]["qty"]), half)
-
-		order.reload()
-		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), ORDER_QTY)
-		self.assertEqual(order.status, "Completed")
-		self.assertEqual(order.pending_manufacture_rows(), [])
-		self.assert_item_balances(order)
+		self.assert_items(order, made=10.0, lost=0.0, pending=0.0, status="Completed",
+			when="after the Finish")
+		self.assert_order(order, status="Completed", made=10.0, lost=0.0,
+			when="after the Finish")
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+			when="after the Finish")
 
 	# ------------------------------------------------------------------
-	# 3 -- loss upstream is not work still to do
+	# 3 -- part runs with loss, twice over, then the Finish
 	# ------------------------------------------------------------------
-	def test_loss_at_first_operation_offers_no_pending_card(self):
-		order = self.make_order()
+	def test_part_runs_with_loss_then_pending_cards_then_finish(self):
+		"""Two items of 10, run 5 at a time with loss at each pass.
+
+		The operator types 5 into Qty to Manufacture rather than the 10 the card was
+		raised for, and 1 of the 5 is lost. What that leaves outstanding is the point
+		of the test: not 5, because a lost piece is not waiting to be made, and not
+		measured against the card either -- against the order, less everything made
+		and everything lost anywhere. The second pass repeats it, and the Finish is
+		held throughout to what has cleared both operations less what is already
+		booked."""
+		order = self.two_item_order()
 		first, second = self.cards_of(order)
-		half = ORDER_QTY / 2
 
-		# Half made, half destroyed: the order can never be completed in full.
-		self.run_card(first.name, completed=half, loss=half)
+		# Pass one: 5 put through the first operation, 1 lost; the second then has
+		# only the 4 survivors to work.
+		self.run_card(first.name, qty=5.0, loss=1.0)
+		self.run_card(second.name, qty=4.0)
 
-		row = self.operation_row(order, self.operations[0])
-		self.assertEqual(flt(row.completed_qty), half)
-		self.assertEqual(flt(row.process_loss_qty), half)
-		self.assertEqual(flt(row.pending_qty), 0)
+		# The partial case, and the one where Pending has to carry a real figure.
+		# Each row off its own sums against its 20: the first ran 10 (8 out, 2
+		# destroyed) so it owes 10; the second ran 8 and destroyed none, so it
+		# owes 12.
+		self.assert_operation(order, self.operations[0], completed=8.0, lost=2.0,
+			pending=10.0, status="Completed", ordered=20.0, when="after pass one")
+		self.assert_operation(order, self.operations[1], completed=8.0, lost=2.0,
+			pending=10.0, status="Completed", ordered=20.0, when="after pass one")
 
-		# The second operation can only ever run what survived.
-		card = frappe.get_doc("Master Job Card", second.name)
-		self.assertEqual(
-			flt(card.qty_caps().get(order.items_to_be_manufacture[0].work_order_number)),
-			half,
+		# Both buttons stand: work is outstanding and goods are ready to book.
+		self.assert_buttons(order, finish=True, pending_card=True,
+			when="after pass one")
+		self.assert_items(order, made=0.0, lost=1.0, pending=9.0, status="In Process",
+			when="after pass one")
+
+		offered = self.finish(order)
+		self.assertEqual([flt(row["qty"]) for row in offered], [4.0, 4.0])
+		self.assert_items(order, made=4.0, lost=1.0, pending=5.0, status="In Process",
+			when="after the first Finish")
+		self.assert_order(order, status="In Process", made=4.0, lost=1.0,
+			when="after the first Finish")
+
+		# Pass two: each operation is offered exactly what its own row says it owes.
+		# This is the partial case working -- unfinished work is pending and
+		# offered, where destroyed cloth is neither.
+		pending = {row["opration_name"]: flt(row["qty"])
+				   for row in order.pending_master_job_card_operations()}
+		self.assertEqual(pending, {
+			self.operations[0]: 10.0,
+			self.operations[1]: 10.0,
+		})
+
+		created = order.make_pending_master_job_cards(
+			operations=order.pending_master_job_card_operations()
 		)
+		self.assertEqual(len(created), len(self.operations))
 
-		self.run_card(second.name)
+		# The cards come back in the operations table's order, so they are matched
+		# to their operation by name rather than by position.
+		by_operation = {
+			frappe.db.get_value("Master Job Card", name, "operation_name"): name
+			for name in created
+		}
 
-		row = self.operation_row(order, self.operations[1])
-		self.assertEqual(flt(row.completed_qty), half)
-		self.assertEqual(
-			flt(row.pending_qty), 0,
-			"material lost upstream is not work this operation still has to do",
-		)
+		# 1 more destroyed at the first operation, so 4 reach the second again.
+		self.run_card(by_operation[self.operations[0]], qty=5.0, loss=1.0)
+		self.run_card(by_operation[self.operations[1]], qty=4.0)
 
-		order.reload()
-		self.assertFalse(
-			order.show_pending_master_job_card_button(),
-			"the shortfall is destroyed material, not work to be redone",
-		)
+		self.assert_cards_completed(order, count=4, when="after pass two")
 
-		self.finish(order)
-		self.assert_item_balances(order)
+		# The first has now run all 20 -- 16 out, 4 destroyed -- and is through. The
+		# second ran the 16 that reached it and destroyed none, so its row still
+		# reads 4 against its 20.
+		self.assert_operation(order, self.operations[0], completed=16.0, lost=4.0,
+			pending=0.0, status="Completed", ordered=20.0, when="after pass two")
+		self.assert_operation(order, self.operations[1], completed=16.0, lost=4.0,
+			pending=0.0, status="Completed", ordered=20.0, when="after pass two")
+		self.assert_untouched_operations(order, when="after pass two")
+
+		# No cloth left -- 8 apiece off the line and 2 apiece destroyed accounts for
+		# the order -- so the partial offer is gone.
+		self.assert_buttons(order, finish=True, pending_card=False,
+			when="after pass two")
+		self.assertEqual(order.outstanding_after_loss(), {}, "nothing left to run")
+
+		# 8 have cleared the line and 4 are booked, so the Finish offers the other 4.
+		offered = self.finish(order)
+		self.assertEqual([flt(row["qty"]) for row in offered], [4.0, 4.0])
+
+		self.assert_items(order, made=8.0, lost=2.0, pending=0.0, status="Completed",
+			when="after the second Finish")
+		self.assert_order(order, status="Completed", made=8.0, lost=2.0,
+			when="after the second Finish")
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+			when="after the second Finish")
 
 	# ------------------------------------------------------------------
-	# 4 -- the cap holds on the server, not only in the dialog
+	# 4 -- half destroyed, across two operations
+	# ------------------------------------------------------------------
+	def test_half_lost_across_operations_finishes_the_other_half(self):
+		"""Two items of 10; 3 die at the first operation and 2 at the second.
+
+		Half the order is gone, and the half that is gone must not be mistaken for
+		work outstanding: no pending card may be offered once the operations are
+		through, and the Finish must offer 5 -- not the 7 the first operation turned
+		out, and not the 10 the order asked for. The order still completes, because
+		made plus lost accounts for it."""
+		order = self.two_item_order()
+		first, second = self.cards_of(order)
+
+		self.run_card(first.name, loss=3.0)
+		# Only the 7 survivors reach the second operation, and 2 die there.
+		self.run_card(second.name, loss=2.0)
+
+		self.assert_cards_completed(order, count=2, when="half destroyed")
+
+		# The first ran all 20, 14 out and 6 destroyed, and is through. The second
+		# ran the 14 that reached it, 10 out and 4 destroyed, so against its 20 it
+		# reads 6 pending.
+		self.assert_operation(order, self.operations[0], completed=14.0, lost=6.0,
+			pending=0.0, status="Completed", ordered=20.0, when="half destroyed")
+		self.assert_operation(order, self.operations[1], completed=10.0, lost=10.0,
+			pending=0.0, status="Completed", ordered=20.0, when="half destroyed")
+		self.assert_untouched_operations(order, when="half destroyed")
+
+		# The heart of it: with half the order destroyed there is no cloth left to
+		# run, so no partial entry is offered. The shortfall is destroyed material,
+		# and the Finish is what closes it -- not another card.
+		self.assert_buttons(order, finish=True, pending_card=False,
+			when="half destroyed")
+		self.assertEqual(
+			order.pending_master_job_card_operations(), [],
+			"nothing may be offered on a pending card -- the shortfall is destroyed",
+		)
+		self.assertEqual(order.outstanding_after_loss(), {},
+			"5 apiece off the line and 5 apiece destroyed accounts for the order")
+
+		self.assert_items(order, made=0.0, lost=5.0, pending=5.0, status="In Process",
+			when="before the Finish")
+
+		# Held to what cleared both operations -- 5, not the 7 the first turned out.
+		offered = self.finish(order)
+		self.assertEqual([flt(row["qty"]) for row in offered], [5.0, 5.0])
+
+		self.assert_items(order, made=5.0, lost=5.0, pending=0.0, status="Completed",
+			when="after the Finish")
+		self.assert_order(order, status="Completed", made=5.0, lost=5.0,
+			when="after the Finish")
+		self.assert_buttons(order, finish=False, pending_card=False, close_stop=False,
+			when="after the Finish")
+
+	# ------------------------------------------------------------------
+	# 5 -- the cap holds on the server, not only in the dialog
 	# ------------------------------------------------------------------
 	def test_reporting_more_than_survived_is_refused(self):
 		order = self.make_order()
@@ -396,3 +739,304 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		} for row in card.job_card_detail if row.job_card_number]
 
 		self.assertRaises(frappe.ValidationError, card.complete_jobs, rows=rows)
+
+	# ------------------------------------------------------------------
+	# 6 -- the Finish and the pending cards interleaved, part by part
+	# ------------------------------------------------------------------
+	def test_partial_finish_interleaved_with_partial_pending_cards(self):
+		"""Neither ledger waits for the other.
+
+		6 of 10 come off the line and only 3 are booked as finished; the other 4 go
+		onto pending cards that themselves run only 2 before the next Finish. The
+		Finish is held to what the line has turned out less what is already booked,
+		the pending offer to what no card has run yet, and the two must stay right
+		through every interleaving."""
+		order = self.make_order()
+		work_order = order.items_to_be_manufacture[0].work_order_number
+
+		# Round one: 6 of 10 through every operation.
+		for card in self.cards_of(order):
+			self.run_card(card.name, completed=6.0)
+
+		# Book 3 of the 6 -- a partial Finish of a partial run.
+		offered = self.finish(order, qty=3.0)
+		self.assertEqual(flt(offered[0]["qty"]), 6.0, "the line has turned out 6")
+		order.reload()
+		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 3.0)
+
+		# The other 4 are work still to do, not loss: offered on pending cards.
+		pending = order.pending_master_job_card_operations()
+		self.assertEqual(
+			[flt(row["qty"]) for row in pending], [4.0] * len(self.operations)
+		)
+		created = order.make_pending_master_job_cards(operations=pending)
+
+		# Round two: the pending cards themselves run only 2 of their 4.
+		for name in created:
+			self.run_card(name, completed=2.0)
+
+		# The line has turned out 8 and 3 are booked -- the Finish may book 5 more.
+		order.reload()
+		self.assertEqual(
+			flt(order.pending_manufacture_by_work_order().get(work_order)), 5.0
+		)
+		self.finish(order)
+		order.reload()
+		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 8.0)
+
+		# And 2 are still work to do, on a second round of pending cards.
+		pending = order.pending_master_job_card_operations()
+		self.assertEqual(
+			[flt(row["qty"]) for row in pending], [2.0] * len(self.operations)
+		)
+		for name in order.make_pending_master_job_cards(operations=pending):
+			self.run_card(name)
+
+		order.reload()
+		self.assertFalse(order.show_pending_master_job_card_button())
+
+		self.finish(order)
+		order.reload()
+		self.assertEqual(
+			flt(order.items_to_be_manufacture[0].manufacture_qty), ORDER_QTY
+		)
+		self.assertEqual(order.status, "Completed")
+		self.assertEqual(order.pending_manufacture_rows(), [])
+
+
+class TestPendingArithmetic(UnitTestCase):
+	"""Each operation owes the order's qty less what it has itself handled.
+
+	Handled means completed and destroyed together -- a piece it rejected is a
+	piece it worked and will not work again. Nothing else enters: no routing, no
+	sequence, and never what another operation did. The floor runs the operations
+	in whatever order it likes, so one operation's loss is never charged to
+	another.
+
+	Built in memory with only the balances stubbed: the arithmetic is the whole of
+	the question and needs no site to answer. Folding covers only WO-A throughout,
+	as an operation that not every item runs."""
+
+	def make_order(self, balances):
+		order = frappe.new_doc("Master Work Order")
+		for name in ("Folding", "Embroidery"):
+			order.append("operations", {
+				"opration_name": name,
+				"manufacturing_type": "In-House",
+			})
+		for work_order in ("WO-A", "WO-B"):
+			order.append("items_to_be_manufacture", {
+				"work_order_number": work_order,
+				"qty_to_manufacture": ORDER_QTY,
+			})
+
+		order.operation_balances = lambda: balances
+		return order
+
+	def figures(self, order):
+		"""Every operation's figures, with the law checked on each of them.
+
+		Completed, lost and pending must account for the order's qty on every row
+		of every scenario -- not just the one a test is about. Any test that reads
+		figures goes through here, so a rule that balances in one case and not
+		another cannot pass."""
+		figures = order.operation_figures()
+
+		for name, by_work_order in figures.items():
+			for work_order, figure in by_work_order.items():
+				where = f"{name} / {work_order}"
+				self.assertAlmostEqual(
+					figure["completed"] + figure["loss"] + figure["pending"],
+					ORDER_QTY, places=3,
+					msg=f"{where}: completed {figure['completed']} + loss "
+						f"{figure['loss']} + pending {figure['pending']} does not "
+						f"account for {ORDER_QTY}",
+				)
+				self.assertGreaterEqual(figure["pending"], 0, f"{where}: pending")
+				self.assertGreaterEqual(figure["loss"], 0, f"{where}: loss")
+
+		return figures
+
+	def pending(self, order):
+		"""Pending per operation, with the law checked on the way past."""
+		self.figures(order)
+		return order.pending_by_operation()
+
+	# ------------------------------------------------------------------
+	# Loss downstream must not be charged to the operation before it
+	# ------------------------------------------------------------------
+	def test_each_operation_answers_for_itself(self):
+		"""5 run at Embroidery for both items, 1 rejected at Folding, which only
+		WO-A runs.
+
+		Embroidery has run 5 of each item and destroyed none, so it owes 5 on each
+		-- 10 in all -- and Folding's reject does not touch its row. Folding has
+		run 5 of WO-A, 4 out and 1 destroyed, so it owes 5."""
+		order = self.make_order({
+			"Embroidery": {
+				"WO-A": {"completed": 5.0, "loss": 0.0},
+				"WO-B": {"completed": 5.0, "loss": 0.0},
+			},
+			"Folding": {
+				"WO-A": {"completed": 4.0, "loss": 1.0},
+			},
+		})
+
+		figures = self.figures(order)
+
+		self.assertEqual(
+			figures["Embroidery"]["WO-A"],
+			{"completed": 5.0, "loss": 0.0, "pending": 5.0},
+		)
+		self.assertEqual(
+			figures["Embroidery"]["WO-B"],
+			{"completed": 5.0, "loss": 0.0, "pending": 5.0},
+		)
+		self.assertEqual(
+			figures["Folding"]["WO-A"],
+			{"completed": 4.0, "loss": 1.0, "pending": 5.0},
+		)
+
+	def test_cloth_destroyed_before_it_arrives_is_lost_to_this_operation(self):
+		"""Folding reads 4 completed and 1 rejected in both orders below. What
+		differs is Embroidery: it destroyed nothing in the first and half the order
+		in the second, where it has also handled all 10 against Folding's 5.
+
+		Where Embroidery has run the whole order, the cloth reaches it first and
+		its 5 never arrive at Folding -- so for Folding they are lost, not
+		outstanding, and its row reads 6 lost with nothing pending. Where nothing
+		was destroyed anywhere, Folding still owes its 5."""
+		untouched = self.make_order({
+			"Embroidery": {
+				"WO-A": {"completed": 5.0, "loss": 0.0},
+				"WO-B": {"completed": 5.0, "loss": 0.0},
+			},
+			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
+		})
+		half_destroyed = self.make_order({
+			"Embroidery": {
+				"WO-A": {"completed": 5.0, "loss": 5.0},
+				"WO-B": {"completed": 5.0, "loss": 5.0},
+			},
+			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
+		})
+
+		# Nothing destroyed anywhere: Folding's own reject only, and 5 still to run.
+		self.assertEqual(
+			self.figures(untouched)["Folding"]["WO-A"],
+			{"completed": 4.0, "loss": 1.0, "pending": 5.0},
+		)
+		# Half destroyed ahead of it: 1 rejected here and 5 that never arrive.
+		self.assertEqual(
+			self.figures(half_destroyed)["Folding"]["WO-A"],
+			{"completed": 4.0, "loss": 6.0, "pending": 0.0},
+		)
+		# Embroidery has run all 10 of each item -- 5 out, 5 destroyed -- so it is
+		# through as well.
+		self.assertEqual(self.pending(half_destroyed)["Embroidery"], {})
+
+	def test_part_production_still_shows_as_pending(self):
+		"""Pieces merely unfinished are still coming: 5 of 10 through each
+		operation with nothing destroyed leaves 5 pending on both."""
+		order = self.make_order({
+			"Embroidery": {"WO-A": {"completed": 5.0, "loss": 0.0}},
+			"Folding": {"WO-A": {"completed": 5.0, "loss": 0.0}},
+		})
+
+		self.assertEqual(self.pending(order), {
+			"Folding": {"WO-A": 5.0},
+			"Embroidery": {"WO-A": 5.0},
+		})
+
+	def test_an_operations_own_loss_is_work_it_has_done(self):
+		"""Destroying a piece is running it: Embroidery put all 10 through, 7 out
+		and 3 destroyed, so 7 and 3 account for its 10 and it owes nothing.
+
+		Folding has handled only 5, so the cloth reaches it after Embroidery and
+		Embroidery's 3 never arrive. Its row reads 5 completed, 3 lost, 2 still to
+		run -- and 5, 3 and 2 account for the 10."""
+		order = self.make_order({
+			"Embroidery": {"WO-A": {"completed": 7.0, "loss": 3.0}},
+			"Folding": {"WO-A": {"completed": 5.0, "loss": 0.0}},
+		})
+
+		figures = self.figures(order)
+		self.assertEqual(
+			figures["Embroidery"]["WO-A"],
+			{"completed": 7.0, "loss": 3.0, "pending": 0.0},
+		)
+		self.assertEqual(
+			figures["Folding"]["WO-A"],
+			{"completed": 5.0, "loss": 3.0, "pending": 2.0},
+		)
+
+	def test_no_operation_order_is_read_anywhere(self):
+		"""The same figures give the same answer whichever way round the operations
+		table lists them, and whichever order the cards were filled in.
+
+		Nothing holds the floor to a sequence, so nothing here assumes one: the row
+		order of the operations table, which is the union over every item, must
+		never change a quantity."""
+		balances = {
+			"Embroidery": {"WO-A": {"completed": 5.0, "loss": 0.0}},
+			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
+		}
+
+		listed_one_way = self.make_order(balances)
+
+		listed_the_other = self.make_order(balances)
+		listed_the_other.operations = list(reversed(listed_the_other.operations))
+
+		self.assertEqual(
+			listed_one_way.pending_by_operation(),
+			listed_the_other.pending_by_operation(),
+		)
+		# Each row off its own figures: Embroidery has run 5 of 10 and owes 5;
+		# Folding has run 5 (4 out, 1 destroyed) and owes 5.
+		self.assertEqual(
+			listed_one_way.pending_by_operation(),
+			{"Embroidery": {"WO-A": 5.0}, "Folding": {"WO-A": 5.0}},
+		)
+
+	def test_everything_comes_off_the_master_work_orders_own_tables(self):
+		"""No BOM, no Work Order Operation rows, no routing table is read.
+
+		The order's items give the qty, the cards give each operation's completed
+		and destroyed, and those are the whole of the input. This is the guard
+		against a routing lookup creeping back in: the doc here has no Work Orders
+		behind it at all, and the arithmetic still answers."""
+		order = self.make_order({
+			"Embroidery": {
+				"WO-A": {"completed": 5.0, "loss": 0.0},
+				"WO-B": {"completed": 5.0, "loss": 0.0},
+			},
+			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
+		})
+
+		self.assertFalse(
+			frappe.db.exists("Work Order", "WO-A"),
+			"the fixture's Work Orders are made up -- nothing may look them up",
+		)
+		self.assertEqual(self.pending(order), {
+			"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+			"Folding": {"WO-A": 5.0},
+		})
+
+	def test_finish_ceiling_is_the_least_any_operation_completed(self):
+		"""A piece is only made once every operation that runs it has put it
+		through, so WO-A is held to Folding's 4 and WO-B, which Folding never
+		touches, to Embroidery's 5. No notion of a last operation is needed."""
+		order = self.make_order({
+			"Embroidery": {
+				"WO-A": {"completed": 5.0, "loss": 5.0},
+				"WO-B": {"completed": 5.0, "loss": 5.0},
+			},
+			"Folding": {
+				"WO-A": {"completed": 4.0, "loss": 1.0},
+			},
+		})
+
+		self.assertEqual(
+			order.final_operation_output(),
+			{"WO-A": 4.0, "WO-B": 5.0},
+		)

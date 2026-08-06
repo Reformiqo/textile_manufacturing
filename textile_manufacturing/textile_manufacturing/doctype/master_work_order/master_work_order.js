@@ -804,9 +804,10 @@ function pending_master_job_card_dialog(frm) {
     dialog.fields_dict["operations"].grid.grid_buttons.hide();
 
     // What the order asked of each operation, less everything its Master Job Cards
-    // accounted for -- made, lost or rejected. Off the operation rows, where the
-    // Master Job Card writes it as its status moves, and taken from onload where that
-    // figure has not been written yet.
+    // accounted for -- made, lost or rejected. Off onload alone, computed fresh
+    // every time the form opens: the operation rows carry a Pending Qty of their
+    // own, but it is only rewritten when a card syncs, and an operation the server
+    // no longer counts as pending must not come back on that stale figure.
     const pending_qty = {};
     (frm.doc.__onload?.pending_master_job_card_operations || []).forEach((row) => {
         pending_qty[row.opration_name] = flt(row.qty);
@@ -815,7 +816,7 @@ function pending_master_job_card_dialog(frm) {
     (frm.doc.operations || []).forEach((row) => {
         if (row.manufacturing_type !== "In-House") return;
 
-        const qty = pending_qty[row.opration_name] ?? flt(row.pending_qty);
+        const qty = flt(pending_qty[row.opration_name]);
         if (qty <= 0) return;
 
         dialog.fields_dict.operations.df.data.push({
