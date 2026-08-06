@@ -851,6 +851,51 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				f"{where}: this row would be dropped from the Subcontracting Order",
 			)
 
+	def test_a_card_can_be_run_with_nobody_named_on_it(self):
+		"""An operator is optional, and the run still has to add up without one.
+
+		ERPNext writes a Job Card Time Log per employee it is handed and none at all
+		for an empty list, and a Job Card with no time logs cannot be submitted
+		(validate_time_logs_present) and reads as nothing made. So a card started with
+		nobody named needs a row of its own -- unattributed, but there -- or the whole
+		run is lost at the end of it."""
+		order = self.make_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+
+		card.start_jobs(employees=[])
+		card.reload()
+
+		self.assertTrue(
+			[log for log in card.time_log if log.from_time],
+			"the run has to be timed whether or not anyone is named on it",
+		)
+		for detail in card.job_card_detail:
+			if not detail.job_card_number:
+				continue
+			job_card = frappe.get_doc("Job Card", detail.job_card_number)
+			self.assertTrue(
+				job_card.time_logs,
+				f"{job_card.name}: ERPNext will not submit a Job Card with no time logs",
+			)
+
+		rows = [{
+			"job_card_number": detail.job_card_number,
+			"qty_to_manufacture": flt(detail.qty_to_manufacture),
+			"completed_qty": flt(detail.qty_to_manufacture),
+			"process_loss_qty": 0.0,
+			"rejected_qty": 0.0,
+			"rejection_reason": "",
+		} for detail in card.job_card_detail if detail.job_card_number]
+
+		card.complete_jobs(rows=rows)
+		card.reload()
+
+		self.assertEqual(card.docstatus, 1, "the card has to submit with no operator on it")
+		self.assertAlmostEqual(
+			flt(card.total_completed_qty), ORDER_QTY, places=3,
+			msg="what was made is booked whether or not anyone was named for it",
+		)
+
 	def test_cutting_the_ordered_qty_cuts_what_goes_to_the_supplier(self):
 		"""The finished goods qty follows the qty ordered, so the order sent out is
 		the order that was placed.
