@@ -1,0 +1,201 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-07-30 12:12:36.092710",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "item_code",
+  "item_name",
+  "uom",
+  "production_plan_number",
+  "sales_order_number",
+  "work_order_number",
+  "planned_start_date",
+  "status",
+  "column_break_xgsz",
+  "bom_no",
+  "qty_to_manufacture",
+  "manufacture_qty",
+  "process_loss_qty",
+  "mateial_transfer_qty",
+  "scrap_qty",
+  "pending_qty",
+  "warehouses_section",
+  "source_warehouse",
+  "wip_warehouse",
+  "column_break_xooo",
+  "fg_warehouse",
+  "scrap_warehouse"
+ ],
+ "fields": [
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item Code",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "fetch_from": "item_code.item_name",
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "label": "Item Name",
+   "options": "Item",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "work_order_number",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Work order Number",
+   "options": "Work Order",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "column_break_xgsz",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fetch_from": "item_code.default_bom",
+   "fieldname": "bom_no",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "BOM No",
+   "options": "BOM"
+  },
+  {
+   "default": "0",
+   "fieldname": "qty_to_manufacture",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Qty to Manufacture",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "manufacture_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Manufacture Qty",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "fieldname": "mateial_transfer_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Mateial Transfer Qty",
+   "precision": "2"
+  },
+  {
+   "fieldname": "warehouses_section",
+   "fieldtype": "Section Break",
+   "label": "Warehouses"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "label": "Source Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "scrap_warehouse",
+   "fieldtype": "Link",
+   "label": "Scrape Warhouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "production_plan_number",
+   "fieldtype": "Link",
+   "label": "Production Plan Number",
+   "options": "Production Plan"
+  },
+  {
+   "fieldname": "column_break_xooo",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Link",
+   "label": "UOM",
+   "options": "UOM"
+  },
+  {
+   "fieldname": "sales_order_number",
+   "fieldtype": "Link",
+   "label": "Sales Order Number",
+   "options": "Sales Order"
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "0",
+   "fieldname": "process_loss_qty",
+   "fieldtype": "Float",
+   "label": "Process Loss Qty",
+   "precision": "2"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "scrap_qty",
+   "fieldtype": "Float",
+   "label": "Scrap Qty",
+   "precision": "2"
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "0",
+   "fieldname": "pending_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Pending Qty",
+   "precision": "2",
+   "read_only": 1
+  },
+  {
+   "fieldname": "planned_start_date",
+   "fieldtype": "Datetime",
+   "label": "Planned Start Date"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "\nNot Started\nIn Process\nCompleted\nStopped",
+   "read_only": 1
+  },
+  {
+   "fieldname": "wip_warehouse",
+   "fieldtype": "Link",
+   "label": "Work in Progress Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "fg_warehouse",
+   "fieldtype": "Link",
+   "label": "Target Warehouse",
+   "options": "Warehouse"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-07-31 18:06:01.911406",
+ "modified_by": "Administrator",
+ "module": "Textile Manufacturing",
+ "name": "Master Work Order Item",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

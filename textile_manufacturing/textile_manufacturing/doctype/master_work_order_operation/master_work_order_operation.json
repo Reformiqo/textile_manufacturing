@@ -1,0 +1,190 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-07-30 12:24:25.766232",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "opration_sequence_no",
+  "opration_name",
+  "workstation",
+  "workstation_type",
+  "manufacturing_type",
+  "supplier",
+  "service_item",
+  "job_work_rate",
+  "material_sent_qty",
+  "received_qty",
+  "standerd_time",
+  "actual_time",
+  "hour_rate",
+  "operating_cost",
+  "subcontracting_po_number",
+  "total_qty_to_manufacture",
+  "completed_qty",
+  "process_loss_qty",
+  "pending_qty",
+  "status"
+ ],
+ "fields": [
+  {
+   "allow_on_submit": 1,
+   "fieldname": "opration_name",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Opration Name",
+   "options": "Operation"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "workstation",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Workstation",
+   "options": "Workstation"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "workstation_type",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Workstation Type",
+   "options": "Workstation Type"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "standerd_time",
+   "fieldtype": "Float",
+   "label": "Standerd Time"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "manufacturing_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Manufacturing Type",
+   "options": "\nIn-House\nOut House"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "opration_sequence_no",
+   "fieldtype": "Int",
+   "label": "Opration Sequence No"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Handled through a plain Subcontracting Purchase Order, not a Job Card.",
+   "fieldname": "supplier",
+   "fieldtype": "Link",
+   "label": "Supplier",
+   "options": "Supplier"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Non-stock service item of the job work (Dyeing Charge, Washing Charge). This is what goes on the Purchase Order, in place of the BOM.",
+   "fieldname": "service_item",
+   "fieldtype": "Link",
+   "label": "Service Item",
+   "options": "Item"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Rate per unit of the job work. Entered by hand, or fetched from the supplier's price list.",
+   "fieldname": "job_work_rate",
+   "fieldtype": "Currency",
+   "label": "Job Work Rate"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Qty sent to the supplier, through a Stock Entry transferring material to the supplier warehouse.",
+   "fieldname": "material_sent_qty",
+   "fieldtype": "Float",
+   "label": "Material Sent Qty"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Qty received back from the supplier, through a Stock Entry.",
+   "fieldname": "received_qty",
+   "fieldtype": "Float",
+   "label": "Received Qty"
+  },
+  {
+   "fieldname": "actual_time",
+   "fieldtype": "Float",
+   "label": "Actual Time"
+  },
+  {
+   "fieldname": "hour_rate",
+   "fieldtype": "Currency",
+   "label": "Hour Rate"
+  },
+  {
+   "fieldname": "operating_cost",
+   "fieldtype": "Currency",
+   "label": "Operating Cost"
+  },
+  {
+   "allow_on_submit": 1,
+   "depends_on": "eval:doc.manufacturing_type==\"Out House\"",
+   "description": "Plain Purchase Order carrying the Service Item. No subcontracting BOM and no BOM validation.",
+   "fieldname": "subcontracting_po_number",
+   "fieldtype": "Link",
+   "label": "Subcontracting PO Number",
+   "options": "Purchase Order",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "total_qty_to_manufacture",
+   "fieldtype": "Float",
+   "label": "Total Qty to Manufacture"
+  },
+  {
+   "fieldname": "completed_qty",
+   "fieldtype": "Float",
+   "label": "Completed Qty"
+  },
+  {
+   "default": "0",
+   "fieldname": "pending_qty",
+   "fieldtype": "Float",
+   "label": "Pending Qty"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "\nPending\nWork In Progress\nCompleted",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "process_loss_qty",
+   "fieldtype": "Float",
+   "label": "Process Loss Qty",
+   "precision": "2"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-08-05 11:13:50.857613",
+ "modified_by": "Administrator",
+ "module": "Textile Manufacturing",
+ "name": "Master Work Order Operation",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

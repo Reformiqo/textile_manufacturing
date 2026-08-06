@@ -43,7 +43,10 @@ app_license = "mit"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {
+    "Production Plan" : "public/js/production_plan.js",
+    "Subcontracting Order" : "public/js/subcontracting_order.js"
+}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
@@ -138,13 +141,46 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Work Order": {
+		"on_update": "textile_manufacturing.override.work_order.on_update",
+	},
+	"Stock Entry": {
+		"on_submit": [
+            "textile_manufacturing.override.stock_entry.update_master_work_order_returns",
+            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
+        ],
+		"on_cancel": [
+            "textile_manufacturing.override.stock_entry.update_master_work_order_returns",
+            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
+        ],
+	},
+	"Subcontracting Order": {
+		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",
+	},
+	"Subcontracting Receipt": {
+		"validate": "textile_manufacturing.override.subcontracting_order.set_receipt_master_work_order",
+	},
+	"Quality Inspection": {
+		"on_submit": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail",
+		"on_cancel": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail"
+	},
+}
+
+# Create/refresh this app's custom fields on migrate.
+after_migrate = "textile_manufacturing.custom_fields.make_custom_fields"
+
+
+override_whitelisted_methods = {
+	"erpnext.controllers.subcontracting_controller.make_rm_stock_entry": "textile_manufacturing.override.subcontracting_order.make_rm_stock_entry",
+}
+
+
+override_doctype_class = {
+    "Work Order": "textile_manufacturing.override.work_order.CustomWorkOrder",
+	"Job Card": "textile_manufacturing.override.job_card.CustomJobCard",
+	"Stock Entry": "textile_manufacturing.override.stock_entry.CustomStockEntry",
+}
 
 # Scheduled Tasks
 # ---------------
@@ -190,9 +226,9 @@ app_license = "mit"
 # each overriding function accepts a `data` argument;
 # generated from the base implementation of the doctype dashboard,
 # along with any modifications made in other Frappe apps
-# override_doctype_dashboards = {
-# 	"Task": "textile_manufacturing.task.get_dashboard_data"
-# }
+override_doctype_dashboards = {
+	"Production Plan": "textile_manufacturing.override.production_plan_dashboard.get_data"
+}
 
 # exempt linked doctypes from being automatically cancelled
 #
