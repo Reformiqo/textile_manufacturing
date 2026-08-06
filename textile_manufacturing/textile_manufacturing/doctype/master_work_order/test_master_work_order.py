@@ -803,6 +803,105 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertEqual(order.status, "Completed")
 		self.assertEqual(order.pending_manufacture_rows(), [])
 
+	def test_subcontracted_po_carries_every_item_to_the_supplier(self):
+		"""Every item goes out, not just the one that happened to disagree with itself.
+
+		ERPNext maps a Purchase Order row onto a Subcontracting Order only where
+		qty != subcontracted_qty, and populate_items_table() then sends the supplier
+		qty - subcontracted_qty. That field is its own running count of what has
+		already been ordered out, kept by update_subcontracted_quantity_in_po() as
+		each order is submitted, so the rows have to leave here at nothing.
+
+		Filled in with the qty to manufacture, every row read as already
+		subcontracted: an order whose figures matched was refused outright as fully
+		subcontracted, and one whose service qty had been typed down to something
+		else lost every row but that one -- which then went out for the difference
+		between the two, a negative quantity."""
+		order = self.two_item_order()
+
+		purchase_order = order.make_subcontracted_purchase_order()
+
+		self.assertEqual(
+			len(purchase_order.items),
+			len(order.items_to_be_manufacture),
+			"one Purchase Order row per item to be manufactured",
+		)
+
+		for row, item in zip(purchase_order.items, order.items_to_be_manufacture):
+			where = item.item_code
+			self.assertEqual(row.fg_item, item.item_code, f"{where}: finished good")
+			self.assertAlmostEqual(
+				flt(row.fg_item_qty), flt(item.qty_to_manufacture), places=3,
+				msg=f"{where}: finished goods qty",
+			)
+			# One unit of the operation is bought per unit made, so the service line
+			# matches it -- ERPNext divides the two for the row's conversion factor.
+			self.assertAlmostEqual(
+				flt(row.qty), flt(item.qty_to_manufacture), places=3,
+				msg=f"{where}: the service line's own qty",
+			)
+			self.assertAlmostEqual(
+				flt(row.subcontracted_qty), 0.0, places=3,
+				msg=f"{where}: nothing has been subcontracted yet -- this is ERPNext's "
+					"count, and it keeps it itself",
+			)
+			# The mapping's own test, put to the row it will be put to.
+			self.assertNotEqual(
+				flt(row.qty), flt(row.subcontracted_qty),
+				f"{where}: this row would be dropped from the Subcontracting Order",
+			)
+
+	def test_cutting_the_ordered_qty_cuts_what_goes_to_the_supplier(self):
+		"""The finished goods qty follows the qty ordered, so the order sent out is
+		the order that was placed.
+
+		ERPNext sizes the Subcontracting Order by dividing the two figures on the row
+		-- conversion_factor = qty / fg_item_qty -- and raises it for
+		available qty / conversion factor. Only qty is on the items grid, so a row cut
+		from 10 to 1 used to leave fg_item_qty at 10: a factor of 0.1, and finished
+		goods back at 10 on the Subcontracting Order."""
+		from textile_manufacturing.override.purchase_order import keep_fg_qty_in_step
+
+		order = self.two_item_order()
+		purchase_order = order.make_subcontracted_purchase_order()
+
+		cut, kept = purchase_order.items[0], purchase_order.items[1]
+		ordered = flt(kept.qty)
+		cut.qty = 1.0
+
+		keep_fg_qty_in_step(purchase_order)
+
+		self.assertAlmostEqual(
+			flt(cut.fg_item_qty), 1.0, places=3,
+			msg="the finished goods qty has to come down with the qty ordered",
+		)
+		self.assertAlmostEqual(
+			flt(cut.qty) / flt(cut.fg_item_qty), 1.0, places=3,
+			msg="a conversion factor of anything but 1 scales the Subcontracting Order",
+		)
+		self.assertAlmostEqual(
+			flt(kept.fg_item_qty), ordered, places=3,
+			msg="the row that was not touched keeps what it was raised for",
+		)
+
+	def test_ordinary_subcontracting_purchase_orders_are_left_alone(self):
+		"""Only this app's own orders are held to one unit of service per unit made.
+
+		Elsewhere the service line and the finished goods are genuinely different
+		quantities, and the ratio between them is the whole point of the row."""
+		from textile_manufacturing.override.purchase_order import keep_fg_qty_in_step
+
+		purchase_order = frappe.new_doc("Purchase Order")
+		purchase_order.is_subcontracted = 1
+		purchase_order.append("items", {"qty": 1.0, "fg_item_qty": 10.0})
+
+		keep_fg_qty_in_step(purchase_order)
+
+		self.assertAlmostEqual(
+			flt(purchase_order.items[0].fg_item_qty), 10.0, places=3,
+			msg="a Purchase Order with no Master Work Order behind it is not ours to touch",
+		)
+
 
 class TestPendingArithmetic(UnitTestCase):
 	"""Each operation owes the order's qty less what it has itself handled.

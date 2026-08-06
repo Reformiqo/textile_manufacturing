@@ -285,7 +285,6 @@ function start_jobs_dialog(frm) {
                 label: __("Select Employees"),
                 options: "Master Job Card Employee",
                 fieldname: "employees",
-                reqd: 1,
             },
         ],
         primary_action_label: __("Start"),
@@ -294,7 +293,7 @@ function start_jobs_dialog(frm) {
             frm.call({
                 method: "start_jobs",
                 doc: frm.doc,
-                args: { employees: values.employees },
+                args: { employees: values.employees || [] },
                 freeze: true,
                 freeze_message: __("Starting Job Cards..."),
             }).then(() => frm.reload_doc());
@@ -525,6 +524,80 @@ function fetch_from_master_work_order(frm) {
 }
 
 
+// ── The job timer widget ────────────────────────────────────────────────
+//
+// What the card can do is decided in one place: which state it is in, and what that
+// state offers. Everything below reads off these two tables, so a new button or a new
+// state is one entry rather than a branch repeated across the build and the binding.
+//
+// The state comes from the card itself -- its docstatus, its status, and its Time
+// Logs -- and never from the quantities on the rows. Those say what has been made,
+// not whether the operation is finished, and reading them as "done" is what used to
+// take every button off a card that had reported its whole qty but never been
+// completed: nothing to press, and no way on.
+
+const JOB_TIMER_ACTIONS = {
+	start: {
+		label: () => __("Start"),
+		css: "btn-primary",
+		run: (frm) => start_jobs_dialog(frm),
+	},
+	resume: {
+		label: () => __("Resume"),
+		css: "btn-primary",
+		run: (frm) => call_job_method(frm, "resume_jobs"),
+	},
+	pause: {
+		label: () => __("Pause"),
+		css: "btn-default",
+		run: (frm) => pause_job_dialog(frm),
+	},
+	complete: {
+		label: () => __("Complete"),
+		css: "btn-primary",
+		run: (frm) => complete_jobs_dialog(frm),
+	},
+};
+
+const JOB_TIMER_STATES = {
+	// Submitted, or reported as finished: the total time stands as a record.
+	finished: [],
+	// Nothing logged yet -- the operation has not begun.
+	not_started: ["start"],
+	// A log is open: the operation is being worked right now.
+	running: ["pause", "complete"],
+	// Paused. Only Resume: completing books the reported qty onto an open log, and
+	// a held card has none -- Pause closed them. Resume first, then Complete.
+	on_hold: ["resume"],
+	// Every log closed, but not held -- pick the work back up, or close it out.
+	idle: ["resume", "complete"],
+};
+
+
+function job_timer_open_log(doc) {
+	return (doc.time_log || []).find((log) => log.from_time && !log.to_time) || null;
+}
+
+
+function job_timer_state(doc) {
+	if (doc.docstatus === 1 || doc.status === "Completed") return "finished";
+	if (!(doc.time_log || []).length) return "not_started";
+	if (job_timer_open_log(doc)) return "running";
+	if (doc.status === "On Hold") return "on_hold";
+	return "idle";
+}
+
+
+function call_job_method(frm, method) {
+	frm.call({
+		method: method,
+		doc: frm.doc,
+		freeze: true,
+		freeze_message: __("Processing linked Job Cards..."),
+	}).then(() => frm.reload_doc());
+}
+
+
 function set_job_card_dashboard(frm) {
 	// Submitted cards still show the widget -- read-only, for the total time.
 	if (frm.is_new() || frm.doc.docstatus === 2) return;
@@ -539,97 +612,31 @@ function set_job_card_dashboard(frm) {
 		frm._job_timer_interval = null;
 	}
 
-	// Completed -> no timer actions, no widget at all.
-	// Trust either the status field, OR the actual quantities (in case status
-	// hasn't flipped yet, or the time log wasn't auto-closed server-side).
-	const all_rows_done = (frm.doc.job_card_detail || [])
-		.filter((row) => row.job_card_number)
-		.every((row) => {
-			const ordered = flt(row.qty_to_manufacture);
-			const accounted =
-				flt(row.completed_qty) + flt(row.rejected_qty) + flt(row.process_loss_qty);
-			return ordered - accounted <= 0.001;
-		});
-
-	// Done -- the total time stands as a record, with nothing left to press and
-	// nothing left to count.
-	if (frm.doc.status === "Completed" || frm.doc.docstatus === 1 || all_rows_done) {
-		render_job_timer_widget(wrapper, {
-			label: __("Total Time"),
-			seconds: flt(frm.doc.total_actual_time) * 60,
-			buttons_html: "",
-		});
-		return;
-	}
-
-	const time_log = frm.doc.time_log || [];
-	const running_log = all_rows_done ? null : time_log.find((t) => t.from_time && !t.to_time);
-
-	// ── Decide which buttons to show (same branches as the toolbar-button version) ──
-	let show_start = false,
-		show_resume = false,
-		show_pause = false,
-		show_complete = false;
-
-	if (!time_log.length) {
-		// Nothing logged yet -- the operation has not begun.
-		show_start = true;
-	} else if (frm.doc.status === "On Hold") {
-		// Paused: resuming is the only way on.
-		show_resume = true;
-	} else if (running_log) {
-		show_pause = true;
-		show_complete = true;
-	} else {
-		// Stopped but not on hold: pick work back up, or close it out.
-		show_resume = true;
-		show_complete = true;
-	}
-
-	const is_timer_running = !!running_log;
-
-	// ── Build HTML ──────────────────────────────────────────────────────
-	const btn = (cls, label) =>
-		`<button class="btn btn-sm ${cls}" style="font-weight:600;padding:6px 14px;">${label}</button>`;
-
-	const buttons_html = [
-		show_start && btn("btn-primary jt-btn-start", __("Start")),
-		show_resume && btn("btn-primary jt-btn-resume", __("Resume")),
-		show_pause && btn("btn-default jt-btn-pause", __("Pause")),
-		show_complete && btn("btn-primary jt-btn-complete", __("Complete")),
-	]
-		.filter(Boolean)
-		.join(" ");
+	const state = job_timer_state(frm.doc);
+	const actions = JOB_TIMER_STATES[state];
+	const running_log = state === "running" ? job_timer_open_log(frm.doc) : null;
 
 	render_job_timer_widget(wrapper, {
-		label: __("Elapsed Time"),
-		seconds: 0,
-		buttons_html: buttons_html,
+		label: state === "finished" ? __("Total Time") : __("Elapsed Time"),
+		// Between runs the widget carries what the card has booked so far; while one
+		// is running the tick below takes over and counts that run.
+		seconds: running_log ? 0 : flt(frm.doc.total_actual_time) * 60,
+		buttons_html: actions
+			.map((key) => {
+				const action = JOB_TIMER_ACTIONS[key];
+				return `<button class="btn btn-sm ${action.css} jt-btn-${key}"
+					style="font-weight:600;padding:6px 14px;">${action.label()}</button>`;
+			})
+			.join(" "),
 	});
 
-	// ── Bind click handlers (only after the HTML exists in the DOM) ─────
-	if (show_start) {
-		wrapper.find(".jt-btn-start").on("click", () => start_jobs_dialog(frm));
-	}
-	if (show_resume) {
-		wrapper.find(".jt-btn-resume").on("click", () => {
-			frm.call({
-				method: "resume_jobs",
-				doc: frm.doc,
-				freeze: true,
-				freeze_message: __("Processing linked Job Cards..."),
-			}).then(() => frm.reload_doc());
-		});
-	}
-	if (show_pause) {
-		wrapper.find(".jt-btn-pause").on("click", () => pause_job_dialog(frm));
-	}
-	if (show_complete) {
-		wrapper.find(".jt-btn-complete").on("click", () => complete_jobs_dialog(frm));
-	}
+	// Bind click handlers only after the HTML exists in the DOM.
+	actions.forEach((key) => {
+		wrapper.find(`.jt-btn-${key}`).on("click", () => JOB_TIMER_ACTIONS[key].run(frm));
+	});
 
-	// ── Stopwatch tick, only while a log entry is actually open ─────────
-	if (!is_timer_running) return;
+	// Stopwatch tick, only while a log entry is actually open.
+	if (!running_log) return;
 
 	const timer_el = wrapper.find(".jt-stopwatch");
 	let elapsed = Math.floor(

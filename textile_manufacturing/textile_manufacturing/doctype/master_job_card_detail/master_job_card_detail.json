@@ -148,7 +148,6 @@
    "precision": "2"
   },
   {
-   "allow_on_submit": 1,
    "default": "0",
    "fieldname": "actual_time",
    "fieldtype": "Float",

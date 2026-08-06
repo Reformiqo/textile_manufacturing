@@ -155,6 +155,9 @@ doc_events = {
             "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
         ],
 	},
+	"Purchase Order": {
+		"validate": "textile_manufacturing.override.purchase_order.keep_fg_qty_in_step",
+	},
 	"Subcontracting Order": {
 		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",
 	},

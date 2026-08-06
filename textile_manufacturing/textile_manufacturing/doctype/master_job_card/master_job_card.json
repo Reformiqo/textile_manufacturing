@@ -38,6 +38,7 @@
   "quality_inspection_template",
   "total_qty_to_manufacture",
   "total_completed_qty",
+  "total_process_loss_qty",
   "total_standerd_time",
   "total_actual_time",
   "hour_rate",
@@ -99,12 +100,15 @@
   {
    "fieldname": "master_work_order_number",
    "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
    "label": "Master Work Order Number",
    "options": "Master Work Order"
   },
   {
    "fieldname": "operation_name",
    "fieldtype": "Link",
+   "in_list_view": 1,
    "label": "Operation Name",
    "options": "Operation"
   },
@@ -277,12 +281,21 @@
   {
    "fieldname": "total_qty_to_manufacture",
    "fieldtype": "Float",
+   "in_list_view": 1,
    "label": "Total Qty to Manufacture"
   },
   {
    "fieldname": "total_completed_qty",
    "fieldtype": "Float",
    "label": "Total Completed Qty"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "total_process_loss_qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Total Process Loss Qty",
+   "read_only": 1
   },
   {
    "fieldname": "total_standerd_time",

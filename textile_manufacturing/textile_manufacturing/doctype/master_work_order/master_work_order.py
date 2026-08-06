@@ -1806,9 +1806,21 @@ class MasterWorkOrder(Document):
             purchase_order.append("items", {
                 # "item_code": row.item_code,
                 # "item_name": row.item_name,
-                "fg_item" : row.item_code,
+                "fg_item": row.item_code,
                 "fg_item_qty": row.qty_to_manufacture,
-                "subcontracted_qty" : row.qty_to_manufacture,
+                # The service line's own qty. One unit of the operation is bought per
+                # unit made, so it matches the finished goods qty -- ERPNext divides the
+                # two for the row's conversion factor, and any other figure scales the
+                # Subcontracting Order's quantity by the difference.
+                "qty": row.qty_to_manufacture,
+                # subcontracted_qty is deliberately not set. It is ERPNext's running
+                # count of how much of the row a Subcontracting Order has already taken,
+                # kept by update_subcontracted_quantity_in_po() as each one is
+                # submitted, and it has to start at nothing. Filled in here it made
+                # every row read as already subcontracted, and Create > Subcontracting
+                # Order dropped them without a word -- its condition is
+                # qty != subcontracted_qty, and a fully matching order was refused
+                # outright as "already fully subcontracted".
                 "uom": uom,
                 "stock_uom": stock_uom,
                 "conversion_factor": conversion_factor,

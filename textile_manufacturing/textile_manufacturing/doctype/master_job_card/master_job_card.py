@@ -936,7 +936,11 @@ class MasterJobCard(Document):
         Per Job Card, not merely per operator: calculate_detail_rows() rolls the logs
         up keyed on job_card_number, so a row without one contributes nothing. That is
         why completed qty and actual time never moved off zero -- the rows were being
-        written with only an employee and a start time."""
+        written with only an employee and a start time.
+
+        An operator is optional. With none named the run still gets one unattributed
+        row per Job Card, so the time and the qty it reports are still booked."""
+        operators = list(operators) or [None]
         now = frappe.utils.now()
 
         for row in (self.get("job_card_detail") or []):
@@ -1174,8 +1178,11 @@ class MasterJobCard(Document):
             frappe.throw("No linked Job Cards to process.")
 
         employees = [{"employee": e.employee} for e in (self.get("employee") or []) if e.employee]
-        if action == "start" and not employees:
-            frappe.throw("Assign at least one Employee before starting.")
+        # An operator is optional. ERPNext writes a Time Log row per employee handed
+        # to it and none at all for an empty list, and a Job Card with no time logs
+        # cannot be submitted (validate_time_logs_present) and reports a completed qty
+        # of zero. One blank operator keeps that row -- unattributed, but there.
+        start_employees = employees or [{"employee": None}]
 
         now = frappe.utils.now()
 
@@ -1186,7 +1193,7 @@ class MasterJobCard(Document):
                 continue
 
             if action == "start":
-                job_card.start_timer(start_time=now, employees=employees)
+                job_card.start_timer(start_time=now, employees=start_employees)
             elif action == "pause":
                 job_card.pause_job(end_time=now)
             elif action == "resume":
