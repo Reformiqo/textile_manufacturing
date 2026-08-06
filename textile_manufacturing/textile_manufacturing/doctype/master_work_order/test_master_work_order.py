@@ -980,6 +980,39 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		# on the strength of what it claims, not on it having finished.
 		self.assertEqual(card.status, "Open", "the card has not been started")
 
+	def test_the_cap_takes_off_the_loss_elsewhere_and_the_finished_goods(self):
+		"""Most a card may be raised for, per item:
+
+		    order qty - what the other operations lost - what has been finished
+
+		Lost, because the cloth is gone. Finished, because those pieces have been
+		booked off the line as goods and are no longer work anybody can take.
+
+		Ten ordered: the first operation destroys 2, and 3 of the survivors are then
+		booked as finished. The ceiling falls to 8 and then to 5, and going over it
+		is what raises "at most N can be made" -- in the Complete dialog first, and
+		again in validate_complete_qty() behind it."""
+		order = self.make_order()
+		cards = self.cards_of(order)
+		work_order = order.items_to_be_manufacture[0].work_order_number
+
+		self.run_card(cards[0].name, loss=2.0)
+		self.run_card(cards[1].name)
+
+		card = frappe.get_doc("Master Job Card", cards[1].name)
+		self.assertAlmostEqual(
+			flt(card.qty_caps().get(work_order)), 8.0, places=3,
+			msg="10 ordered less the 2 the other operation destroyed",
+		)
+
+		self.finish(order, qty=3.0)
+
+		card.reload()
+		self.assertAlmostEqual(
+			flt(card.qty_caps().get(work_order)), 5.0, places=3,
+			msg="and less the 3 now booked as finished goods",
+		)
+
 	def test_a_card_can_be_run_with_nobody_named_on_it(self):
 		"""An operator is optional, and the run still has to add up without one.
 
