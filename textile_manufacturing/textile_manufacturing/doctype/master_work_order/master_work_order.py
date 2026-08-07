@@ -1700,28 +1700,28 @@ class MasterWorkOrder(Document):
         if not self.out_house_operations():
             return
 
-        orders = frappe.get_all(
-            "Subcontracting Order",
-            filters={
-                "master_work_order": self.name,
-                "docstatus": 1,
-                "status": "Completed",
-            },
+        receipts = frappe.get_all(
+            "Subcontracting Receipt",
+            filters={"master_work_order": self.name, "docstatus": 1},
             pluck="name",
         )
 
         received = {}
-        if orders:
+        if receipts:
             for row in frappe.get_all(
-                "Subcontracting Order Item",
-                filters={"parent": ["in", orders]},
+                "Subcontracting Receipt Item",
+                filters={"parent": ["in", receipts]},
                 fields=["item_code", "qty"],
             ):
                 received[row.item_code] = flt(received.get(row.item_code)) + flt(row.qty)
 
         outstanding = {}
         for row in self.items_to_be_manufacture:
-            short = flt(row.qty_to_manufacture) - flt(received.get(row.item_code))
+            # What the supplier owes is what the order asked for less what was
+            # destroyed: a piece that no longer exists is never coming back, and
+            # holding the order open for it would leave it open for good.
+            owed = flt(row.qty_to_manufacture) - flt(row.process_loss_qty)
+            short = owed - flt(received.get(row.item_code))
             if short > 0.001:
                 outstanding[row.item_code] = short
 
@@ -1886,12 +1886,18 @@ class MasterWorkOrder(Document):
                 # "item_code": row.item_code,
                 # "item_name": row.item_name,
                 "fg_item": row.item_code,
-                "fg_item_qty": row.qty_to_manufacture,
+                # What actually goes out to him is what the line has turned out. An
+                # order for 10 that made 8 sends 8 -- the other 2 were destroyed and
+                # there is nothing there to send, and a Purchase Order raised for
+                # them could never be received against. Where nothing has been
+                # produced yet the order's own qty stands in, so the Purchase Order
+                # can be raised ahead of the run rather than only after it.
+                "fg_item_qty": flt(row.manufacture_qty) or flt(row.qty_to_manufacture),
                 # The service line's own qty. One unit of the operation is bought per
                 # unit made, so it matches the finished goods qty -- ERPNext divides the
                 # two for the row's conversion factor, and any other figure scales the
                 # Subcontracting Order's quantity by the difference.
-                "qty": row.qty_to_manufacture,
+                "qty": flt(row.manufacture_qty) or flt(row.qty_to_manufacture),
                 # subcontracted_qty is deliberately not set. It is ERPNext's running
                 # count of how much of the row a Subcontracting Order has already taken,
                 # kept by update_subcontracted_quantity_in_po() as each one is

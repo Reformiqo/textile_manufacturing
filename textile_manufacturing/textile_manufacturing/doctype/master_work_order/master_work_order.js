@@ -8,15 +8,7 @@ frappe.ui.form.on("Master Work Order", {
         if(frm.doc.docstatus != 1) return;
 
         add_status_buttons(frm);
-        if (NO_FURTHER_WORK.includes(frm.doc.status)) {
-            // Production being finished does not stop the out house material from
-            // going to the supplier, so the Subcontracted PO stays available.
-            if (frm.doc.status === "Completed") {
-                add_subcontracted_po_button(frm);
-                frm.page.set_inner_btn_group_as_primary(__("Create"));
-            }
-            return;
-        }
+        if (NO_FURTHER_WORK.includes(frm.doc.status)) return;
 
         add_create_buttons(frm);
         add_return_buttons(frm);

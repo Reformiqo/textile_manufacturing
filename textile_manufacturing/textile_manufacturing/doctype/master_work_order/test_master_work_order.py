@@ -912,40 +912,116 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				msg=f"{row.item_code}: the whole qty is outstanding",
 			)
 
-	def test_a_completed_subcontracting_order_settles_the_out_house_work(self):
-		"""Matched qty on a completed order clears it; short of that it still holds."""
+	def receive_from_supplier(self, order, rows):
+		"""A submitted Subcontracting Receipt against this order, {item: qty}."""
+		receipt = frappe.get_doc({
+			"doctype": "Subcontracting Receipt",
+			"master_work_order": order.name,
+			"docstatus": 1,
+			"items": [
+				{"item_code": item_code, "qty": flt(qty)}
+				for item_code, qty in rows.items()
+			],
+		})
+		receipt.db_insert()
+		for row in receipt.items:
+			row.parent = receipt.name
+			row.parenttype = "Subcontracting Receipt"
+			row.parentfield = "items"
+			row.db_insert()
+
+		return receipt
+
+	def test_a_receipt_settles_the_out_house_work_it_accounts_for(self):
+		"""The receipt settles it, not the order it went out on.
+
+		An order raised is only a promise; the goods coming back is what finishes the
+		work. So an item is owed until a submitted Subcontracting Receipt accounts for
+		it, and the others carry on holding the order In Process."""
 		order = self.make_order()
 		order.operations[-1].manufacturing_type = "Out House"
 		item = order.items_to_be_manufacture[0]
 
-		subcontracting_order = frappe.get_doc({
-			"doctype": "Subcontracting Order",
-			"master_work_order": order.name,
-			"status": "Completed",
-			"docstatus": 1,
-			"items": [{
-				"item_code": item.item_code,
-				"qty": flt(item.qty_to_manufacture),
-			}],
-		})
-		subcontracting_order.db_insert()
-		for row in subcontracting_order.items:
-			row.parent = subcontracting_order.name
-			row.parenttype = "Subcontracting Order"
-			row.parentfield = "items"
-			row.db_insert()
+		self.receive_from_supplier(order, {item.item_code: flt(item.qty_to_manufacture)})
 
-		outstanding = order.outstanding_out_house_qty()
+		outstanding = order.outstanding_out_house_qty() or {}
 
 		self.assertNotIn(
 			item.item_code, outstanding,
-			"the qty came back on a completed Subcontracting Order, so nothing is owed",
+			"the whole qty came back on a receipt, so nothing is owed for it",
 		)
 		for row in order.items_to_be_manufacture[1:]:
 			self.assertIn(
 				row.item_code, outstanding,
 				f"{row.item_code}: nothing has come back for this one, so it still holds",
 			)
+
+	def test_the_purchase_order_sends_what_the_line_turned_out(self):
+		"""The supplier is sent goods that exist, not the order's ambition.
+
+		Ten ordered and 8 made means 8 go out: the 2 destroyed are not there to send,
+		and a Purchase Order raised for them could never be received against -- what
+		the order owes is its qty less the loss, so a PO for 10 would leave it unable
+		to reach Completed. Before anything has been produced the order's own qty
+		stands in, so the PO can be raised ahead of the run."""
+		order = self.make_order()
+
+		ahead_of_the_run = order.make_subcontracted_purchase_order()
+		for row, item in zip(ahead_of_the_run.items, order.items_to_be_manufacture):
+			self.assertAlmostEqual(
+				flt(row.fg_item_qty), flt(item.qty_to_manufacture), places=3,
+				msg=f"{item.item_code}: nothing made yet, so the order's qty stands in",
+			)
+
+		cards = self.cards_of(order)
+		self.run_card(cards[0].name, loss=2.0)
+		self.run_card(cards[1].name)
+		self.finish(order)
+		order.reload()
+
+		purchase_order = order.make_subcontracted_purchase_order()
+
+		for row, item in zip(purchase_order.items, order.items_to_be_manufacture):
+			self.assertAlmostEqual(
+				flt(item.manufacture_qty), 8.0, places=3,
+				msg=f"{item.item_code}: 8 of the 10 came off the line",
+			)
+			self.assertAlmostEqual(
+				flt(row.fg_item_qty), 8.0, places=3,
+				msg=f"{item.item_code}: the supplier is sent the 8 that exist",
+			)
+			self.assertAlmostEqual(
+				flt(row.qty), flt(row.fg_item_qty), places=3,
+				msg=f"{item.item_code}: one unit of the operation per unit sent",
+			)
+
+	def test_destroyed_cloth_is_not_owed_by_the_supplier(self):
+		"""What the supplier owes is the qty raised less what was destroyed.
+
+		A piece that no longer exists is never coming back. Counting it would hold the
+		order open for good, so an item of 10 that lost 2 is settled by a receipt for
+		the 8 that survived."""
+		order = self.make_order()
+		order.operations[-1].manufacturing_type = "Out House"
+		item = order.items_to_be_manufacture[0]
+
+		frappe.db.set_value("Master Work Order Item", item.name, "process_loss_qty", 2.0)
+		item.process_loss_qty = 2.0
+
+		short = (order.outstanding_out_house_qty() or {}).get(item.item_code)
+		self.assertAlmostEqual(
+			flt(short), flt(item.qty_to_manufacture) - 2.0, places=3,
+			msg="the 2 destroyed are not the supplier's to return",
+		)
+
+		self.receive_from_supplier(
+			order, {item.item_code: flt(item.qty_to_manufacture) - 2.0}
+		)
+
+		self.assertNotIn(
+			item.item_code, order.outstanding_out_house_qty() or {},
+			"the 8 that survived came back, so the item is settled",
+		)
 
 	def test_a_card_typed_down_to_five_offers_the_other_five(self):
 		"""The formula the Pending Master Job Card button runs on, per operation:
