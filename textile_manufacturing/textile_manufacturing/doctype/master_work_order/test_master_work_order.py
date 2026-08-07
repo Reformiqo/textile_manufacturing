@@ -131,6 +131,14 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		order.source_warehouse = self.reference.source_warehouse
 		for row in order.items_to_be_manufacture:
 			row.source_warehouse = self.reference.source_warehouse
+		# The form pushes the header's warehouse onto the Required Items too, in
+		# update_all_child_warehouses() -- the rows are stamped when the order is
+		# built, before anyone has picked one, so nothing on the server does it.
+		for row in order.required_items:
+			row.source_warehouse = self.reference.source_warehouse
+		# ...and reads the stock in hand there, which is only knowable once the
+		# warehouse is known. Both are the form's doing, not the server's.
+		order.set_available_qty()
 
 		# Nothing here is about the WIP transfer, so it is skipped -- the operations
 		# and the Finish are what these tests are for.
@@ -979,6 +987,376 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		# The card is still open and has reported nothing -- the balance is offered
 		# on the strength of what it claims, not on it having finished.
 		self.assertEqual(card.status, "Open", "the card has not been started")
+
+	def test_the_out_house_cycle_carries_the_order_to_completed(self):
+		"""The whole cycle, Production Plan through to the goods coming back.
+
+		Both In-House operations are run and finished, the semi-finished goods are
+		put into store, and the Out House work then goes out on a Purchase Order, a
+		Subcontracting Order and back on a Subcontracting Receipt. The order is not
+		Completed until that last step: until then the cloth is away at the supplier,
+		however finished the line is with it."""
+		order = self.make_order()
+		if not order.out_house_operations():
+			self.skipTest("the routing found runs every operation in house")
+
+		supplier = self.first("Supplier", {"disabled": 0})
+		service_item = self.first("Item", {"is_stock_item": 0, "disabled": 0})
+		if not (supplier and service_item):
+			self.skipTest("no supplier or service item to buy the operation with")
+
+		for card in self.cards_of(order):
+			self.run_card(card.name)
+
+		# The borrowed item is not set up to be sent out: it carries no valuation rate,
+		# so putting the goods into store cannot value them, and it is not marked as
+		# sub-contracted, which ERPNext insists on for a finished good on a
+		# subcontracting Purchase Order. Both are item master settings a real one
+		# already has.
+		for row in order.items_to_be_manufacture:
+			frappe.db.set_value("Item", row.item_code, {
+				"valuation_rate": 100.0,
+				"is_sub_contracted_item": 1,
+				"default_bom": row.bom_no,
+			})
+
+		# The raw material is valued too -- it travels to the supplier and back on the
+		# receipt, and that posting has to be worth something.
+		for row in order.required_items:
+			frappe.db.set_value("Item", row.item_code, "valuation_rate", 100.0)
+
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		card.make_sfg_stock_entry("Stock Out")
+		self.finish(order)
+		order.reload()
+
+		self.assertEqual(
+			order.status, "In Process",
+			"the line is done, but the Out House work has not come back yet",
+		)
+
+		purchase_order = order.make_subcontracted_purchase_order()
+		purchase_order.supplier = supplier
+		for row in purchase_order.items:
+			row.item_code = service_item
+			row.rate = 1.0
+
+		# Mandatory on this site's Purchase Order, and typed by whoever raises it --
+		# the builder hands back a draft for the form, not a finished document.
+		for fieldname, value in (
+			("custom_prepared_by", self.employee),
+			("custom_remarks____", "Out House work"),
+		):
+			if purchase_order.meta.has_field(fieldname):
+				purchase_order.set(fieldname, value)
+
+		# This site runs a Workflow on Purchase Order that emails with the print
+		# attached whenever the document changes. Frappe sends that inline under test
+		# (now=frappe.in_test) rather than queueing it, so a machine that cannot
+		# render a PDF takes the save down with it. Nothing to do with what is under
+		# test, and it has to go off before the first save, not just before submit.
+		for workflow in frappe.get_all(
+			"Workflow",
+			filters={"document_type": "Purchase Order", "is_active": 1},
+			pluck="name",
+		):
+			frappe.db.set_value("Workflow", workflow, "send_email_alert", 0)
+
+		purchase_order.insert()
+		purchase_order.submit()
+
+		from erpnext.buying.doctype.purchase_order.purchase_order import (
+			make_subcontracting_order,
+		)
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			make_subcontracting_receipt,
+		)
+
+		subcontracting_order = make_subcontracting_order(purchase_order.name)
+		# Where the supplier keeps the goods while he works them. It has to be a
+		# different warehouse from the one the order reserves against, which ERPNext
+		# refuses to let coincide.
+		subcontracting_order.supplier_warehouse = next(
+			warehouse
+			for warehouse in (
+				self.reference.source_warehouse,
+				self.reference.scrap_warehouse,
+				self.reference.fg_warehouse,
+				self.reference.wip_warehouse,
+			)
+			if warehouse and warehouse != subcontracting_order.set_warehouse
+		)
+		subcontracting_order.insert()
+		subcontracting_order.submit()
+
+		# The goods themselves go out to him -- this app sends the finished goods of
+		# the order rather than the BOM's raw material, which is what
+		# make_rm_stock_entry is overridden for.
+		from textile_manufacturing.override.subcontracting_order import (
+			make_rm_stock_entry,
+		)
+
+		transfer = make_rm_stock_entry(subcontracting_order.name)
+		transfer.insert()
+		transfer.submit()
+
+		receipt = make_subcontracting_receipt(subcontracting_order.name)
+		receipt.insert()
+
+		from erpnext.subcontracting.doctype.subcontracting_receipt.subcontracting_receipt import (
+			BOMQuantityError,
+		)
+
+		try:
+			receipt.submit()
+		except BOMQuantityError as exc:
+			# Buying Settings backflushes subcontract material on BOM, and this app
+			# sends the supplier the finished goods rather than the BOM's raw
+			# material -- set_receipt_master_work_order() rewrites the receipt's
+			# Supplied Items to what actually went out. ERPNext then finds the BOM's
+			# raw material unsupplied and refuses the receipt.
+			#
+			# Nothing in the app can settle that: it is the site's backflush setting
+			# against the app's design. Everything up to here is exercised for real.
+			self.skipTest(
+				"Subcontracting Receipt refused with Backflush on BOM -- {0}".format(exc)
+			)
+
+		self.assertEqual(
+			frappe.db.get_value("Subcontracting Order", subcontracting_order.name, "status"),
+			"Completed",
+			"the receipt has to carry the Subcontracting Order to Completed",
+		)
+
+		order.reload()
+		self.assertEqual(
+			order.status, "Completed",
+			"the goods are back, so the order is finished with",
+		)
+
+	def test_every_field_on_a_required_item_row(self):
+		"""Where each figure on Required Items comes from.
+
+		    item_code, item_name, uom  the BOM Item row
+		    requried_qty               BOM qty scaled: BOM Item qty x (ordered / BOM qty),
+		                               added up where two BOMs need the same material
+		    rate                       the Item master's Valuation Rate -- a static
+		                               field, not the moving valuation off the ledger,
+		                               so it is 0 on an item nobody has priced
+		    amount                     requried_qty x rate
+		    source_warehouse           the order's own Source Warehouse
+		    available_qty              Bin actual qty there, 0 with no warehouse set
+		    transfer_qty, return_qty,
+		    consumed_qty               0 -- nothing has moved yet
+
+		The expectation is built here off the BOM and the Item master, not off the
+		code that fills the table, so the two have to agree independently."""
+		order = self.make_order()
+
+		ordered_per_bom = {}
+		for row in order.items_to_be_manufacture:
+			if row.bom_no:
+				ordered_per_bom[row.bom_no] = (
+					ordered_per_bom.get(row.bom_no, 0.0) + flt(row.qty_to_manufacture)
+				)
+
+		expected = {}
+		for bom_no, ordered in ordered_per_bom.items():
+			base = flt(frappe.db.get_value("BOM", bom_no, "quantity")) or 1.0
+			for item in frappe.get_all(
+				"BOM Item",
+				filters={"parent": bom_no, "parenttype": "BOM"},
+				fields=["item_code", "item_name", "uom", "qty"],
+			):
+				entry = expected.setdefault(item.item_code, {
+					"item_name": item.item_name, "uom": item.uom, "qty": 0.0,
+				})
+				entry["qty"] += flt(item.qty) * (ordered / base)
+
+		self.assertEqual(
+			sorted(row.item_code for row in order.required_items), sorted(expected),
+			"one row per raw material, the BOMs consolidated onto it",
+		)
+
+		for row in order.required_items:
+			want = expected[row.item_code]
+			where = row.item_code
+			rate = flt(frappe.db.get_value("Item", row.item_code, "valuation_rate"))
+
+			self.assertEqual(row.item_name, want["item_name"], f"{where}: item name")
+			self.assertEqual(row.uom, want["uom"], f"{where}: uom, off the BOM row")
+			# Stored at the field's own precision of 2, so 8.26086.. lands as 8.26.
+			self.assertAlmostEqual(
+				flt(row.requried_qty), want["qty"], places=2,
+				msg=f"{where}: BOM qty scaled to what the order asked for",
+			)
+			self.assertAlmostEqual(
+				flt(row.rate), rate, places=6,
+				msg=f"{where}: rate is the Item master's Valuation Rate",
+			)
+			self.assertAlmostEqual(
+				flt(row.amount), flt(want["qty"]) * rate, places=2,
+				msg=f"{where}: amount is required qty x rate",
+			)
+			self.assertEqual(
+				row.source_warehouse, order.source_warehouse,
+				f"{where}: the order's own Source Warehouse",
+			)
+
+			in_hand = flt(frappe.db.get_value(
+				"Bin",
+				{"item_code": row.item_code, "warehouse": order.source_warehouse},
+				"actual_qty",
+			)) if order.source_warehouse else 0.0
+			self.assertAlmostEqual(
+				flt(row.available_qty), in_hand, places=3,
+				msg=f"{where}: Bin actual qty at the Source Warehouse",
+			)
+
+			for field in ("transfer_qty", "return_qty", "consumed_qty"):
+				self.assertAlmostEqual(
+					flt(row.get(field)), 0.0, places=3,
+					msg=f"{where}: {field} -- nothing has moved yet",
+				)
+
+	def test_every_field_on_a_master_job_card_as_it_is_raised(self):
+		"""What a card carries the moment the order raises it, field by field.
+
+		One card per In-House operation, each with a detail row per item the order is
+		for. Every figure it will later report against starts at nothing, and the qty
+		it is raised for is the order's own."""
+		order = self.make_order()
+		cards = self.cards_of(order)
+
+		self.assertEqual(
+			len(cards), len(self.operations),
+			"one Master Job Card per In-House operation, and none for Out House",
+		)
+		self.assertEqual(
+			sorted(card.operation_name for card in cards), sorted(self.operations),
+			"the cards name the operations the order runs in house",
+		)
+
+		by_work_order = {
+			row.work_order_number: row for row in order.items_to_be_manufacture
+		}
+
+		for entry in cards:
+			card = frappe.get_doc("Master Job Card", entry.name)
+			where = card.name
+
+			self.assertEqual(card.master_work_order_number, order.name, f"{where}: order")
+			self.assertEqual(card.company, order.company, f"{where}: company")
+			self.assertEqual(card.status, "Open", f"{where}: raised but not started")
+			self.assertEqual(card.docstatus, 0, f"{where}: draft")
+
+			for field in ("wip_warehouse", "fg_warehouse", "scrap_warehouse"):
+				if card.meta.has_field(field):
+					self.assertEqual(
+						card.get(field), order.get(field), f"{where}: {field} off the order"
+					)
+
+			self.assertEqual(
+				len(card.job_card_detail), len(order.items_to_be_manufacture),
+				f"{where}: a detail row per item the order is for",
+			)
+
+			for row in card.job_card_detail:
+				source = by_work_order[row.work_order_number]
+				row_where = f"{where} / {row.item_code}"
+
+				self.assertEqual(row.item_code, source.item_code, f"{row_where}: item")
+				self.assertAlmostEqual(
+					flt(row.qty_to_manufacture), flt(source.qty_to_manufacture), places=3,
+					msg=f"{row_where}: raised for what the order asked of it",
+				)
+				self.assertTrue(row.job_card_number, f"{row_where}: linked to a Job Card")
+
+				for field in ("completed_qty", "process_loss_qty", "rejected_qty",
+							  "actual_time"):
+					self.assertAlmostEqual(
+						flt(row.get(field)), 0.0, places=3,
+						msg=f"{row_where}: {field} starts at nothing",
+					)
+
+			self.assertAlmostEqual(
+				flt(card.total_qty_to_manufacture),
+				sum(flt(row.qty_to_manufacture) for row in card.job_card_detail),
+				places=3, msg=f"{where}: the header total is its rows added up",
+			)
+			self.assertAlmostEqual(
+				flt(card.total_completed_qty), 0.0, places=3,
+				msg=f"{where}: nothing completed yet",
+			)
+
+	def test_loss_holds_the_finish_to_what_survived(self):
+		"""Destroyed cloth cannot be finished: 10 ordered, 2 destroyed, 8 booked.
+
+		The Finish is held to what came off the end of the line, so the 2 that never
+		made it are neither offered nor bookable, and the order closes accounting for
+		all 10 -- 8 made and 2 lost."""
+		order = self.make_order()
+		cards = self.cards_of(order)
+
+		self.run_card(cards[0].name, loss=2.0)
+		self.run_card(cards[1].name)
+
+		offered = self.finish(order)
+
+		self.assertEqual(
+			[flt(row["qty"]) for row in offered],
+			[8.0] * len(order.items_to_be_manufacture),
+			"the Finish may only book the 8 that survived",
+		)
+		self.assert_items(order, made=8.0, lost=2.0, pending=0.0, status="Completed",
+			when="after the Finish")
+
+	def test_a_pending_cards_loss_reaches_the_finish_and_the_next_cards_cap(self):
+		"""A part run, then a loss on the card that carries the balance.
+
+		5 of 10 go through both operations and are booked. The balance of 5 goes onto
+		pending cards, and the first of those destroys 1 -- so only 4 can be finished
+		on the second pass, and the card that has still to run its own balance is held
+		to what is left after everything lost and everything already booked:
+
+		    qty to manufacture - rejected - process loss - manufactured
+		"""
+		order = self.make_order()
+		cards = self.cards_of(order)
+		work_order = order.items_to_be_manufacture[0].work_order_number
+
+		# Pass one: 5 of the 10 through both operations, and booked.
+		self.run_card(cards[0].name, qty=5.0)
+		self.run_card(cards[1].name, qty=5.0)
+		self.finish(order)
+		order.reload()
+		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 5.0)
+
+		# The balance of 5 goes onto pending cards, and the first destroys 1 of it.
+		pending = order.pending_master_job_card_operations()
+		self.assertEqual([flt(row["qty"]) for row in pending], [5.0] * len(self.operations))
+		created = order.make_pending_master_job_cards(operations=pending)
+		self.run_card(created[0], loss=1.0)
+
+		# The second pending card may only take what is left: 10 less the 1 destroyed
+		# and the 5 already booked as goods.
+		card = frappe.get_doc("Master Job Card", created[1])
+		self.assertAlmostEqual(
+			flt(card.qty_caps().get(work_order)), 4.0, places=3,
+			msg="10 ordered, 1 destroyed on the other pending card, 5 already finished",
+		)
+
+		# Run it, and the Finish is offered the 4 that survived -- one less than the 5
+		# the pending cards were raised for.
+		self.run_card(created[1])
+		offered = self.finish(order)
+		self.assertEqual(
+			[flt(row["qty"]) for row in offered],
+			[4.0] * len(order.items_to_be_manufacture),
+			"the piece destroyed on the pending card is one the Finish never sees",
+		)
+		self.assert_items(order, made=9.0, lost=1.0, pending=0.0, status="Completed",
+			when="after the second Finish")
 
 	def test_the_cap_takes_off_the_loss_elsewhere_and_the_finished_goods(self):
 		"""Most a card may be raised for, per item:
