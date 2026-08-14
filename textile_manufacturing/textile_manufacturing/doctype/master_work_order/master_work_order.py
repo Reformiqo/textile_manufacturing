@@ -43,6 +43,7 @@ class MasterWorkOrder(Document):
 
     def on_submit(self):
         self.create_work_orders()
+        self.set_operation_qty_from_work_orders()
         self.create_master_job_cards()
 
         status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
@@ -50,7 +51,6 @@ class MasterWorkOrder(Document):
 
     def on_update_after_submit(self):
         self.propagate_new_operations()
-        self.set_master_job_card_flags()
 
     def before_cancel(self):
         self.validate_linked_docs_cancelled()
@@ -135,15 +135,121 @@ class MasterWorkOrder(Document):
 
         work_order.set_work_order_operations()
 
-        in_house = {
-            op.opration_name
-            for op in self.operations
+        in_house = [
+            op for op in self.operations
             if op.manufacturing_type == "In-House" and op.opration_name
-        }
+        ]
+        wanted = {op.opration_name for op in in_house}
 
         work_order.operations = [
-            op for op in work_order.operations if op.operation in in_house
+            op for op in work_order.operations if op.operation in wanted
         ]
+
+        self.append_operations_missing_from_work_order(work_order, in_house)
+
+    def append_operations_missing_from_work_order(self, work_order, operations):
+        """Put the operations no BOM supplied onto the Work Order.
+
+        set_work_order_operations() builds the table out of the BOM, so an operation
+        the planner put on the order by hand is in none of it -- and the Work Order
+        Operation row is the only thing a Job Card can be raised against. It runs on
+        every Work Order of the order whatever any one BOM happens to carry, which is
+        what the planner asked for by adding it to an order-wide table.
+
+        Sequence Id is carried on from the last row rather than taken off the
+        operation: ERPNext's validate_operations_sequence() will only have them run
+        1, 2, 3 down the table or be blank throughout, and an operation added by hand
+        has whatever number -- usually none -- the planner left on it."""
+        on_work_order = {op.operation for op in work_order.operations}
+        last = work_order.operations[-1] if work_order.operations else None
+        sequence_id = cint(last.sequence_id) if last else 0
+
+        for op in operations:
+            if op.opration_name in on_work_order:
+                continue
+
+            values = self.work_order_operation_values(op)
+            # Blank throughout stays blank throughout -- ERPNext then numbers the
+            # whole table off idx for itself.
+            values["sequence_id"] = sequence_id + 1 if sequence_id else 0
+            sequence_id = values["sequence_id"]
+
+            work_order.append("operations", values)
+            on_work_order.add(op.opration_name)
+
+    def work_order_operation_values(self, operation):
+        """The Work Order Operation row one of this order's operations becomes."""
+        return {
+            "operation": operation.opration_name,
+            "workstation": operation.workstation,
+            "workstation_type": operation.workstation_type,
+            "sequence_id": cint(operation.opration_sequence_no),
+            "time_in_mins": flt(operation.standerd_time),
+            "hour_rate": flt(operation.hour_rate),
+            "status": "Pending",
+            "completed_qty": 0,
+            "process_loss_qty": 0,
+        }
+
+    def work_orders_running_operation(self, operation):
+        """The Work Orders of this order that carry the operation.
+
+        Which is what decides whether an item runs it, rather than the BOM: the Work
+        Order Operation row is what a Job Card is booked against, so an item runs an
+        operation exactly when its Work Order carries it. An operation added to the
+        order by hand is in no BOM at all and reaches every Work Order."""
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return set()
+
+        return set(frappe.get_all(
+            "Work Order Operation",
+            filters={
+                "parent": ["in", work_orders],
+                "parenttype": "Work Order",
+                "operation": operation,
+            },
+            pluck="parent",
+        ))
+
+    def set_operation_qty_from_work_orders(self):
+        """Fill in the qty of any In-House operation the BOMs did not account for."""
+        for op in self.operations:
+            if op.manufacturing_type != "In-House":
+                continue
+
+            self.set_operation_qty_to_manufacture(op)
+
+    def set_operation_qty_to_manufacture(self, operation):
+        """What the order asks of an operation the BOMs never supplied.
+
+        set_operations() works this out per BOM when the order is built, and an
+        operation added by hand was in none of them -- so the row would sit at
+        nothing, and pending_master_job_card_operations(), which reads exactly this
+        field, would never offer it. It runs on every Work Order it reached, so it is
+        asked for the whole of what those were raised for.
+
+        A figure already on the row is left alone: it is either the BOMs' or the
+        planner's, and both outrank this."""
+        if flt(operation.total_qty_to_manufacture):
+            return
+
+        running = self.work_orders_running_operation(operation.opration_name)
+        if not running:
+            return
+
+        qty = sum(
+            flt(row.qty_to_manufacture)
+            for row in self.items_to_be_manufacture
+            if row.work_order_number in running
+        )
+        if qty <= 0:
+            return
+
+        operation.total_qty_to_manufacture = qty
+        operation.db_set(
+            "total_qty_to_manufacture", qty, update_modified=False
+        )
 
 
     # ------------------------------------------------------------------
@@ -667,6 +773,11 @@ class MasterWorkOrder(Document):
             for work_order in self.linked_work_orders():
                 self.add_work_order_operation(work_order, op)
 
+            # After the Work Orders have it and before the card is raised: the qty is
+            # read off the Work Orders that took the operation, and the card is
+            # raised for what the row then says.
+            self.set_operation_qty_to_manufacture(op)
+
             card = self.make_master_job_card_for(op.opration_name)
             raised.add(op.opration_name)
 
@@ -679,7 +790,18 @@ class MasterWorkOrder(Document):
             )
 
     def add_work_order_operation(self, work_order, operation):
-        """Add the operation to a submitted Work Order, and raise its Job Card."""
+        """Add the operation to a submitted Work Order, and raise its Job Card.
+
+        Whatever the BOM carries. The Work Order Operation row is what a Job Card is
+        booked against, so an operation the planner adds to the order has to reach
+        every Work Order on it -- and the BOM has nothing to say about that, because
+        the operation was added to the order rather than to the BOM.
+
+        Skipping the ones no BOM carried, which is what this used to do, left the
+        planner with an operation that looked added and was not: a Master Job Card was
+        still raised for it, and it failed at the far end on submit with "the
+        operation is not on the Work Order, so there is no operation row to book the
+        work against"."""
         from erpnext.manufacturing.doctype.work_order.work_order import create_job_card
 
         work_order = frappe.get_doc("Work Order", work_order)
@@ -687,24 +809,10 @@ class MasterWorkOrder(Document):
             return
         if any(op.operation == operation.opration_name for op in work_order.operations):
             return
-        # if this operation is not in bom then we dont need to link this bom
-        if not frappe.db.exists(
-            "BOM Operation",
-            {"parent": work_order.bom_no, "operation": operation.opration_name}
-        ):
-            return
 
-        row = work_order.append("operations", {
-            "operation": operation.opration_name,
-            "workstation": operation.workstation,
-            "workstation_type": operation.workstation_type,
-            "sequence_id": operation.opration_sequence_no,
-            "time_in_mins": flt(operation.standerd_time),
-            "hour_rate": flt(operation.hour_rate),
-            "status": "Pending",
-            "completed_qty": 0,
-            "process_loss_qty": 0,
-        })
+        row = work_order.append(
+            "operations", self.work_order_operation_values(operation)
+        )
         row.docstatus = work_order.docstatus
         row.db_insert()
 
@@ -753,8 +861,6 @@ class MasterWorkOrder(Document):
             previous_master_job_card = master_job_card.name
             created.append(master_job_card.name)
 
-        self.set_master_job_card_flags()
-
         if created:
             frappe.msgprint(
                 ("Created {0} Master Job Card(s): {1}").format(
@@ -765,26 +871,6 @@ class MasterWorkOrder(Document):
             )
 
         return created
-
-    def set_master_job_card_flags(self):
-        """Mark the operation rows a Master Job Card has been raised against.
-
-        The flag is what holds Manufacturing Type still on the form -- the field is
-        read_only_depends_on it, so an operation stops being re-routable the moment
-        the work is raised against it, rather than being re-routed and refused on
-        save. An operation nobody has raised a card for is still the planner's to
-        move, which is what makes an Out House row addable after the submit."""
-        raised = {
-            card.operation_name for card in self.master_job_cards() if card.operation_name
-        }
-
-        for op in self.operations:
-            flag = 1 if op.opration_name in raised else 0
-            if cint(op.has_master_job_card) == flag:
-                continue
-
-            op.has_master_job_card = flag
-            op.db_set("has_master_job_card", flag, update_modified=False)
 
     # ------------------------------------------------------------------
     # Finish -- produce the finished goods
@@ -1229,17 +1315,32 @@ class MasterWorkOrder(Document):
                 continue
 
             by_work_order = figures.get(op.opration_name) or {}
-            values = {
-                "completed_qty": flt(
-                    sum(f["completed"] for f in by_work_order.values()), 3
-                ),
-                "process_loss_qty": flt(
-                    sum(f["loss"] for f in by_work_order.values()), 3
-                ),
-                "pending_qty": flt(
-                    sum(f["pending"] for f in by_work_order.values()), 3
-                ),
-            }
+            if by_work_order:
+                values = {
+                    "completed_qty": flt(
+                        sum(f["completed"] for f in by_work_order.values()), 3
+                    ),
+                    "process_loss_qty": flt(
+                        sum(f["loss"] for f in by_work_order.values()), 3
+                    ),
+                    "pending_qty": flt(
+                        sum(f["pending"] for f in by_work_order.values()), 3
+                    ),
+                }
+            else:
+                # No live card for this operation: the last one was cancelled, or
+                # none was ever raised. Nothing made, nothing lost, and the whole of
+                # what the order asked of it owed again.
+                #
+                # Written out rather than summed off an empty reckoning, which reads
+                # Pending as zero and leaves the row not adding up -- 0 completed, 0
+                # lost and 0 pending against a Total Qty to Manufacture of 10, an
+                # operation that has run nothing and owes nothing.
+                values = {
+                    "completed_qty": 0.0,
+                    "process_loss_qty": 0.0,
+                    "pending_qty": flt(op.total_qty_to_manufacture, 3),
+                }
 
             if all(flt(op.get(field)) == value for field, value in values.items()):
                 continue
@@ -1684,8 +1785,18 @@ class MasterWorkOrder(Document):
         if finished and not self.outstanding_out_house_qty():
             self.db_set("status", "Completed")
             self.db_set("actual_end_date", frappe.utils.now_datetime())
-        elif self.status == "Not Started":
+        elif self.status in ("Not Started", "Completed"):
+            # Off Completed as readily as on to it. ERPNext works its Work Order's
+            # status out from scratch every time something moves -- get_status() --
+            # so cancelling a Manufacture entry takes the order back off Completed
+            # of its own accord, and the wrapper has to follow or it would sit
+            # Completed over Work Orders that are not. It is what lets the Finish be
+            # cancelled and the run put right afterwards.
+            #
+            # Closed, Stopped and Cancelled are set by hand and are nobody's to undo
+            # here, which is why they are named rather than everything-but-Completed.
             self.db_set("status", "In Process")
+            self.db_set("actual_end_date", None)
 
         self.update_production_plan()
 

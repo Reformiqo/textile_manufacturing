@@ -2,6 +2,38 @@
 // For license information, please see license.txt
 
 frappe.ui.form.on("Master Job Card", {
+    setup: function (frm) {
+        // Cancel is this card's own job, not the Cancel dialog's.
+        //
+        // Frappe offers to cancel everything linked to a document before cancelling
+        // the document itself -- cancel_all_linked_docs(). Left to it, it reaches the
+        // Job Cards first, while this card is still submitted and its detail and time
+        // log rows still name them, and Frappe's own link check then refuses:
+        // "Cannot delete or cancel because Job Card X is linked with Master Job Card
+        // Y". The cascade defeats itself, and on_cancel never runs.
+        //
+        // Handed back to the server, which does it in the one order that works: this
+        // card goes first, and its on_cancel then releases the Job Cards, the
+        // material they drew and its own postings -- with the operation's figures
+        // taken back off the Master Work Order on the way. The same reason ERPNext
+        // holds Delivery Note back from a Delivery Trip and Sales Invoice back from a
+        // Sales Order.
+        //
+        // Master Job Card is in the list for a different reason, and the sharpest
+        // one. The cards of an order are raised in a chain, each pointing back at the
+        // operation before it through Previous Opration Master Job Card, so the
+        // cascade walks that chain and offers to cancel every operation that follows
+        // this one -- "MJC-...-18 is linked with MJC-...-19, MJC-...-20. Do you want
+        // to cancel all linked documents?" Answering yes destroys three operations
+        // where one was asked for. The chain is not ownership: a later card is its
+        // own run, with its own Job Cards and its own reported quantity, and it
+        // survives this one being cancelled. release_back_links() takes this card's
+        // name off it in before_cancel, which is all that is owed.
+        frm.ignore_doctypes_on_cancel_all = [
+            "Master Job Card", "Job Card", "Stock Entry", "Quality Inspection",
+        ];
+    },
+
     refresh: function (frm) {
         if (frm.doc.master_work_order_number) {
             load_inhouse_operations(frm);

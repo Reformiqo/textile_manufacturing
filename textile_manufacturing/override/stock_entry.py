@@ -113,6 +113,43 @@ def update_master_work_order_returns(doc, method=None):
             frappe.db.set_value("Master Work Order Required Item", item.name, "return_qty", new_returned)
 
 
+def update_master_work_order_manufactured(doc, method=None):
+    """Bring the order's produced figures back in line when a Manufacture entry is
+    cancelled.
+
+    ERPNext works a Work Order's Produced Qty out from scratch every time an entry
+    moves -- Stock Entry.update_work_order() -- and the wrapper has to follow it or
+    the two come apart. Cancelling the Finish took the Work Order to 0 produced and
+    left the Master Work Order reporting 5 made, and the same again for the loss:
+    ERPNext recomputes Process Loss Qty off its Manufacture entries too, so
+    cancelling them zeroed the figure hold_process_loss_to_actual() had written
+    there, and nothing put it back. The floor was then told two different things
+    about one run.
+
+    On cancel alone, and deliberately. The Finish already calls
+    update_manufactured_qty() itself, once, after the last of its entries is
+    submitted -- so a submit was always covered, and hooking it there as well runs
+    the recount part way through, off Work Orders only some of which have produced.
+
+    Loss first, then what was made: the same pair in the same order as
+    finish_work_orders(), the only other place these two are driven. Both recomputed
+    from source rather than deducted, which is ERPNext's own rule and the only one
+    that survives entries being cancelled out of order."""
+    if doc.purpose != "Manufacture":
+        return
+
+    order = doc.get("master_work_order")
+    if not order or not frappe.db.exists("Master Work Order", order):
+        return
+
+    master_work_order = frappe.get_doc("Master Work Order", order)
+    if master_work_order.docstatus != 1:
+        return
+
+    master_work_order.hold_process_loss_to_actual()
+    master_work_order.update_manufactured_qty()
+
+
 def update_master_work_order_consumed(doc, method=None):
     if doc.purpose != "Manufacture" or not doc.work_order:
         return

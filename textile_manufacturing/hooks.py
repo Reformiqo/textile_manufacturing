@@ -152,7 +152,10 @@ doc_events = {
         ],
 		"on_cancel": [
             "textile_manufacturing.override.stock_entry.update_master_work_order_returns",
-            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed"
+            "textile_manufacturing.override.stock_entry.update_master_work_order_consumed",
+            # Cancel only -- the Finish does its own recount on the way out, and
+            # hooking the submit as well runs it part way through a Finish.
+            "textile_manufacturing.override.stock_entry.update_master_work_order_manufactured"
         ],
 	},
 	"Purchase Order": {

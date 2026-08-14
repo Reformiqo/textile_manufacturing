@@ -16,6 +16,8 @@ Run them with:
         textile_manufacturing.textile_manufacturing.doctype.master_work_order.test_master_work_order
 """
 
+import json
+
 import frappe
 from frappe.tests import UnitTestCase
 from frappe.utils import cint, flt
@@ -125,7 +127,7 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		order to reach Completed off the line alone -- an Out House operation holds it
 		In Process until the goods come back from the supplier. Settled before the
 		submit, so the routing is in hand by the time the cards are raised against
-		it -- see set_master_job_card_flags()."""
+		it -- an operation's Manufacturing Type is settled once it is set."""
 		from textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order import (
 			make_master_work_order,
 		)
@@ -1814,29 +1816,8 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		)
 
 	# ------------------------------------------------------------------
-	# Re-routing an operation -- set_master_job_card_flags()
+	# Re-routing an operation
 	# ------------------------------------------------------------------
-	def test_an_operation_with_a_card_is_flagged_and_one_without_is_not(self):
-		"""The flag Manufacturing Type is held still by, and only where it is earned.
-
-		read_only_depends_on reads it off the row, so it is the flag rather than the
-		submit that decides: an In-House operation has had a card raised against it
-		and is settled, an Out House one has not and is still the planner's to move."""
-		order = self.make_order()
-		order.reload()
-
-		for row in order.operations:
-			if row.manufacturing_type == "In-House":
-				self.assertEqual(
-					cint(row.has_master_job_card), 1,
-					f"{row.opration_name}: a card was raised for it on submit",
-				)
-			else:
-				self.assertEqual(
-					cint(row.has_master_job_card), 0,
-					f"{row.opration_name}: Out House work raises no Master Job Card",
-				)
-
 	def test_re_routing_a_running_operation_is_no_longer_refused(self):
 		"""The form holds it still now, so the server does not refuse it.
 
@@ -1859,139 +1840,935 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			"the server takes what it is given and leaves the holding to the form",
 		)
 
-	def test_an_operation_added_after_the_submit_is_flagged_once_its_card_is_raised(self):
-		"""Free while it is only a plan, held once the work is raised against it.
+	def test_routing_an_operation_in_house_after_the_submit_raises_its_card(self):
+		"""Routing is what raises the work, whenever it is done.
 
-		Which is what makes the table still workable after the submit: a row nobody
-		has raised a card for is the planner's to route, and stops being so the moment
-		propagate_new_operations() raises one."""
+		An operation left Out House at submit has no Master Job Card, because Out
+		House work is not run on the floor. Bring it in house afterwards and
+		propagate_new_operations() raises one for it -- which is what makes the
+		operations table still worth having after the order is submitted."""
 		order = self.make_order()
 		out_house = next(
 			row for row in order.operations if row.manufacturing_type == "Out House"
 		)
 
-		self.assertEqual(
-			cint(out_house.has_master_job_card), 0, "no card has been raised for it yet"
+		self.assertNotIn(
+			out_house.opration_name,
+			{card.operation_name for card in order.master_job_cards()},
+			"Out House work has no card raised for it",
 		)
 
 		out_house.manufacturing_type = "In-House"
 		order.save()
 		order.reload()
 
-		row = next(op for op in order.operations if op.name == out_house.name)
-		self.assertEqual(
-			cint(row.has_master_job_card), 1,
-			"routing it in house raised its card, which settles it",
-		)
 		self.assertIn(
-			row.opration_name,
+			out_house.opration_name,
 			{card.operation_name for card in order.master_job_cards()},
-			"and the card really is there",
+			"routing it in house raises its card",
 		)
 
-	def test_a_card_backing_booked_production_can_be_cancelled(self):
-		"""The refusal that made a finished card uncancellable is gone.
-
-		ERPNext will not cancel a Job Card whose operation backs booked production --
-		validate_produced_quantity() raises JobCardCancelError rather than leave the
-		Work Order having produced more than its operations account for. The Master
-		Job Card is the document and the Job Card under it is the bookkeeping, so the
-		answer is to take the production back first, not to leave the Job Card
-		standing under a cancelled card."""
-		order = self.completed_in_house_order()
-		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
-		job_cards = frappe.get_all(
-			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+	# ------------------------------------------------------------------
+	# An operation put on the order by hand -- add_work_order_operation()
+	# ------------------------------------------------------------------
+	def a_workstation(self, order):
+		return (
+			next((op.workstation for op in order.operations if op.workstation), None)
+			or self.first("Workstation")
 		)
-		self.assertTrue(job_cards, "the card has a Job Card under it to carry with it")
 
-		card.cancel()   # used to throw JobCardCancelError
+	def new_operation(self, workstation=None, name="Hand Added Operation"):
+		"""An Operation no BOM on the site carries.
 
-		self.assertEqual(card.docstatus, 2, "the Master Job Card cancels")
+		Which is the whole of the point: the order's operations table is the
+		planner's, and what they put on it was never in anybody's BOM."""
+		return frappe.get_doc({
+			"doctype": "Operation",
+			"__newname": name,
+			"workstation": workstation,
+		}).insert().name
+
+	def add_operation(self, order, operation, workstation=None, time=30.0):
+		"""Add an In-House operation row to the submitted order, as the form does."""
+		order.append("operations", {
+			"opration_name": operation,
+			"manufacturing_type": "In-House",
+			"workstation": workstation,
+			"standerd_time": time,
+		})
+		order.save()
+		order.reload()
+		return next(op for op in order.operations if op.opration_name == operation)
+
+	def hand_added_order(self, order=None):
+		"""A submitted order with one operation added to it that no BOM carries."""
+		order = order or self.make_order()
+		workstation = self.a_workstation(order)
+		if not workstation:
+			self.skipTest("no Workstation to run a hand-added operation on")
+
+		operation = self.new_operation(workstation)
+		self.add_operation(order, operation, workstation)
+		return order, operation
+
+	def work_orders_carrying(self, order, operation):
+		return set(frappe.get_all(
+			"Work Order Operation",
+			filters={
+				"parent": ["in", order.linked_work_orders()],
+				"parenttype": "Work Order",
+				"operation": operation,
+			},
+			pluck="parent",
+		))
+
+	def card_for(self, order, operation):
+		name = frappe.db.get_value(
+			"Master Job Card",
+			{
+				"master_work_order_number": order.name,
+				"operation_name": operation,
+				"docstatus": ["<", 2],
+			},
+			"name",
+		)
+		self.assertTrue(name, f"a Master Job Card was raised for {operation}")
+		return frappe.get_doc("Master Job Card", name)
+
+	def test_an_operation_no_bom_carries_reaches_every_work_order(self):
+		"""Added to the order, so added to every Work Order under it.
+
+		The BOM has no say in it. The operation was put on the order rather than on
+		the BOM, and the Work Order Operation row is the only thing a Job Card can be
+		booked against -- so skipping the Work Orders whose BOM did not carry it left
+		the planner with an operation that looked added and was not: the Master Job
+		Card was raised all the same, and it failed on submit with "the operation is
+		not on the Work Order, so there is no operation row to book the work
+		against"."""
+		order, operation = self.hand_added_order()
+
 		self.assertEqual(
-			frappe.db.get_value("Master Job Card", card.name, "status"), "Cancelled"
+			self.work_orders_carrying(order, operation),
+			set(order.linked_work_orders()),
+			"every Work Order of the order runs it, BOM or no BOM",
 		)
 
-	def test_cancelling_a_card_carries_its_job_cards_with_it(self):
-		"""The bookkeeping goes where the document goes -- cancelled and released."""
-		order = self.completed_in_house_order()
+	def test_a_hand_added_operation_reaches_both_work_orders_of_a_two_item_order(self):
+		"""The same, where there is more than one Work Order to miss."""
+		order, operation = self.hand_added_order(self.two_item_order())
+
+		self.assertEqual(len(order.linked_work_orders()), 2)
+		self.assertEqual(
+			self.work_orders_carrying(order, operation),
+			set(order.linked_work_orders()),
+		)
+
+	def test_a_hand_added_operation_raises_its_job_cards(self):
+		"""A Work Order Operation row is no use without the Job Card that books it."""
+		order, operation = self.hand_added_order()
+
+		self.assertEqual(
+			{
+				row.work_order
+				for row in frappe.get_all(
+					"Job Card",
+					filters={
+						"work_order": ["in", order.linked_work_orders()],
+						"operation": operation,
+						"docstatus": ["<", 2],
+					},
+					fields=["work_order"],
+				)
+			},
+			set(order.linked_work_orders()),
+			"one Job Card per Work Order, raised with the operation",
+		)
+
+	def test_a_hand_added_operations_card_carries_every_item(self):
+		"""Every item runs it, so every item is on the card."""
+		order, operation = self.hand_added_order()
+		card = self.card_for(order, operation)
+
+		self.assertEqual(
+			{row.work_order_number for row in card.job_card_detail},
+			set(order.linked_work_orders()),
+		)
+
+	def test_a_hand_added_operation_is_asked_for_the_orders_qty(self):
+		"""Total Qty to Manufacture is filled in, or nothing would ever offer it.
+
+		set_operations() works the figure out from the BOMs, and this operation was in
+		none of them -- so without set_operation_qty_to_manufacture() the row sits at
+		nothing and pending_master_job_card_operations(), which reads exactly this
+		field, never offers the operation a card for the balance."""
+		order, operation = self.hand_added_order()
+
+		self.assertEqual(
+			flt(self.operation_row(order, operation).total_qty_to_manufacture),
+			ORDER_QTY,
+			"it runs the whole of what the Work Orders were raised for",
+		)
+
+	def test_a_hand_added_operation_can_be_run_to_completion(self):
+		"""The failure this was all about: the card submits.
+
+		It used to throw Job Card Not Available -- "the operation is not on the Work
+		Order" -- because nothing had put the operation there."""
+		order, operation = self.hand_added_order()
+		card = self.run_card(self.card_for(order, operation).name)
+
+		self.assertEqual(card.docstatus, 1, "the card submitted")
+		self.assertEqual(card.status, "Completed")
+		self.assertEqual(
+			flt(self.operation_row(order, operation).completed_qty), ORDER_QTY
+		)
+
+	def test_a_hand_added_operation_holds_the_finish_until_it_has_run(self):
+		"""Adding an operation adds work, and the order is not finished without it.
+
+		ERPNext's own rule, in check_if_operations_completed() -- and it only reaches
+		the operation because it is on the Work Order. An operation that never got
+		there was an operation the order was finished without."""
+		order, operation = self.hand_added_order()
+
+		for card in self.cards_of(order):
+			if card.operation_name != operation:
+				self.run_card(card.name)
+
+		with self.assertRaises(frappe.ValidationError):
+			self.finish(order)
+
+		self.run_card(self.card_for(order, operation).name)
+		self.finish(order)
+		order.reload()
+
+		self.assertEqual(flt(order.total_manufacture_qty), ORDER_QTY)
+
+	def test_a_hand_added_out_house_operation_raises_no_card(self):
+		"""Out House work is not run on the floor, so there is no card to run it with.
+
+		It goes to a supplier through a Subcontracting Order. propagate_new_operations()
+		takes only the In-House rows, so an Out House one added by hand reaches neither
+		the Work Orders nor a Master Job Card -- the same rule create_work_orders()
+		keeps at submit, held to after it as well."""
+		order = self.make_order()
+		workstation = self.a_workstation(order)
+		if not workstation:
+			self.skipTest("no Workstation to run a hand-added operation on")
+
+		operation = self.new_operation(workstation)
+		before = {card.name for card in self.cards_of(order)}
+
+		order.append("operations", {
+			"opration_name": operation,
+			"manufacturing_type": "Out House",
+			"workstation": workstation,
+			"standerd_time": 30.0,
+		})
+		order.save()
+		order.reload()
+
+		self.assertFalse(
+			frappe.db.exists("Master Job Card", {
+				"master_work_order_number": order.name,
+				"operation_name": operation,
+				"docstatus": ["<", 2],
+			}),
+			"no Master Job Card is raised for Out House work",
+		)
+		self.assertEqual(
+			{card.name for card in self.cards_of(order)}, before,
+			"and no other card is disturbed",
+		)
+		self.assertEqual(
+			self.work_orders_carrying(order, operation), set(),
+			"nor does it reach the Work Orders -- it is not run on the floor",
+		)
+
+	def test_a_card_covers_the_work_orders_that_carry_the_operation_and_no_others(self):
+		"""Which items run an operation is the Work Orders' answer, not the BOMs'.
+
+		The Work Order Operation row is the only thing a Job Card can be booked
+		against, so a detail row for a Work Order without one could never be given a
+		Job Card. Read off the BOMs instead -- as _set_detail_rows() used to -- an item
+		whose BOM lacked the operation was dropped whenever some other item's BOM
+		carried it, while its Work Order had been given the operation and a Job Card
+		raised against it all the same."""
+		order, operation = self.hand_added_order(self.two_item_order())
+		card = self.card_for(order, operation)
+
+		self.assertEqual(
+			{row.work_order_number for row in card.job_card_detail},
+			set(order.linked_work_orders()),
+			"both Work Orders carry it, so both are on the card",
+		)
+
+		# Take it off one of them, the way an order routed per item leaves it, and
+		# ask the card again.
+		dropped = sorted(order.linked_work_orders())[0]
+		frappe.db.delete("Work Order Operation", {
+			"parent": dropped, "parenttype": "Work Order", "operation": operation,
+		})
+
+		card.fetch_from_master_work_order()
+
+		covered = {row.work_order_number for row in card.job_card_detail}
+		self.assertNotIn(
+			dropped, covered,
+			f"{dropped} no longer carries the operation, so it is left off",
+		)
+		self.assertEqual(
+			covered, set(order.linked_work_orders()) - {dropped},
+			"and every Work Order that still carries it is kept",
+		)
+
+	# ------------------------------------------------------------------
+	# Cancelling a Master Job Card
+	# ------------------------------------------------------------------
+	def run_order(self):
+		"""Every operation run, but nothing finished off the order.
+
+		The state a card is cancellable in: the operations have reported, so there
+		are submitted Job Cards under them, but no Manufacture entry has been raised
+		and so nothing is standing on them."""
+		order = self.make_order(in_house=True)
+		for card in self.cards_of(order):
+			self.run_card(card.name)
+		return order
+
+	def test_cancelling_a_card_cancels_the_job_cards_it_holds(self):
+		"""The card is the wrapper and the Job Cards are what it holds.
+
+		Left submitted they would go on carrying their qty on the Work Order's
+		operation, and link_job_cards() would offer one up again to the next card
+		raised for the operation -- it claims anything not cancelled."""
+		order = self.run_order()
 		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
 		job_cards = frappe.get_all(
 			"Job Card", filters={"master_job_card": card.name}, pluck="name"
 		)
+		self.assertTrue(job_cards, "the card has Job Cards under it to carry")
 
 		card.cancel()
 
+		self.assertEqual(card.docstatus, 2, "the card cancels")
 		for name in job_cards:
 			self.assertEqual(
 				frappe.db.get_value("Job Card", name, "docstatus"), 2,
-				f"{name}: cancelled with the card it was reporting through",
+				f"{name}: cancelled with the card that held it",
 			)
 			self.assertIsNone(
 				frappe.db.get_value("Job Card", name, "master_job_card"),
 				f"{name}: and released from it",
 			)
 
-	def test_cancelling_a_card_takes_the_booked_production_back(self):
-		"""The Manufacture entries stood on this operation, so they go with it.
+	def test_cancelling_a_card_cancels_the_stock_entries_it_raised(self):
+		"""Its own postings go with it, and its own link must not hold them.
 
-		Every operation stands behind the finished goods the Finish booked -- an
-		operation coming off the order takes them with it, or the order would report
-		goods that nothing on the floor accounts for."""
-		order = self.completed_in_house_order()
+		A Master SFG Stock row on this card points at the Stock Entry it posted, and
+		Frappe will not cancel a document a live one links to -- so the entry only
+		lets go once this card is itself cancelled. That is why it is done in
+		on_cancel rather than before_cancel."""
+		order = self.run_order()
+
+		# Putting goods into store has to value them.
+		for row in order.items_to_be_manufacture:
+			frappe.db.set_value("Item", row.item_code, "valuation_rate", 100.0)
+
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		card.make_sfg_stock_entry("Stock Out")
+
 		entries = frappe.get_all(
-			"Stock Entry",
-			filters={"master_work_order": order.name, "purpose": "Manufacture", "docstatus": 1},
-			pluck="name",
+			"Stock Entry", filters={"master_job_card": card.name, "docstatus": 1}, pluck="name"
 		)
-		self.assertTrue(entries, "the Finish booked something to take back")
+		self.assertTrue(entries, "the card posted semi-finished goods")
 
-		frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name).cancel()
+		card.reload()
+		card.cancel()
 
 		for name in entries:
 			self.assertEqual(
 				frappe.db.get_value("Stock Entry", name, "docstatus"), 2,
-				f"{name}: taken back with the card that stood behind it",
+				f"{name}: raised through this card, so cancelled with it",
 			)
 
-	def test_cancelling_a_card_walks_the_order_back_off_completed(self):
-		"""An order that is no longer finished must not go on saying it is."""
+	def test_cancelling_a_card_leaves_the_orders_own_entries_alone(self):
+		"""Only what is this card's. The Finish's entries are the order's.
+
+		They carry the order's name, not this card's, and are cancelled from the
+		Master Work Order -- never reached for from here."""
+		order = self.run_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		others = frappe.get_all(
+			"Stock Entry",
+			filters={"master_work_order": order.name, "master_job_card": ("is", "not set"),
+					 "docstatus": 1},
+			pluck="name",
+		)
+
+		card.cancel()
+
+		for name in others:
+			self.assertEqual(
+				frappe.db.get_value("Stock Entry", name, "docstatus"), 1,
+				f"{name}: not this card's, so not this card's to cancel",
+			)
+
+	def test_a_card_backing_booked_production_is_refused_and_says_why(self):
+		"""ERPNext will not release a Job Card the produced qty stands on.
+
+		validate_produced_quantity() refuses rather than leave the Work Order having
+		produced more than its operations account for. Nothing here overrules it --
+		the message just names what has to be dealt with first."""
 		order = self.completed_in_house_order()
-		self.assertEqual(order.status, "Completed", "it starts finished")
-
-		frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name).cancel()
-
-		order.reload()
-		self.assertNotEqual(
-			order.status, "Completed",
-			"its production has been taken back, so it is running again",
-		)
-		self.assertAlmostEqual(
-			flt(order.total_manufacture_qty), 0.0, places=3,
-			msg="and it reports nothing made",
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		entries = frappe.get_all(
+			"Stock Entry", filters={"master_work_order": order.name, "docstatus": 1}, pluck="name"
 		)
 
-	def test_a_cancelled_card_frees_its_operation_again(self):
-		"""The same once the work has run and the card is cancelled off it.
+		with self.assertRaises(frappe.ValidationError) as caught:
+			card.cancel()
 
-		on_cancel is where it is put back, and by then the card's docstatus is already
-		2 in the database -- which is what master_job_cards() reads it as gone by."""
-		order = self.make_order()
-		cards = self.cards_of(order)
-		for card in cards:
-			self.run_card(card.name)
+		message = str(caught.exception)
+		self.assertIn("Manufacture Stock Entry", message, "it says what stands in the way")
+		self.assertIn(order.name, message, "and which order they were raised from")
 
-		last = frappe.get_doc("Master Job Card", cards[-1].name)
-		self.assertEqual(last.docstatus, 1, "running the card submits it")
-		last.cancel()
+		# Nothing half-done. The refusal comes out of release_job_cards(), which runs
+		# before a single Stock Entry is touched -- Frappe rolls the docstatus write
+		# back with the failed request, but the stock must not have moved meanwhile.
+		for name in entries:
+			self.assertEqual(
+				frappe.db.get_value("Stock Entry", name, "docstatus"), 1,
+				f"{name}: refused before anything was cancelled",
+			)
+
+	def test_the_refusal_lifts_once_the_finish_is_cancelled(self):
+		"""The step the message asks for is one that actually works.
+
+		Cancel the Manufacture entries off the Master Work Order, and the card goes
+		-- Job Cards and all. A refusal that named an impossible step would be
+		worse than no message at all."""
+		order = self.completed_in_house_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+
+		for name in frappe.get_all(
+			"Stock Entry",
+			filters={"master_work_order": order.name, "purpose": "Manufacture", "docstatus": 1},
+			pluck="name", order_by="creation desc",
+		):
+			frappe.get_doc("Stock Entry", name).cancel()
+
+		card.reload()
+		card.cancel()
+
+		self.assertEqual(card.docstatus, 2, "the card goes once nothing stands on it")
+		for name in job_cards:
+			self.assertEqual(
+				frappe.db.get_value("Job Card", name, "docstatus"), 2,
+				f"{name}: and its Job Cards with it",
+			)
+
+	def test_the_refusal_lands_before_the_job_cards_are_touched(self):
+		"""validate_cancel() asks in before_cancel, so nothing has moved yet.
+
+		The Master Work Order is what carries the booked production, so the question
+		is answerable off the order alone -- no need to reach into the Job Cards to
+		find out, and so no need to have started cancelling them."""
+		order = self.completed_in_house_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+		self.assertTrue(job_cards, "the card has Job Cards under it")
+
+		with self.assertRaises(frappe.ValidationError):
+			card.cancel()
+
+		for name in job_cards:
+			self.assertEqual(
+				frappe.db.get_value("Job Card", name, "docstatus"), 1,
+				f"{name}: refused before anything was cancelled",
+			)
+			self.assertEqual(
+				frappe.db.get_value("Job Card", name, "master_job_card"), card.name,
+				f"{name}: and still held by the card that was refused",
+			)
+
+	def test_a_card_on_a_stopped_order_cannot_be_cancelled(self):
+		"""ERPNext will not cancel a Stopped Work Order -- Work Order.validate_cancel().
+
+		The wrapper reads the same rule one level up: an order shut by hand is not
+		open for change, and neither is the work under it."""
+		order = self.run_order()
+		order.stop_work_orders()
+		order.reload()
+		self.assertEqual(order.status, "Stopped")
+
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+
+		with self.assertRaises(frappe.ValidationError) as caught:
+			card.cancel()
+
+		self.assertIn("Stopped", str(caught.exception), "it says what shut the order")
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", card.name, "docstatus"), 1,
+			"and the card is left standing",
+		)
+
+	def test_cancelling_the_finish_takes_the_order_back_off_completed(self):
+		"""What makes the refusal liftable rather than a dead end.
+
+		ERPNext works a Work Order's status out from scratch every time something
+		moves -- get_status() -- so cancelling a Manufacture entry takes it back off
+		Completed. The wrapper has to follow, or it would sit Completed over Work
+		Orders that are not, and read as finished for good."""
+		order = self.completed_in_house_order()
+		self.assertEqual(order.status, "Completed")
+
+		for name in frappe.get_all(
+			"Stock Entry",
+			filters={"master_work_order": order.name, "purpose": "Manufacture", "docstatus": 1},
+			pluck="name", order_by="creation desc",
+		):
+			frappe.get_doc("Stock Entry", name).cancel()
 
 		order.reload()
-		row = next(
-			op for op in order.operations if op.opration_name == last.operation_name
+		order.set_status_from_work_orders()
+		order.reload()
+
+		self.assertEqual(
+			order.status, "In Process",
+			"the goods are no longer booked, so the order is no longer finished",
+		)
+
+	def test_a_job_card_stamped_but_named_on_no_row_still_lets_go(self):
+		"""The stamp is what Frappe reads, so the stamp is what has to be released.
+
+		The rows and the stamps come apart -- fetch_from_master_work_order() rebuilds
+		the detail table from scratch, and the qty ceilings drop a row outright -- and
+		a Job Card left stamped but named nowhere used to refuse the cancel outright:
+		"Cannot delete or cancel because Job Card X is linked with Master Job Card Y".
+		"""
+		order = self.run_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+
+		orphan = card.job_card_detail[0].job_card_number
+		self.assertTrue(orphan, "the row has a Job Card to lose")
+		# Exactly what a re-fetch leaves behind: the stamp on the Job Card, and no
+		# row naming it.
+		for row in card.job_card_detail:
+			if row.job_card_number == orphan:
+				row.db_set("job_card_number", None, update_modified=False)
+		card.reload()
+		self.assertEqual(
+			frappe.db.get_value("Job Card", orphan, "master_job_card"), card.name,
+			"the Job Card is still stamped with this card",
+		)
+
+		card.cancel()
+
+		self.assertEqual(card.docstatus, 2, "the orphaned stamp does not block the cancel")
+		self.assertIsNone(
+			frappe.db.get_value("Job Card", orphan, "master_job_card"),
+			"and it is released like any other",
 		)
 		self.assertEqual(
-			cint(row.has_master_job_card), 0,
-			"the card behind it is cancelled, so the operation is free again",
+			frappe.db.get_value("Job Card", orphan, "docstatus"), 2,
+			"and cancelled like any other",
+		)
+
+	def assert_ledgers_agree(self, order, where):
+		"""The wrapper and what it wraps must read the same.
+
+		Two ledgers are kept over one run: the Master Work Order's, added up from the
+		Master Job Cards, and ERPNext's own, added up from the Job Cards. They are
+		never written from each other -- each recomputes from its own submitted
+		documents -- so agreeing is not something either arranges. They agree because
+		the same events reach both, and the moment they stop the wrapper is telling
+		the floor one thing while the Work Order tells it another.
+
+		Three readings are compared, which is every figure the two hold in common:
+
+		    what the operation made   MWO Operation.completed_qty
+		                              vs Work Order Operation.completed_qty
+		    what was destroyed        MWO Item.process_loss_qty
+		                              vs Work Order.process_loss_qty
+		    what was produced         MWO Item.manufacture_qty
+		                              vs Work Order.produced_qty
+
+		Process Loss on the *operation* rows is deliberately left out: the two mean
+		different things there. ERPNext's is what that operation itself destroyed;
+		the order's also carries what died at an operation the cloth passes earlier
+		and so never arrived here -- see operation_figures(). Both are right about
+		their own question."""
+		order.reload()
+
+		work_orders = [
+			row.work_order_number for row in order.items_to_be_manufacture
+			if row.work_order_number
+		]
+
+		made = {}
+		for row in frappe.get_all(
+			"Work Order Operation",
+			filters={"parent": ["in", work_orders], "parenttype": "Work Order"},
+			fields=["operation", "completed_qty"],
+		):
+			made[row.operation] = flt(made.get(row.operation)) + flt(row.completed_qty)
+
+		for op in order.operations:
+			if op.manufacturing_type != "In-House":
+				continue
+			self.assertAlmostEqual(
+				flt(op.completed_qty), flt(made.get(op.opration_name)), places=3,
+				msg=f"{where}: {op.opration_name} -- Completed Qty must read the same "
+					f"on the order as it does on the Work Orders",
+			)
+
+		for row in order.items_to_be_manufacture:
+			if not row.work_order_number:
+				continue
+
+			work_order = frappe.db.get_value(
+				"Work Order", row.work_order_number,
+				["process_loss_qty", "produced_qty"], as_dict=True,
+			)
+			self.assertAlmostEqual(
+				flt(row.process_loss_qty), flt(work_order.process_loss_qty), places=3,
+				msg=f"{where}: {row.work_order_number} -- Process Loss must read the "
+					f"same on the item row as it does on the Work Order",
+			)
+			self.assertAlmostEqual(
+				flt(row.manufacture_qty), flt(work_order.produced_qty), places=3,
+				msg=f"{where}: {row.work_order_number} -- Manufacture Qty must read "
+					f"the same on the item row as Produced Qty on the Work Order",
+			)
+
+	def test_the_two_ledgers_agree_before_and_after_a_cancel(self):
+		"""The wrapper never drifts from the Work Order it wraps.
+
+		Checked at each step of a run rather than only at the end: a cancel that put
+		one ledger right and left the other behind would pass an end-state check on
+		whichever one it happened to fix."""
+		order = self.make_order(in_house=True)
+		cards = self.cards_of(order)
+
+		self.assert_ledgers_agree(order, "nothing run yet")
+
+		self.run_card(cards[0].name, loss=2.0, rejected=1.0)
+		self.assert_ledgers_agree(order, "first operation run, with loss")
+
+		for card in cards[1:]:
+			self.run_card(card.name)
+		self.assert_ledgers_agree(order, "every operation run")
+
+		frappe.get_doc("Master Job Card", cards[-1].name).cancel()
+		self.assert_ledgers_agree(order, "the last operation cancelled off")
+
+		frappe.get_doc("Master Job Card", cards[0].name).cancel()
+		self.assert_ledgers_agree(order, "and the one that carried the loss with it")
+
+	def test_the_two_ledgers_agree_when_the_finish_is_cancelled(self):
+		"""The road the refusal actually sends the operator down.
+
+		A card on a produced-against order is refused until the Manufacture entries
+		are cancelled, so that cancel is part of the ordinary cycle rather than an odd
+		case -- and it was where the wrapper and the Work Order came apart worst. The
+		order went on reporting 5 made and 2 lost against a Work Order reporting none
+		of either: ERPNext recomputes both off its Manufacture entries, and the Finish
+		was the only thing that ever put the app's figures back."""
+		order = self.completed_in_house_order()
+		self.assert_ledgers_agree(order, "finished")
+
+		card = self.cards_of(order)[-1].name
+		with self.assertRaises(frappe.ValidationError):
+			frappe.get_doc("Master Job Card", card).cancel()
+
+		for name in frappe.get_all(
+			"Stock Entry",
+			filters={"master_work_order": order.name, "purpose": "Manufacture", "docstatus": 1},
+			pluck="name", order_by="creation desc",
+		):
+			frappe.get_doc("Stock Entry", name).cancel()
+
+		self.assert_ledgers_agree(order, "the Finish cancelled off")
+
+		order.reload()
+		for row in order.items_to_be_manufacture:
+			self.assertAlmostEqual(
+				flt(row.manufacture_qty), 0.0, places=3,
+				msg=f"{row.work_order_number}: nothing is booked as made any more",
+			)
+
+		frappe.get_doc("Master Job Card", card).cancel()
+		self.assert_ledgers_agree(order, "and the card cancelled after it")
+
+	def test_an_inspection_taken_on_a_job_card_does_not_block_the_cancel(self):
+		"""Quality Inspection points at the Job Card through a Dynamic Link.
+
+		A submitted one stops the Job Card being cancelled exactly as a Stock Entry
+		does, and this app raises them itself -- make_quality_inspection(). An
+		inspection of work that is being undone is an inspection of nothing, so it
+		goes with the work."""
+		order = self.run_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		row = card.job_card_detail[0]
+
+		inspection = frappe.get_doc({
+			"doctype": "Quality Inspection",
+			"inspection_type": "In Process",
+			"reference_type": "Job Card",
+			"reference_name": row.job_card_number,
+			"item_code": row.item_code,
+			"sample_size": flt(row.qty_to_manufacture),
+			"company": order.company,
+			"inspected_by": frappe.session.user,
+		})
+		inspection.insert()
+		inspection.submit()
+
+		card.reload()
+		card.cancel()
+
+		self.assertEqual(card.docstatus, 2, "the inspection does not stand in the way")
+		self.assertEqual(
+			frappe.db.get_value("Quality Inspection", inspection.name, "docstatus"), 2,
+			"it is cancelled with the work it inspected",
+		)
+		self.assertEqual(
+			frappe.db.get_value("Job Card", row.job_card_number, "docstatus"), 2,
+			"and the Job Card goes",
+		)
+
+	def test_cancelling_a_card_takes_its_figures_back_off_the_order(self):
+		"""The cancel has to undo the card's effect, not merely let go of it.
+
+		Completed, Process Loss and Pending on the operation row, and Process Loss on
+		the item rows and the order total. All of them are worked out from the cards
+		that are still live, so a cancelled card drops out of every one -- but only
+		because set_card_status() carries the recount, which is the part worth
+		holding still."""
+		order = self.make_order(in_house=True)
+		cards = self.cards_of(order)
+		card = frappe.get_doc("Master Job Card", cards[-1].name)
+		self.run_card(card.name, loss=2.0, rejected=1.0)
+
+		before = self.operation_row(order, card.operation_name)
+		self.assertGreater(flt(before.completed_qty), 0, "the run reported against it")
+		self.assertGreater(flt(before.process_loss_qty), 0, "and lost against it")
+
+		order.reload()
+		self.assertGreater(flt(order.total_process_loss), 0, "the order carries the loss")
+
+		frappe.get_doc("Master Job Card", card.name).cancel()
+
+		after = self.operation_row(order, card.operation_name)
+		self.assertAlmostEqual(
+			flt(after.completed_qty), 0, places=3,
+			msg="the card is gone, so nothing it made is still counted",
+		)
+		self.assertAlmostEqual(
+			flt(after.process_loss_qty), 0, places=3,
+			msg="nor anything it lost",
+		)
+		self.assertAlmostEqual(
+			flt(after.pending_qty), flt(after.total_qty_to_manufacture), places=3,
+			msg="the whole quantity is owed again",
+		)
+		self.assertEqual(after.status, "Pending", "and the operation has not been run")
+
+		order.reload()
+		self.assertAlmostEqual(
+			flt(order.total_process_loss), 0, places=3,
+			msg="and the order's total loss goes back with it",
+		)
+		for row in order.items_to_be_manufacture:
+			self.assertAlmostEqual(
+				flt(row.process_loss_qty), 0, places=3,
+				msg=f"{row.work_order_number}: the item row's loss too",
+			)
+
+	def test_cancelling_a_card_takes_its_scrap_back_off_the_order(self):
+		"""Scrap is rolled up on save, and a cancel is not a save.
+
+		Every other figure comes off through sync_to_master_work_order(); this one
+		had to be asked for, and without it the order went on carrying scrap that no
+		live card accounted for."""
+		order = self.make_order(in_house=True)
+		name = self.cards_of(order)[-1].name
+
+		# Scrap is entered while the operation is being worked, so on the draft card
+		# -- the table is not allow_on_submit.
+		card = frappe.get_doc("Master Job Card", name)
+		item = card.job_card_detail[0].item_code
+		card.append("scrap_item", {
+			"item_code": item,
+			"uom": frappe.db.get_value("Item", item, "stock_uom"),
+			"scrap_qty": 3.0,
+			"scrap_warehouse": order.scrap_warehouse,
+		})
+		card.save()
+
+		card = self.run_card(name)
+
+		order.reload()
+		self.assertAlmostEqual(
+			flt(sum(flt(row.scrap_qty) for row in order.scrap_item)), 3.0, places=3,
+			msg="the card's scrap reaches the order",
+		)
+
+		card.reload()
+		card.cancel()
+
+		order.reload()
+		self.assertAlmostEqual(
+			flt(sum(flt(row.scrap_qty) for row in order.scrap_item)), 0.0, places=3,
+			msg="and comes back off it with the card",
+		)
+		for row in order.items_to_be_manufacture:
+			self.assertAlmostEqual(
+				flt(row.scrap_qty), 0.0, places=3,
+				msg=f"{row.work_order_number}: and off the item rows with it",
+			)
+
+	def cancel_dialog_ignore_list(self):
+		"""What the form holds back from Frappe's Cancel All cascade.
+
+		Read out of the form script itself rather than written out again here: the
+		setting lives in master_job_card.js, and a test carrying its own copy would go
+		on passing after someone shortened the real one."""
+		import re
+
+		path = frappe.get_app_path(
+			"textile_manufacturing", "textile_manufacturing", "doctype",
+			"master_job_card", "master_job_card.js",
+		)
+		with open(path) as handle:
+			source = handle.read()
+
+		match = re.search(
+			r"ignore_doctypes_on_cancel_all\s*=\s*\[(.*?)\]", source, re.S
+		)
+		self.assertTrue(match, "the form sets ignore_doctypes_on_cancel_all")
+		return re.findall(r'"([^"]+)"', match.group(1))
+
+	def test_the_cancel_dialog_offers_nothing_of_this_cards_own(self):
+		"""Frappe's Cancel All cascade must not be let near a Master Job Card.
+
+		Hitting Cancel makes Frappe offer to cancel everything linked to the document
+		first -- cancel_all_linked_docs() -- and everything linked to a card is
+		something the card owns or something that outlives it:
+
+		    the cards after it     its own run, and not this one's to destroy
+		    its Job Cards          released in on_cancel, in an order the cascade
+		                           cannot reproduce -- reached first, they are refused
+		                           while this card still stands and still names them
+
+		Asked of get_submitted_linked_docs(), which is the very call the dialog is
+		built from, so this is what the operator would be shown."""
+		from frappe.desk.form.linked_with import get_submitted_linked_docs
+
+		order = self.run_order()
+		cards = self.cards_of(order)
+		if len(cards) < 2:
+			self.skipTest("the routing has only one in-house operation to chain")
+
+		name = cards[0].name
+
+		offered = get_submitted_linked_docs("Master Job Card", name)["docs"]
+		# The state the bug needs, asserted rather than assumed: left to itself the
+		# cascade really does reach the cards after this one. Without this the test
+		# would pass just as happily against a card nothing is linked to, and prove
+		# nothing about holding the cascade back.
+		self.assertTrue(
+			[d["name"] for d in offered if d["doctype"] == "Master Job Card"],
+			"Frappe walks the chain and offers the operations after this one",
+		)
+		self.assertTrue(
+			[d["name"] for d in offered if d["doctype"] == "Job Card"],
+			"and the Job Cards this one holds",
+		)
+
+		held = get_submitted_linked_docs(
+			"Master Job Card", name,
+			ignore_doctypes_on_cancel_all=json.dumps(self.cancel_dialog_ignore_list()),
+		)["docs"]
+		self.assertEqual(
+			[(d["doctype"], d["name"]) for d in held], [],
+			"nothing is offered, so there is no dialog and the cancel goes straight "
+			"to the server",
+		)
+
+	def test_cancelling_a_card_leaves_the_operations_after_it_standing(self):
+		"""One operation cancelled is one operation cancelled.
+
+		The cards of an order are raised in a chain, each pointing back at the one
+		before it, and Frappe's cascade reads that chain as ownership -- it offered to
+		cancel every operation that follows, and answering yes destroyed three runs
+		where one was asked for. A later card is its own run, with its own Job Cards
+		and its own reported quantity."""
+		order = self.run_order()
+		cards = self.cards_of(order)
+		if len(cards) < 2:
+			self.skipTest("the routing has only one in-house operation to chain")
+
+		later = [card.name for card in cards[1:]]
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": ["in", later]},
+			fields=["name", "master_job_card"],
+		)
+
+		frappe.get_doc("Master Job Card", cards[0].name).cancel()
+
+		for name in later:
+			self.assertEqual(
+				frappe.db.get_value("Master Job Card", name, "docstatus"), 1,
+				f"{name}: its own run, so it stands",
+			)
+		for row in job_cards:
+			self.assertEqual(
+				frappe.db.get_value("Job Card", row.name, "docstatus"), 1,
+				f"{row.name}: and keeps the Job Cards it holds",
+			)
+			self.assertEqual(
+				frappe.db.get_value("Job Card", row.name, "master_job_card"),
+				row.master_job_card,
+				f"{row.name}: still held by the card it belongs to",
+			)
+
+	def test_cancelling_a_card_clears_its_name_off_the_cards_after_it(self):
+		"""The chain has to let go, and it has to let go in before_cancel.
+
+		Each card points back at the operation before it. A cancelled card is no
+		longer an operation before anything, and -- more plainly -- Frappe refuses to
+		cancel a document a submitted one links to, so a card further down the chain
+		would block this one outright."""
+		order = self.run_order()
+		cards = self.cards_of(order)
+		if len(cards) < 2:
+			self.skipTest("the routing has only one in-house operation to chain")
+
+		first, second = cards[0], cards[1]
+		self.assertEqual(
+			frappe.db.get_value(
+				"Master Job Card", second.name, "previous_opration_master_job_card"
+			),
+			first.name,
+			"the second card is raised pointing back at the first",
+		)
+
+		card = frappe.get_doc("Master Job Card", first.name)
+		card.cancel()
+
+		self.assertEqual(card.docstatus, 2, "the submitted card after it does not block it")
+		self.assertIsNone(
+			frappe.db.get_value(
+				"Master Job Card", second.name, "previous_opration_master_job_card"
+			),
+			"and its name is off the card that followed it",
 		)
 
 

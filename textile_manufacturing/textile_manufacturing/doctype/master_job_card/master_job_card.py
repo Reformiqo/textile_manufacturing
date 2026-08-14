@@ -93,9 +93,15 @@ class MasterJobCard(Document):
 
         return snapshot(self) != snapshot(before)
 
-    def sync_scrap_to_master_work_order(self):
-        """Roll every card's scrap up onto the order, one row per scrap item."""
-        if not self.master_work_order_number or not self.scrap_rows_changed():
+    def sync_scrap_to_master_work_order(self, force=False):
+        """Roll every card's scrap up onto the order, one row per scrap item.
+
+        force skips the did-the-table-change gate, for the cancel: the rows are
+        exactly as they were, and it is the card being withdrawn that moves the
+        total."""
+        if not self.master_work_order_number:
+            return
+        if not force and not self.scrap_rows_changed():
             return
 
         cards = frappe.get_all(
@@ -108,7 +114,14 @@ class MasterJobCard(Document):
             pluck="name",
         )
 
-        rows = [row.as_dict() for row in (self.get("scrap_item") or [])]
+        # A cancelled card scrapped nothing in the end -- the same reckoning
+        # operation_totals() makes of its quantities, and for the same reason: the
+        # work went back with the Job Cards, and so did what it spoiled. It is left
+        # out here rather than filtered out of the query below because the query
+        # already excludes it by name; this is the half that adds it back in.
+        rows = [] if self.docstatus == 2 else [
+            row.as_dict() for row in (self.get("scrap_item") or [])
+        ]
         if cards:
             rows += frappe.get_all(
                 "Master Job Card Scrap Item",
@@ -210,11 +223,178 @@ class MasterJobCard(Document):
         self.set_card_status("Completed")
 
     def before_cancel(self):
+        self.validate_cancel()
         self.release_back_links()
 
+    # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
+    #
+    # A Master Work Order wraps the Work Orders and a Master Job Card wraps the Job
+    # Cards, so the rules for letting one go are ERPNext's own rules, read one level
+    # up. ERPNext refuses on two counts, and both are answered here:
+    #
+    #   Work Order.validate_cancel()          -- a Stopped order cannot be cancelled,
+    #                                            and neither can one with submitted
+    #                                            Stock Entries standing against it.
+    #   Job Card.validate_produced_quantity() -- a card cannot be cancelled while the
+    #                                            Work Order has produced more than its
+    #                                            operations account for; cancel the
+    #                                            Manufacturing Entries first.
+    #
+    # Both are asked up front, in validate_cancel(), so the refusal lands before a
+    # single Job Card or Stock Entry has been touched. ERPNext's own second check
+    # still runs underneath, from inside job_card.cancel(), and cancel_job_card()
+    # catches it -- it works per operation where this one works per order, so it is
+    # the finer of the two and is left to have the last word.
+    #
+    # What the cancel then does, in order:
+    #
+    #   before_cancel  validate_cancel()        may refuse; nothing touched yet
+    #                  release_back_links()     this card's name off the cards after it
+    #   on_cancel      release_job_cards()      the Job Cards, and the material they drew
+    #                  cancel_own_stock_entries()  the semi-finished goods it posted
+    #                  set_card_status()        and the operation's figures with it
+
+    # Shut by hand, and not by anything the floor did. Cancelled is not among them:
+    # a card is cancelled before its order can be, so refusing here would leave the
+    # pair with no way out of each other. Completed is not among them either -- the
+    # Finish is what makes it, and the Finish is answered by its own postings, which
+    # let go the moment they are cancelled. A status would not.
+    SHUT_ORDER_STATUS = ("Closed", "Stopped")
+
+    def validate_cancel(self):
+        """Refuse the cancel while the order is shut, or has been produced against.
+
+        The Finish books the production on the Master Work Order, not on this card,
+        so an operation that has been produced against cannot simply be handed back
+        -- the order would be left reporting goods that no operation accounts for.
+
+        Read off the Manufacture entries rather than off the order's status, for the
+        same reason ERPNext reads it off the Work Order's produced qty: the status
+        says the order was finished once, the entries say the goods are still booked.
+        Cancel the Finish and the refusal lifts with it, which is exactly what the
+        message asks for -- a refusal that named a step that did not work would be
+        worse than no message at all."""
+        if not self.master_work_order_number:
+            return
+        if not frappe.db.exists("Master Work Order", self.master_work_order_number):
+            return
+
+        status = frappe.db.get_value(
+            "Master Work Order", self.master_work_order_number, "status"
+        )
+        if status in self.SHUT_ORDER_STATUS:
+            frappe.throw(
+                ("Master Work Order {0} is {1}, so the work under it cannot be "
+                 "cancelled.<br><br>{2}").format(
+                    frappe.utils.get_link_to_form(
+                        "Master Work Order", self.master_work_order_number
+                    ),
+                    frappe.bold(status),
+                    ("Re-open the order first." if status == "Stopped" else
+                     "A Closed order cannot be re-opened, so the work under it "
+                     "stands as it was run."),
+                ),
+                title="Master Work Order {0}".format(status),
+            )
+
+        entries = self.manufacture_entries()
+        if not entries:
+            return
+
+        frappe.throw(
+            ("{0} has been produced against, so {1} cannot be cancelled -- the "
+             "order would be left reporting goods that no operation accounts "
+             "for.<br><br>"
+             "Cancel the Manufacture Stock Entry(s) raised by the Finish on {2} "
+             "first, then cancel this card:<br>{3}").format(
+                frappe.bold(self.master_work_order_number),
+                frappe.bold(self.name),
+                frappe.utils.get_link_to_form(
+                    "Master Work Order", self.master_work_order_number
+                ),
+                "<br>".join(
+                    frappe.utils.get_link_to_form("Stock Entry", entry)
+                    for entry in entries
+                ),
+            ),
+            title="Production Booked Against This Order",
+        )
+
+    def manufacture_entries(self):
+        """The Finish's postings. They carry the order's name, never this card's."""
+        return frappe.get_all(
+            "Stock Entry",
+            filters={
+                "master_work_order": self.master_work_order_number,
+                "purpose": "Manufacture",
+                "docstatus": 1,
+            },
+            pluck="name",
+        )
+
     def on_cancel(self):
-        self.release_job_cards()
+        # The Job Cards first, because they are the only thing left that can refuse:
+        # validate_cancel() has answered the order, but ERPNext still asks its own
+        # question per operation. Ordered this way that refusal lands before this
+        # card's own postings have been touched, so a card that cannot be cancelled
+        # keeps its semi-finished goods where they are.
+        cancelled = self.release_job_cards()
+        cancelled += self.cancel_own_stock_entries()
+        self.report_cancelled_stock_entries(cancelled)
+        # Completed, Process Loss and Pending come off the order through here:
+        # set_card_status() ends in sync_to_master_work_order(), and every figure it
+        # writes is worked out from the cards that are still live -- this one is not,
+        # so it drops out of all of them. Scrap is the one that does not travel that
+        # road, since it is rolled up on save and a cancel is not one.
         self.set_card_status("Cancelled")
+        self.sync_scrap_to_master_work_order(force=True)
+
+    def cancel_own_stock_entries(self):
+        """Cancel the Stock Entries raised through this card, and only those.
+
+        The ones carrying its name -- the semi-finished goods it posted itself. The
+        Finish's Manufacture entries carry the order's name, not this card's, and are
+        left alone: they belong to the Master Work Order and are cancelled from it.
+
+        In on_cancel and not before_cancel: this card's sfg_stock rows point at these
+        entries, and Frappe will not cancel a document a live one links to -- so they
+        only let go once this card is itself cancelled, which it is by the time this
+        runs.
+
+        Newest first, since a later entry drew on what an earlier one put into
+        store."""
+        return self.cancel_stock_entries({"master_job_card": self.name, "docstatus": 1})
+
+    def cancel_stock_entries(self, filters):
+        """Cancel the submitted Stock Entries matching filters, newest first.
+
+        Newest first because a later entry drew on what an earlier one moved --
+        cancelling the earlier one first would leave the stock negative in between."""
+        entries = frappe.get_all(
+            "Stock Entry", filters=filters, pluck="name", order_by="creation desc"
+        )
+
+        for name in entries:
+            frappe.get_doc("Stock Entry", name).cancel()
+
+        return entries
+
+    def report_cancelled_stock_entries(self, entries):
+        if not entries:
+            return
+
+        frappe.msgprint(
+            ("Cancelled {0} Stock Entry(s) raised through this card:<br><br>{1}").format(
+                len(entries),
+                "<br>".join(
+                    frappe.utils.get_link_to_form("Stock Entry", name) for name in entries
+                ),
+            ),
+            title="Stock Entries Cancelled",
+            indicator="orange",
+        )
 
     # ------------------------------------------------------------------
     # Validation
@@ -639,11 +819,29 @@ class MasterJobCard(Document):
     # Job Cards
     # ------------------------------------------------------------------
     def release_back_links(self):
-        for name in frappe.get_all(
+        """Take this card's name off every other Master Job Card that names it.
+
+        The cards of an order are raised in a chain, each one pointing back at the
+        operation before it, and a cancelled card is no longer an operation before
+        anything: previous_operation_ceiling() would go on holding the card after it
+        to a figure nobody ran. Cleared rather than re-pointed at this card's own
+        predecessor -- what the cancelled operation would have turned out is not
+        known, so the card after it is left unbound and keeps the quantity the order
+        was raised for.
+
+        In before_cancel, and it has to be: Frappe refuses to cancel a document a
+        submitted one links to (check_no_back_links_exist), so a submitted card
+        further down the chain would block this one outright.
+
+        Every card, whatever its docstatus. A draft one reads the link the moment it
+        is fetched, and a submitted one is what would block the cancel."""
+        names = frappe.get_all(
             "Master Job Card",
             filters={"previous_opration_master_job_card": self.name},
             pluck="name",
-        ):
+        )
+
+        for name in names:
             frappe.db.set_value(
                 "Master Job Card",
                 name,
@@ -651,6 +849,8 @@ class MasterJobCard(Document):
                 None,
                 update_modified=False,
             )
+
+        return names
 
     def link_job_cards(self):
         """Take up a Job Card of the Work Order for each row of this card.
@@ -738,22 +938,154 @@ class MasterJobCard(Document):
 
         return create_job_card(work_order, operation, auto_create=True).name
 
+    def linked_job_cards(self):
+        """Every Job Card this card holds: named on its rows, stamped with its name,
+        or both.
+
+        The two come apart, and a Job Card missed either way is one the cancel then
+        cannot get past -- Frappe reads the stamp, not the rows
+        (check_no_back_links_exist), and refuses with "Cannot delete or cancel
+        because Job Card X is linked with Master Job Card Y". Ways they come apart:
+
+            fetch_from_master_work_order() rebuilds the detail table from scratch, so
+            re-fetching a card that has already claimed its Job Cards leaves them
+            stamped and named on no row;
+
+            _apply_previous_operation_ceiling() and limit_to_pending_qty() drop a row
+            outright where the operation has nothing left to run, stamp and all.
+
+        The stamp is the one that decides, so the stamp is what is read. The rows go
+        first only so the cancel works the operation in the order the card lists it."""
+        names = []
+        seen = set()
+
+        for row in (self.get("job_card_detail") or []):
+            if row.job_card_number and row.job_card_number not in seen:
+                seen.add(row.job_card_number)
+                names.append(row.job_card_number)
+
+        for name in frappe.get_all(
+            "Job Card",
+            filters={"master_job_card": self.name},
+            pluck="name",
+            order_by="creation",
+        ):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+
+        return [name for name in names if frappe.db.exists("Job Card", name)]
+
     def release_job_cards(self):
         """Hand the Job Cards back. They belong to the Work Order, not to this card,
         so cancelling here only releases them -- a submitted one is cancelled first,
-        since the qty it reported was reported through this card."""
-        for row in (self.get("job_card_detail") or []):
-            if not row.job_card_number:
-                continue
-            if not frappe.db.exists("Job Card", row.job_card_number):
-                continue
+        since the qty it reported was reported through this card.
 
-            job_card = frappe.get_doc("Job Card", row.job_card_number)
-            if job_card.docstatus == 1:
-                job_card.cancel()
+        Returns the Stock Entries cancelled along the way, for the one report the
+        cancel puts out."""
+        cancelled = []
+
+        for name in self.linked_job_cards():
+            if frappe.db.get_value("Job Card", name, "docstatus") == 1:
+                cancelled += self.cancel_job_card_stock_entries(name)
+                self.cancel_job_card_inspections(name)
+                # Read only now, and never before the two above. Cancelling either
+                # writes back onto the Job Card -- a Stock Entry through
+                # set_transferred_qty(), an inspection through its own status hook --
+                # so a doc read ahead of them is stale by the time it is used, and
+                # cancel() refuses it with a timestamp mismatch rather than a word
+                # about the operation.
+                self.cancel_job_card(frappe.get_doc("Job Card", name))
 
             frappe.db.set_value(
-                "Job Card", job_card.name, "master_job_card", None, update_modified=False
+                "Job Card", name, "master_job_card", None, update_modified=False
+            )
+
+        return cancelled
+
+    def cancel_job_card_stock_entries(self, job_card_number):
+        """Put back the material drawn against one Job Card.
+
+        Material Transfer On decides where the raw material is moved: onto the Work
+        Order, in which case the entries are the order's and are cancelled from it,
+        or onto the Job Card itself, in which case they carry the Job Card's name and
+        are this card's to undo. Two reasons to undo them, and either alone would be
+        enough: Frappe will not cancel a document a submitted one links to, so the
+        Job Card cannot be released while they stand; and the operation they were
+        drawn for is being cancelled, so the material has to come back regardless.
+
+        Only for a Job Card that is itself being cancelled. A draft one is merely
+        released and stays on the Work Order for the next Master Job Card to claim,
+        so what has already reached it stays where it is -- taking it back would
+        leave the next card transferring material that never left."""
+        return self.cancel_stock_entries({"job_card": job_card_number, "docstatus": 1})
+
+    def cancel_job_card_inspections(self, job_card_number):
+        """Cancel the Quality Inspections taken against one Job Card.
+
+        make_quality_inspection() raises them against the Job Card, and Quality
+        Inspection points back at it through a Dynamic Link -- so a submitted one
+        stops the Job Card being cancelled just as surely as a Stock Entry does, and
+        with the same unhelpful message. They are cancelled rather than worked around
+        because an inspection of work that is being undone is an inspection of
+        nothing; the record stands, cancelled, and the reading it took is still
+        readable on it.
+
+        Cancelling one runs update_master_job_card_detail(), which takes its name
+        back off the detail row it was written onto -- so the rows are tidied by the
+        same step."""
+        inspections = frappe.get_all(
+            "Quality Inspection",
+            filters={
+                "reference_type": "Job Card",
+                "reference_name": job_card_number,
+                "docstatus": 1,
+            },
+            pluck="name",
+        )
+
+        for name in inspections:
+            frappe.get_doc("Quality Inspection", name).cancel()
+
+        return inspections
+
+    def cancel_job_card(self, job_card):
+        """Cancel one Job Card, and say what to do where ERPNext will not have it.
+
+        It refuses while the operation backs production that has been booked:
+        validate_produced_quantity() will not leave the Work Order having produced
+        more than its operations account for. Nothing here overrules that -- the
+        Manufacture entries belong to the Master Work Order and are cancelled from
+        it -- but ERPNext's own message names the Work Order, which is not where they
+        were raised. Named properly, the refusal is a step to take.
+
+        validate_cancel() has already turned back the finished order; what reaches
+        here is the part-finished one, which carries booked production without ever
+        having reached Completed."""
+        from erpnext.manufacturing.doctype.job_card.job_card import JobCardCancelError
+
+        try:
+            job_card.cancel()
+        except JobCardCancelError:
+            entries = self.manufacture_entries()
+
+            frappe.throw(
+                ("{0} has been produced against, so its Job Card {1} cannot be "
+                 "cancelled -- the Work Order would be left reporting goods that no "
+                 "operation accounts for.<br><br>"
+                 "Cancel the Manufacture Stock Entry(s) raised by the Finish on {2} "
+                 "first, then cancel this card:<br>{3}").format(
+                    frappe.bold(self.operation_name or "This operation"),
+                    frappe.bold(job_card.name),
+                    frappe.utils.get_link_to_form(
+                        "Master Work Order", self.master_work_order_number
+                    ),
+                    "<br>".join(
+                        frappe.utils.get_link_to_form("Stock Entry", entry)
+                        for entry in entries
+                    ) or "(none found against this order)",
+                ),
+                title="Production Booked Against This Operation",
             )
 
     # ------------------------------------------------------------------
@@ -1345,10 +1677,30 @@ class MasterJobCard(Document):
         )
 
     def _set_detail_rows(self, mwo):
-        """One row per MWO item (work order) whose BOM includes this operation.
+        """One row per Work Order that runs this operation.
 
-        An operation added to the order by hand is in no BOM at all, so when none of
-        them carry it every item runs through it instead."""
+        Which Work Orders those are is read off their own operation rows, not off the
+        BOMs. The Work Order Operation row is the only thing a Job Card can be booked
+        against, so an item runs an operation exactly when its Work Order carries it
+        -- the same rule MasterWorkOrder.work_orders_running_operation() states, and
+        the same one add_work_order_operation() acts on when it puts an operation the
+        planner added by hand onto every Work Order of the order.
+
+        Reading the BOMs instead was right for the operations that came from a BOM and
+        wrong for the ones that did not. A hand-added operation is in no BOM at all,
+        so where every item lacked it every item ran it and the answer came out right
+        by accident; but where one item's BOM happened to carry the operation and
+        another's did not, the second was dropped -- while its Work Order had been
+        given the operation and a Job Card raised against it all the same. The card
+        never claimed that Job Card, and the operation's Total Qty to Manufacture,
+        counted over every Work Order running it, stood against detail rows for only
+        some of them.
+
+        The BOMs are still read, for the one thing only they know: the workstation and
+        the standard time of this operation as that item runs it.
+
+        Falling back to the BOMs while there are no Work Orders yet -- the card is
+        fetched on a draft order too, where nothing has been raised to read."""
         self.set("job_card_detail", [])
 
         bom_operation = {}
@@ -1361,6 +1713,7 @@ class MasterJobCard(Document):
                 None,
             )
 
+        running = mwo.work_orders_running_operation(self.operation_name)
         from_bom = any(bom_operation.values())
 
         for item in mwo.items_to_be_manufacture:
@@ -1368,8 +1721,12 @@ class MasterJobCard(Document):
                 continue
 
             bom_op = bom_operation.get(item.name)
-            if from_bom and not bom_op:
-                # This work order does not run through this operation.
+            if running:
+                if item.work_order_number not in running:
+                    # This Work Order was not given the operation.
+                    continue
+            elif from_bom and not bom_op:
+                # No Work Order to ask yet, so the BOM is all there is to go on.
                 continue
 
             bom_op = bom_op or frappe._dict()
