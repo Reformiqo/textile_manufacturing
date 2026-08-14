@@ -48,11 +48,9 @@ class MasterWorkOrder(Document):
         status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
         self.db_set("status", status)
 
-    def before_update_after_submit(self):
-        self.validate_manufacturing_type_not_rerouted()
-
     def on_update_after_submit(self):
         self.propagate_new_operations()
+        self.set_master_job_card_flags()
 
     def before_cancel(self):
         self.validate_linked_docs_cancelled()
@@ -87,32 +85,6 @@ class MasterWorkOrder(Document):
             ),
             title="Master Work Order Already Exists",
         )
-
-    def validate_manufacturing_type_not_rerouted(self):
-        was = dict(frappe.get_all(
-            "Master Work Order Operation",
-            filters={"parent": self.name, "parenttype": "Master Work Order"},
-            fields=["name", "manufacturing_type"],
-            as_list=True,
-        ))
-
-        for row in self.operations:
-            previous = was.get(row.name)
-            if not previous or row.manufacturing_type == previous:
-                continue
-
-            frappe.throw(
-                ("Row {0}: {1} is already running as {2}, so its Manufacturing Type "
-                 "cannot be changed to {3}.<br><br>The work has been raised against "
-                 "that choice -- cancel this order to route the operation "
-                 "differently.").format(
-                    row.idx,
-                    frappe.bold(row.opration_name or ""),
-                    frappe.bold(previous),
-                    frappe.bold(row.manufacturing_type or "empty"),
-                ),
-                title="Operation Already Routed",
-            )
 
     def validate_linked_docs_cancelled(self):
         pending = []
@@ -781,6 +753,8 @@ class MasterWorkOrder(Document):
             previous_master_job_card = master_job_card.name
             created.append(master_job_card.name)
 
+        self.set_master_job_card_flags()
+
         if created:
             frappe.msgprint(
                 ("Created {0} Master Job Card(s): {1}").format(
@@ -791,6 +765,26 @@ class MasterWorkOrder(Document):
             )
 
         return created
+
+    def set_master_job_card_flags(self):
+        """Mark the operation rows a Master Job Card has been raised against.
+
+        The flag is what holds Manufacturing Type still on the form -- the field is
+        read_only_depends_on it, so an operation stops being re-routable the moment
+        the work is raised against it, rather than being re-routed and refused on
+        save. An operation nobody has raised a card for is still the planner's to
+        move, which is what makes an Out House row addable after the submit."""
+        raised = {
+            card.operation_name for card in self.master_job_cards() if card.operation_name
+        }
+
+        for op in self.operations:
+            flag = 1 if op.opration_name in raised else 0
+            if cint(op.has_master_job_card) == flag:
+                continue
+
+            op.has_master_job_card = flag
+            op.db_set("has_master_job_card", flag, update_modified=False)
 
     # ------------------------------------------------------------------
     # Finish -- produce the finished goods
@@ -978,6 +972,10 @@ class MasterWorkOrder(Document):
         held to what the line has turned out, so it can be zero -- the form then says
         why rather than hiding the button."""
         if self.docstatus != 1:
+            return []
+
+        # No operation is routed anywhere: no Master Job Card is raised
+        if not any(row.manufacturing_type for row in self.operations):
             return []
 
         outstanding = self.outstanding_manufacture_by_work_order()

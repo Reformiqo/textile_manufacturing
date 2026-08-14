@@ -12,6 +12,7 @@
   "workstation",
   "workstation_type",
   "manufacturing_type",
+  "has_master_job_card",
   "supplier",
   "service_item",
   "job_work_rate",
@@ -65,7 +66,18 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Manufacturing Type",
-   "options": "\nIn-House\nOut House"
+   "options": "\nIn-House\nOut House",
+   "read_only_depends_on": "eval:doc.has_master_job_card"
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "0",
+   "description": "Set once a Master Job Card has been raised for this operation, which is what holds its Manufacturing Type still.",
+   "fieldname": "has_master_job_card",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Has Master Job Card",
+   "read_only": 1
   },
   {
    "allow_on_submit": 1,

@@ -18,7 +18,7 @@ Run them with:
 
 import frappe
 from frappe.tests import UnitTestCase
-from frappe.utils import flt
+from frappe.utils import cint, flt
 
 ORDER_QTY = 10.0
 IN_HOUSE = 2
@@ -118,19 +118,41 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		plan.submit()
 		return plan.name
 
-	def make_order(self, plan=None):
-		"""A submitted Master Work Order with the first operations run in house."""
+	def make_order(self, plan=None, in_house=False):
+		"""A submitted Master Work Order with the first operations run in house.
+
+		in_house routes every operation in house instead, for the tests that need the
+		order to reach Completed off the line alone -- an Out House operation holds it
+		In Process until the goods come back from the supplier. Settled before the
+		submit, so the routing is in hand by the time the cards are raised against
+		it -- see set_master_job_card_flags()."""
 		from textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order import (
 			make_master_work_order,
 		)
 
 		order = frappe.get_doc("Master Work Order", make_master_work_order(plan or self.plan))
 		for idx, op in enumerate(order.operations):
+			if in_house:
+				op.manufacturing_type = "In-House"
+				continue
 			op.manufacturing_type = "In-House" if idx < IN_HOUSE else "Out House"
 
+		# Every warehouse off the reference order, not just the source. The rest are
+		# stamped by set_default_warehouses() out of Manufacturing Settings, which a
+		# site is under no obligation to have filled in -- and a Work Order with no
+		# target warehouse is refused on submit, which took the whole suite down with
+		# it. Taken from an order that has already produced cleanly instead, the same
+		# way this fixture takes its item and BOM.
 		order.source_warehouse = self.reference.source_warehouse
+		for field in ("wip_warehouse", "fg_warehouse", "scrap_warehouse"):
+			if self.reference.get(field):
+				order.set(field, self.reference.get(field))
+
 		for row in order.items_to_be_manufacture:
 			row.source_warehouse = self.reference.source_warehouse
+			for field in ("wip_warehouse", "fg_warehouse", "scrap_warehouse"):
+				if self.reference.get(field):
+					row.set(field, self.reference.get(field))
 		# The form pushes the header's warehouse onto the Required Items too, in
 		# update_all_child_warehouses() -- the rows are stamped when the order is
 		# built, before anyone has picked one, so nothing on the server does it.
@@ -153,7 +175,10 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		# likes, and the arithmetic under test settles everything off the reported
 		# quantities. self.operations[0] simply means "the one driven first".
 		self.operations = [op.opration_name for op in order.in_house_operations()]
-		self.assertEqual(len(self.operations), IN_HOUSE)
+		if in_house:
+			self.assertEqual(len(self.operations), len(order.operations))
+		else:
+			self.assertEqual(len(self.operations), IN_HOUSE)
 		return order
 
 	def two_item_order(self):
@@ -1138,6 +1163,12 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		):
 			frappe.db.set_value("Workflow", workflow, "send_email_alert", 0)
 
+		# And Buying Settings' Auto Create Subcontracting Order, which raises one on
+		# submit before this test raises its own. That one is built by ERPNext with no
+		# Job Worker Warehouse on it, which is mandatory, so the submit goes down with
+		# it. The cycle under test is the deliberate one below.
+		frappe.db.set_single_value("Buying Settings", "auto_create_subcontracting_order", 0)
+
 		purchase_order.insert()
 		purchase_order.submit()
 
@@ -1561,6 +1592,406 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertAlmostEqual(
 			flt(purchase_order.items[0].fg_item_qty), 10.0, places=3,
 			msg="a Purchase Order with no Master Work Order behind it is not ours to touch",
+		)
+
+	# ------------------------------------------------------------------
+	# The Production Plan's status -- CustomProductionPlan.set_status()
+	# ------------------------------------------------------------------
+	def completed_in_house_order(self, loss=2.0):
+		"""An order run all the way through in house and finished, with loss.
+
+		The loss is what makes the plan's own arithmetic disagree: 10 planned and 8
+		booked, so all_items_completed() never sees produced catch planned, however
+		finished the order is."""
+		order = self.make_order(in_house=True)
+
+		cards = self.cards_of(order)
+		self.run_card(cards[0].name, loss=loss)
+		for card in cards[1:]:
+			self.run_card(card.name)
+
+		self.finish(order)
+		order.reload()
+
+		self.assertEqual(
+			order.status, "Completed",
+			"nothing is away at a supplier, so the line alone finishes the order",
+		)
+		return order
+
+	def plan_of(self, order):
+		return frappe.get_doc("Production Plan", order.production_plan_number)
+
+	def test_a_completed_order_completes_its_production_plan(self):
+		"""The order is done, so the plan is done -- loss and all.
+
+		Left to ERPNext the plan never gets there: all_items_completed() waits for
+		produced to have caught planned and produced counts the good pieces only, so
+		the 2 destroyed hold it back for good."""
+		order = self.completed_in_house_order()
+
+		self.assertEqual(
+			frappe.db.get_value("Production Plan", order.production_plan_number, "status"),
+			"Completed",
+			"the plan has nothing left to run once its only order is finished",
+		)
+
+	def test_the_plan_is_completed_by_erpnexts_own_road(self):
+		"""all_items_completed() is what answers, not a status written over the top.
+
+		It is asked inside set_status()'s produced-qty branch, so everything hanging
+		off the status downstream -- the reserved qty above all -- is settled with the
+		right answer in hand rather than corrected afterwards."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		self.assertTrue(
+			plan.completed_master_work_order(),
+			"the order raised against this plan is finished",
+		)
+		self.assertTrue(
+			plan.all_items_completed(),
+			"so the plan has no items left to complete, whatever was destroyed",
+		)
+		self.assertGreater(
+			flt(plan.total_produced_qty), 0.0,
+			"and something was produced, so ERPNext asks the question at all",
+		)
+
+	def test_the_finished_plan_still_reports_what_was_really_made(self):
+		"""Only the status is ours to say. The quantities stay true.
+
+		8 made of 10 planned reads as 8 made with 2 pending, not as 10 made -- the
+		plan is not to be told the destroyed pieces exist just to make its own
+		completion arithmetic work out."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		for row in plan.po_items:
+			self.assertAlmostEqual(
+				flt(row.produced_qty), ORDER_QTY - 2.0, places=3,
+				msg="produced qty is the good pieces, not the pieces put through",
+			)
+			self.assertAlmostEqual(
+				flt(row.pending_qty), 2.0, places=3,
+				msg="what was destroyed stays pending on the plan",
+			)
+
+		self.assertAlmostEqual(
+			flt(plan.total_produced_qty), ORDER_QTY - 2.0, places=3,
+			msg="the total follows the rows",
+		)
+
+	def test_a_requested_material_request_does_not_reopen_a_finished_plan(self):
+		"""Material Requested must not win over a finished order.
+
+		set_status() runs update_requested_status() whenever it stops short of
+		Completed, and that puts the plan back to Material Requested for as long as a
+		Material Request Plan Item carries a requested qty -- which is exactly what
+		was seen on site. Recomputed on every Material Request submitted or cancelled
+		against the plan, in update_requested_qty_in_production_plan()."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		plan.append("mr_items", {
+			"item_code": order.required_items[0].item_code,
+			"warehouse": self.reference.source_warehouse,
+			"quantity": 5.0,
+			"requested_qty": 5.0,
+			"material_request_type": "Purchase",
+			"schedule_date": frappe.utils.nowdate(),
+		})
+
+		plan.set_status()
+
+		self.assertEqual(
+			plan.status, "Completed",
+			"a requested Material Request does not put a finished plan back",
+		)
+
+	def test_material_requested_still_stands_while_the_order_is_running(self):
+		"""The Material Request flow is untouched for as long as there is work left.
+
+		Requesting material is a real thing to say about a plan and the plan should go
+		on saying it. Only a finished order overrules it, and ERPNext ranks them the
+		same way itself -- set_status() runs update_requested_status() only when it
+		has not already reached Completed."""
+		order = self.make_order(in_house=True)
+		self.run_card(self.cards_of(order)[0].name)
+
+		plan = self.plan_of(order)
+		plan.append("mr_items", {
+			"item_code": order.required_items[0].item_code,
+			"warehouse": self.reference.source_warehouse,
+			"quantity": 5.0,
+			"requested_qty": 5.0,
+			"material_request_type": "Purchase",
+			"schedule_date": frappe.utils.nowdate(),
+		})
+
+		plan.set_status()
+
+		self.assertEqual(
+			plan.status, "Material Requested",
+			"material really has been requested, and the order is not finished",
+		)
+
+	def test_an_ordered_row_does_not_reopen_a_finished_plan(self):
+		"""The other status update_status() falls through to, for the same reason.
+
+		update_ordered_status() reads In Process off any row carrying an ordered qty,
+		and it runs after update_requested_status(), so it is the one that would
+		actually stick."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		plan.po_items[0].ordered_qty = ORDER_QTY
+		plan.set_status()
+
+		self.assertEqual(plan.status, "Completed", "an ordered row does not reopen it")
+
+	def test_re_opening_a_finished_plan_stores_completed(self):
+		"""Re-open works the status out again, and stores it itself.
+
+		close=False is the Re-open button. super().set_status() stores what it made
+		of the status before this override has spoken, so the override has to store
+		its own or the plan would come back Material Requested."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		plan.set_status(close=False, update_bin=True)
+
+		self.assertEqual(plan.status, "Completed")
+		self.assertEqual(
+			frappe.db.get_value("Production Plan", plan.name, "status"), "Completed",
+			"re-opening has to store the status it worked out",
+		)
+
+	def test_closing_a_plan_is_not_overruled(self):
+		"""Closed is said outright by whoever pressed the button, finished order or
+		not, and is not this override's to overrule."""
+		order = self.completed_in_house_order()
+		plan = self.plan_of(order)
+
+		plan.set_status(close=True, update_bin=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Production Plan", plan.name, "status"), "Closed",
+			"Closed stands",
+		)
+
+	def test_an_unfinished_order_leaves_its_plan_alone(self):
+		"""Nothing is forced while the order still has work in it.
+
+		The first operation has run and the second has not, so there is nothing off
+		the end of the line and the plan is ERPNext's to describe as it always was."""
+		order = self.make_order(in_house=True)
+		self.run_card(self.cards_of(order)[0].name)
+		order.reload()
+
+		self.assertNotEqual(
+			order.status, "Completed", "the order still has an operation to run"
+		)
+		self.assertNotEqual(
+			frappe.db.get_value("Production Plan", order.production_plan_number, "status"),
+			"Completed",
+			"an unfinished order must not finish its plan",
+		)
+
+	def test_a_plan_with_no_master_work_order_is_left_to_erpnext(self):
+		"""A plan nobody has raised an order against is untouched by any of this."""
+		plan = frappe.get_doc("Production Plan", self.plan)
+
+		self.assertFalse(
+			plan.completed_master_work_order(),
+			"no order has been raised against this plan",
+		)
+
+		plan.set_status()
+		self.assertNotEqual(
+			plan.status, "Completed",
+			"ERPNext decides on its own for a plan with no order behind it",
+		)
+
+	# ------------------------------------------------------------------
+	# Re-routing an operation -- set_master_job_card_flags()
+	# ------------------------------------------------------------------
+	def test_an_operation_with_a_card_is_flagged_and_one_without_is_not(self):
+		"""The flag Manufacturing Type is held still by, and only where it is earned.
+
+		read_only_depends_on reads it off the row, so it is the flag rather than the
+		submit that decides: an In-House operation has had a card raised against it
+		and is settled, an Out House one has not and is still the planner's to move."""
+		order = self.make_order()
+		order.reload()
+
+		for row in order.operations:
+			if row.manufacturing_type == "In-House":
+				self.assertEqual(
+					cint(row.has_master_job_card), 1,
+					f"{row.opration_name}: a card was raised for it on submit",
+				)
+			else:
+				self.assertEqual(
+					cint(row.has_master_job_card), 0,
+					f"{row.opration_name}: Out House work raises no Master Job Card",
+				)
+
+	def test_re_routing_a_running_operation_is_no_longer_refused(self):
+		"""The form holds it still now, so the server does not refuse it.
+
+		It used to throw Operation Already Routed out of before_update_after_submit(),
+		which meant a planner who touched the field could not save the order at all --
+		not even the changes that had nothing to do with it."""
+		order = self.make_order()
+		in_house = next(
+			row for row in order.operations if row.manufacturing_type == "In-House"
+		)
+
+		in_house.manufacturing_type = "Out House"
+		order.save()   # no throw
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Master Work Order Operation", in_house.name, "manufacturing_type"
+			),
+			"Out House",
+			"the server takes what it is given and leaves the holding to the form",
+		)
+
+	def test_an_operation_added_after_the_submit_is_flagged_once_its_card_is_raised(self):
+		"""Free while it is only a plan, held once the work is raised against it.
+
+		Which is what makes the table still workable after the submit: a row nobody
+		has raised a card for is the planner's to route, and stops being so the moment
+		propagate_new_operations() raises one."""
+		order = self.make_order()
+		out_house = next(
+			row for row in order.operations if row.manufacturing_type == "Out House"
+		)
+
+		self.assertEqual(
+			cint(out_house.has_master_job_card), 0, "no card has been raised for it yet"
+		)
+
+		out_house.manufacturing_type = "In-House"
+		order.save()
+		order.reload()
+
+		row = next(op for op in order.operations if op.name == out_house.name)
+		self.assertEqual(
+			cint(row.has_master_job_card), 1,
+			"routing it in house raised its card, which settles it",
+		)
+		self.assertIn(
+			row.opration_name,
+			{card.operation_name for card in order.master_job_cards()},
+			"and the card really is there",
+		)
+
+	def test_a_card_backing_booked_production_can_be_cancelled(self):
+		"""The refusal that made a finished card uncancellable is gone.
+
+		ERPNext will not cancel a Job Card whose operation backs booked production --
+		validate_produced_quantity() raises JobCardCancelError rather than leave the
+		Work Order having produced more than its operations account for. The Master
+		Job Card is the document and the Job Card under it is the bookkeeping, so the
+		answer is to take the production back first, not to leave the Job Card
+		standing under a cancelled card."""
+		order = self.completed_in_house_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+		self.assertTrue(job_cards, "the card has a Job Card under it to carry with it")
+
+		card.cancel()   # used to throw JobCardCancelError
+
+		self.assertEqual(card.docstatus, 2, "the Master Job Card cancels")
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", card.name, "status"), "Cancelled"
+		)
+
+	def test_cancelling_a_card_carries_its_job_cards_with_it(self):
+		"""The bookkeeping goes where the document goes -- cancelled and released."""
+		order = self.completed_in_house_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+
+		card.cancel()
+
+		for name in job_cards:
+			self.assertEqual(
+				frappe.db.get_value("Job Card", name, "docstatus"), 2,
+				f"{name}: cancelled with the card it was reporting through",
+			)
+			self.assertIsNone(
+				frappe.db.get_value("Job Card", name, "master_job_card"),
+				f"{name}: and released from it",
+			)
+
+	def test_cancelling_a_card_takes_the_booked_production_back(self):
+		"""The Manufacture entries stood on this operation, so they go with it.
+
+		Every operation stands behind the finished goods the Finish booked -- an
+		operation coming off the order takes them with it, or the order would report
+		goods that nothing on the floor accounts for."""
+		order = self.completed_in_house_order()
+		entries = frappe.get_all(
+			"Stock Entry",
+			filters={"master_work_order": order.name, "purpose": "Manufacture", "docstatus": 1},
+			pluck="name",
+		)
+		self.assertTrue(entries, "the Finish booked something to take back")
+
+		frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name).cancel()
+
+		for name in entries:
+			self.assertEqual(
+				frappe.db.get_value("Stock Entry", name, "docstatus"), 2,
+				f"{name}: taken back with the card that stood behind it",
+			)
+
+	def test_cancelling_a_card_walks_the_order_back_off_completed(self):
+		"""An order that is no longer finished must not go on saying it is."""
+		order = self.completed_in_house_order()
+		self.assertEqual(order.status, "Completed", "it starts finished")
+
+		frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name).cancel()
+
+		order.reload()
+		self.assertNotEqual(
+			order.status, "Completed",
+			"its production has been taken back, so it is running again",
+		)
+		self.assertAlmostEqual(
+			flt(order.total_manufacture_qty), 0.0, places=3,
+			msg="and it reports nothing made",
+		)
+
+	def test_a_cancelled_card_frees_its_operation_again(self):
+		"""The same once the work has run and the card is cancelled off it.
+
+		on_cancel is where it is put back, and by then the card's docstatus is already
+		2 in the database -- which is what master_job_cards() reads it as gone by."""
+		order = self.make_order()
+		cards = self.cards_of(order)
+		for card in cards:
+			self.run_card(card.name)
+
+		last = frappe.get_doc("Master Job Card", cards[-1].name)
+		self.assertEqual(last.docstatus, 1, "running the card submits it")
+		last.cancel()
+
+		order.reload()
+		row = next(
+			op for op in order.operations if op.opration_name == last.operation_name
+		)
+		self.assertEqual(
+			cint(row.has_master_job_card), 0,
+			"the card behind it is cancelled, so the operation is free again",
 		)
 
 
