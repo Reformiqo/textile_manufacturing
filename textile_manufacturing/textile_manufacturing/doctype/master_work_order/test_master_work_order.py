@@ -2739,6 +2739,205 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				f"{row.name}: still held by the card it belongs to",
 			)
 
+	def test_deleting_a_draft_card_deletes_the_job_cards_it_holds(self):
+		"""A card that never ran is deleted, not cancelled -- and takes its work along.
+
+		on_cancel releases the Job Cards, but a draft card is never cancelled: there is
+		nothing to cancel, so it is deleted. Nothing let go on the way out, and the two
+		ends then held each other -- the card cannot go while its Job Cards carry its
+		name, and the Job Cards cannot go while the card's detail rows name them.
+		Neither could be got rid of, whichever was reached for.
+
+		They go with it rather than being left open on the Work Order: a Master Job
+		Card is the only thing that drives a Job Card here, so one whose card has been
+		deleted is work nobody can report against."""
+		order = self.make_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		self.assertEqual(card.docstatus, 0, "raised as a draft, never submitted")
+
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+		self.assertTrue(job_cards, "the card holds Job Cards")
+
+		card.delete()
+
+		self.assertFalse(
+			frappe.db.exists("Master Job Card", card.name), "the card is gone"
+		)
+		for name in job_cards:
+			self.assertFalse(
+				frappe.db.exists("Job Card", name),
+				f"{name}: nothing drives it any more, so it goes with the card",
+			)
+
+	def test_deleting_an_open_card_from_the_desk_takes_its_job_cards(self):
+		"""The Delete an operator actually presses, on an Open card.
+
+		Through frappe.client.delete -- the whitelisted method the desk's Delete button
+		calls -- rather than doc.delete(), so this is the button and not a shortcut
+		past it. Same road, same link checks, same on_trash, and it has to come back
+		without an error: this is the state cards were stuck in, Open and holding Job
+		Cards that neither end would let go of."""
+		from frappe.client import delete as desk_delete
+
+		order = self.make_order()
+		card = self.cards_of(order)[0]
+
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", card.name, "docstatus"), 0
+		)
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", card.name, "status"), "Open",
+			"an Open card -- the state the operator deletes from",
+		)
+
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+		self.assertTrue(job_cards, "and it is holding Job Cards")
+
+		desk_delete("Master Job Card", card.name)
+
+		self.assertFalse(
+			frappe.db.exists("Master Job Card", card.name),
+			"the Delete button goes through -- no link error",
+		)
+		for name in job_cards:
+			self.assertFalse(
+				frappe.db.exists("Job Card", name),
+				f"{name}: taken with the card that held it",
+			)
+
+	def test_deleting_a_card_inspected_on_the_floor_is_not_refused(self):
+		"""An inspection taken on a draft card must not trap it.
+
+		make_quality_inspection() is offered on the draft card, so an inspection
+		against a Job Card is an ordinary thing to find on a card that was never
+		submitted. Frappe will not delete a document a submitted one points at, so the
+		delete came back "Cannot delete or cancel because Job Card X is linked with
+		Quality Inspection Y" -- the same trap the card was in before, one step
+		further down."""
+		order = self.make_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		row = next(r for r in card.job_card_detail if r.job_card_number)
+
+		inspection = frappe.get_doc({
+			"doctype": "Quality Inspection",
+			"inspection_type": "In Process",
+			"reference_type": "Job Card",
+			"reference_name": row.job_card_number,
+			"item_code": row.item_code,
+			"sample_size": 1,
+			"inspected_by": frappe.session.user,
+			"company": card.company,
+		})
+		inspection.insert(ignore_mandatory=True)
+		inspection.submit()
+
+		card.delete()
+
+		self.assertFalse(
+			frappe.db.exists("Master Job Card", card.name),
+			"the inspection does not stand in the way of the delete",
+		)
+		self.assertFalse(
+			frappe.db.exists("Job Card", row.job_card_number),
+			"and the Job Card it was taken on goes with the card",
+		)
+		self.assertEqual(
+			frappe.db.get_value("Quality Inspection", inspection.name, "docstatus"), 2,
+			"the inspection is cancelled, the same as it is on the cancel road",
+		)
+
+	def test_deleting_a_cancelled_card_deletes_its_job_cards_too(self):
+		"""The second road, and the one that runs on_trash a second time.
+
+		A cancelled card is often deleted afterwards. on_cancel has already released
+		everything by then, so the delete must find nothing left to let go of and say
+		nothing about it -- and the Job Cards it cancelled go with it."""
+		order = self.run_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[-1].name)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)
+		self.assertTrue(job_cards, "the card ran, so it holds submitted Job Cards")
+
+		card.cancel()
+		for name in job_cards:
+			self.assertEqual(
+				frappe.db.get_value("Job Card", name, "docstatus"), 2,
+				f"{name}: cancelled with the card",
+			)
+
+		frappe.get_doc("Master Job Card", card.name).delete()
+
+		self.assertFalse(
+			frappe.db.exists("Master Job Card", card.name),
+			"the cancelled card deletes without complaint",
+		)
+		for name in job_cards:
+			self.assertFalse(
+				frappe.db.exists("Job Card", name),
+				f"{name}: and goes with it",
+			)
+
+	def test_a_job_card_cannot_be_deleted_while_its_card_holds_it(self):
+		"""The knot, from the other end -- and it is the card that unties it.
+
+		Frappe refuses to delete a Job Card while a live Master Job Card's detail rows
+		name it: "Cannot delete or cancel because Job Card X is linked with Master Job
+		Card Y". Deleting the card is what clears it, and the Job Card goes at the same
+		time."""
+		order = self.make_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		job_card = frappe.get_all(
+			"Job Card", filters={"master_job_card": card.name}, pluck="name"
+		)[0]
+
+		with self.assertRaises(frappe.LinkExistsError):
+			frappe.delete_doc("Job Card", job_card)
+
+		card.delete()
+
+		self.assertFalse(
+			frappe.db.exists("Job Card", job_card),
+			"deleting the card that held it is what takes it",
+		)
+
+	def test_deleting_a_draft_card_clears_its_name_off_the_cards_after_it(self):
+		"""The chain is let go on the delete road as well as the cancel one.
+
+		The cards of an order are raised in a chain, each pointing back at the one
+		before it. A deleted card left its name on the card after it, which then read
+		a ceiling off a card that no longer exists."""
+		order = self.make_order()
+		cards = self.cards_of(order)
+		if len(cards) < 2:
+			self.skipTest("the routing has only one in-house operation to chain")
+
+		first, second = cards[0], cards[1]
+		self.assertEqual(
+			frappe.db.get_value(
+				"Master Job Card", second.name, "previous_opration_master_job_card"
+			),
+			first.name,
+			"the second card follows the first",
+		)
+
+		frappe.get_doc("Master Job Card", first.name).delete()
+
+		self.assertIsNone(
+			frappe.db.get_value(
+				"Master Job Card", second.name, "previous_opration_master_job_card"
+			),
+			"the deleted card's name is off it",
+		)
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", second.name, "docstatus"), 0,
+			"and the card itself still stands -- its own run, not the first's",
+		)
+
 	def test_cancelling_a_card_clears_its_name_off_the_cards_after_it(self):
 		"""The chain has to let go, and it has to let go in before_cancel.
 

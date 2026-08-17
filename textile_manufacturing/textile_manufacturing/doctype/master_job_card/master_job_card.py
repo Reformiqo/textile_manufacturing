@@ -226,6 +226,81 @@ class MasterJobCard(Document):
         self.validate_cancel()
         self.release_back_links()
 
+    def on_trash(self):
+        """Let go of everything on the way out, the same as a cancel does.
+
+        A card that was never submitted is never cancelled -- there is nothing to
+        cancel -- so it is deleted instead, and the releasing that on_cancel does had
+        no counterpart on that road. The two ends then held each other and neither
+        could go: the card cannot be deleted while its Job Cards carry its name, and
+        the Job Cards cannot be deleted while the card's detail rows name them.
+        "Cannot delete or cancel because Job Card X is linked with Master Job Card Y",
+        whichever of the two was reached for.
+
+        Run here rather than in a before_delete, because on_trash is called before
+        Frappe checks the links (delete_doc) -- so by the time it looks, there is
+        nothing left pointing this way.
+
+        The Job Cards go with it rather than being left behind. A Master Job Card is
+        the only thing that drives them here -- nothing else starts, pauses or
+        completes one -- so a Job Card whose card has been deleted is work nobody can
+        report against, cluttering the Work Order and waiting to be claimed by the
+        next card raised for the operation. Deleted, the Work Order is back where it
+        was before this card was raised, and link_job_cards() raises a fresh one for
+        whatever comes next.
+
+        Idempotent, because this runs on the second road as well: a cancelled card is
+        often deleted afterwards, and by then release_job_cards() has already let go
+        of everything. The writes below are then no-ops and the loop has nothing left
+        to delete."""
+        self.release_back_links()
+        self.delete_job_cards()
+
+    def delete_job_cards(self):
+        """Take the Job Cards with the card that held them.
+
+        The rows are unnamed first. This card's Master Job Card Detail and Time Log
+        rows still name the Job Cards while on_trash runs -- they are deleted with the
+        parent a moment later, but Frappe checks the links before that and would
+        refuse: "Cannot delete or cancel because Job Card X is linked with Master Job
+        Card Y". Unnaming them costs nothing, since the rows themselves are about to
+        go.
+
+        What was raised against a Job Card goes first, for the same reason and with
+        the same refusal behind it. An inspection can be taken on a draft card and a
+        transfer posted against its Job Card, and Frappe will not delete a document
+        either of those still points at -- "linked with Quality Inspection ...". They
+        are cancelled here exactly as release_job_cards() cancels them on the other
+        road, so the two ends of the card's life let go of the same things.
+
+        A submitted Job Card is left alone and merely released. Frappe will not delete
+        one, and it is not this card's to cancel on a delete -- a card being deleted
+        was never submitted, so a submitted Job Card under it is work somebody
+        reported by hand and is theirs to deal with."""
+        for doctype in ("Master Job Card Detail", "Master Job Card Time Log"):
+            frappe.db.set_value(
+                doctype,
+                {"parent": self.name, "parenttype": "Master Job Card"},
+                "job_card_number",
+                None,
+                update_modified=False,
+            )
+
+        for name in self.linked_job_cards():
+            frappe.db.set_value(
+                "Job Card", name, "master_job_card", None, update_modified=False
+            )
+
+            if frappe.db.get_value("Job Card", name, "docstatus") == 1:
+                continue
+
+            self.cancel_job_card_stock_entries(name)
+            self.cancel_job_card_inspections(name)
+
+            frappe.delete_doc(
+                "Job Card", name, ignore_permissions=True, ignore_missing=True
+            )
+
     # ------------------------------------------------------------------
     # Cancel
     # ------------------------------------------------------------------
