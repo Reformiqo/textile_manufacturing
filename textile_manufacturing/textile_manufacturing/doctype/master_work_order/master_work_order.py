@@ -31,6 +31,7 @@ class MasterWorkOrder(Document):
 
     def validate(self):
         self.validate_unique_production_plan()
+        self.validate_manufacturing_type_change()
 
         for row in self.items_to_be_manufacture:
             if not row.qty_to_manufacture:
@@ -48,6 +49,12 @@ class MasterWorkOrder(Document):
 
         status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
         self.db_set("status", status)
+
+    def before_update_after_submit(self):
+        # validate() does not run on a submitted doc, and Manufacturing Type is an
+        # allow-on-submit field -- so the check has to be hung here as well, which is
+        # where the change it guards against is actually made.
+        self.validate_manufacturing_type_change()
 
     def on_update_after_submit(self):
         self.propagate_new_operations()
@@ -85,6 +92,62 @@ class MasterWorkOrder(Document):
             ),
             title="Master Work Order Already Exists",
         )
+
+    def validate_manufacturing_type_change(self):
+        """An In-House operation that already has a Master Job Card stays In-House.
+
+        Turning it Out House, or clearing it, would leave the card standing with
+        nothing on the order left to explain it -- and the Work Order Operation row
+        it books its work against is still there, so the card goes on running while
+        the order says the operation is the supplier's. The card is cancelled or
+        deleted first, and the type moves after that."""
+        before = self.get_doc_before_save()
+        if not before:
+            return
+
+        # Read off the saved doc, by row, so that a row whose operation was renamed in
+        # the same save is still matched against the card raised for the old name.
+        was_in_house = {
+            row.name: row.opration_name
+            for row in before.operations
+            if row.manufacturing_type == "In-House" and row.opration_name
+        }
+        if not was_in_house:
+            return
+
+        for row in self.operations:
+            if row.manufacturing_type == "In-House":
+                continue
+
+            operation = was_in_house.get(row.name)
+            if not operation:
+                continue
+
+            cards = frappe.get_all(
+                "Master Job Card",
+                filters={
+                    "master_work_order_number": self.name,
+                    "operation_name": operation,
+                    "docstatus": ["<", 2],
+                },
+                pluck="name",
+            )
+            if not cards:
+                continue
+
+            frappe.throw(
+                ("Row {0}: Operation {1} cannot be moved off In-House -- "
+                 "Master Job Card {2} is raised against it.<br><br>"
+                 "Cancel or delete the card first, then change the Manufacturing Type.").format(
+                    row.idx,
+                    frappe.bold(operation),
+                    ", ".join(
+                        frappe.utils.get_link_to_form("Master Job Card", card)
+                        for card in cards
+                    ),
+                ),
+                title="Master Job Card Exists",
+            )
 
     def validate_linked_docs_cancelled(self):
         pending = []

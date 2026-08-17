@@ -2,7 +2,7 @@
  "actions": [],
  "allow_bulk_edit": 1,
  "allow_rename": 1,
- "creation": "2026-07-30 12:24:25.766232",
+ "creation": "2026-08-14 17:40:22.153673",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
@@ -65,8 +65,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Manufacturing Type",
-   "options": "\nIn-House\nOut House",
-   "read_only_depends_on": "eval:doc.manufacturing_type"
+   "options": "\nIn-House\nOut House"
   },
   {
    "allow_on_submit": 1,
@@ -182,7 +181,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-08-06 16:08:17.264240",
+ "modified": "2026-08-17 13:26:11.573270",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Operation",
