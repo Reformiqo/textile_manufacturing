@@ -1818,18 +1818,60 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 	# ------------------------------------------------------------------
 	# Re-routing an operation
 	# ------------------------------------------------------------------
-	def test_re_routing_a_running_operation_is_no_longer_refused(self):
-		"""The form holds it still now, so the server does not refuse it.
+	def test_re_routing_an_operation_with_a_card_on_it_is_refused(self):
+		"""An In-House operation with a Master Job Card raised stays In-House.
 
-		It used to throw Operation Already Routed out of before_update_after_submit(),
-		which meant a planner who touched the field could not save the order at all --
-		not even the changes that had nothing to do with it."""
+		The card would otherwise be left standing with nothing on the order to explain
+		it, while the Work Order Operation row it books its work against is still
+		there -- so the card goes on running on the floor while the order says the
+		operation is the supplier's."""
 		order = self.make_order()
 		in_house = next(
 			row for row in order.operations if row.manufacturing_type == "In-House"
 		)
 
 		in_house.manufacturing_type = "Out House"
+		with self.assertRaises(frappe.ValidationError):
+			order.save()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Master Work Order Operation", in_house.name, "manufacturing_type"
+			),
+			"In-House",
+			"and the row is left as it was",
+		)
+
+	def test_clearing_the_routing_of_an_operation_with_a_card_is_refused(self):
+		"""Emptying the field strands the card just as surely as re-routing it."""
+		order = self.make_order()
+		in_house = next(
+			row for row in order.operations if row.manufacturing_type == "In-House"
+		)
+
+		in_house.manufacturing_type = ""
+		with self.assertRaises(frappe.ValidationError):
+			order.save()
+
+	def test_re_routing_is_allowed_once_the_card_is_gone(self):
+		"""What the refusal asks for, and it has to be enough to lift it.
+
+		Deleted rather than cancelled: a card raised at submit is still a draft, and
+		a draft is not cancellable -- deleting it is what the planner does."""
+		order = self.make_order()
+		in_house = next(
+			row for row in order.operations if row.manufacturing_type == "In-House"
+		)
+
+		for card in self.cards_of(order):
+			if card.operation_name == in_house.opration_name:
+				frappe.delete_doc("Master Job Card", card.name)
+
+		order.reload()
+		row = next(
+			op for op in order.operations if op.name == in_house.name
+		)
+		row.manufacturing_type = "Out House"
 		order.save()   # no throw
 
 		self.assertEqual(
@@ -1837,7 +1879,23 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				"Master Work Order Operation", in_house.name, "manufacturing_type"
 			),
 			"Out House",
-			"the server takes what it is given and leaves the holding to the form",
+		)
+
+	def test_an_operation_with_no_card_on_it_re_routes_freely(self):
+		"""Out House work has no card, so nothing holds it -- it moves either way."""
+		order = self.make_order()
+		out_house = next(
+			row for row in order.operations if row.manufacturing_type == "Out House"
+		)
+
+		out_house.manufacturing_type = ""
+		order.save()   # no throw
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Master Work Order Operation", out_house.name, "manufacturing_type"
+			),
+			"",
 		)
 
 	def test_routing_an_operation_in_house_after_the_submit_raises_its_card(self):
@@ -3455,3 +3513,77 @@ class TestPendingArithmetic(UnitTestCase):
 			order.final_operation_output(),
 			{"WO-A": 4.0, "WO-B": 5.0},
 		)
+
+
+class TestOperationOwnership(UnitTestCase):
+	"""Which Work Orders an operation reaches -- operation_belongs_to().
+
+	The Work Order Operation row is the only thing a Job Card can be booked against,
+	and the Master Job Card counts its rows off the Work Orders that carry the
+	operation. So this rule settles what a card is raised for, and getting it wrong
+	is visible as a card asking for three items' worth of an operation only one of
+	them runs.
+
+	Nothing here touches the database: bom_operations() is answered from its own
+	cache, which is what the BOMs would have filled in.
+	"""
+
+	def make_order(self, routings, qty=ORDER_QTY):
+		"""An order for one item per BOM, each BOM running the routing given."""
+		order = frappe.new_doc("Master Work Order")
+		for bom in routings:
+			order.append("items_to_be_manufacture", {
+				"bom_no": bom,
+				"qty_to_manufacture": qty,
+			})
+
+		order._bom_operations = {bom: set(ops) for bom, ops in routings.items()}
+		return order
+
+	def test_an_operation_off_one_bom_belongs_to_that_bom_alone(self):
+		"""The bug this is here for.
+
+		An order making three items where one is dyed asks for 10 pieces of Dyeing,
+		which is what the operation row says. Handing the operation to every Work
+		Order made the Master Job Card come out raised for all 30."""
+		order = self.make_order({
+			"BOM-DYED": ["Weaving", "Dyeing"],
+			"BOM-PLAIN": ["Weaving"],
+			"BOM-ALSO-PLAIN": ["Weaving"],
+		})
+
+		self.assertTrue(order.operation_belongs_to("Dyeing", "BOM-DYED"))
+		self.assertFalse(order.operation_belongs_to("Dyeing", "BOM-PLAIN"))
+		self.assertFalse(order.operation_belongs_to("Dyeing", "BOM-ALSO-PLAIN"))
+
+	def test_an_operation_every_bom_carries_belongs_to_all_of_them(self):
+		order = self.make_order({
+			"BOM-DYED": ["Weaving", "Dyeing"],
+			"BOM-PLAIN": ["Weaving"],
+		})
+
+		self.assertTrue(order.operation_belongs_to("Weaving", "BOM-DYED"))
+		self.assertTrue(order.operation_belongs_to("Weaving", "BOM-PLAIN"))
+
+	def test_an_operation_no_bom_carries_belongs_to_every_work_order(self):
+		"""The planner put it on the order, not on a BOM, and the order is every
+		item on it -- there is nothing else to go on."""
+		order = self.make_order({
+			"BOM-DYED": ["Weaving", "Dyeing"],
+			"BOM-PLAIN": ["Weaving"],
+		})
+
+		self.assertTrue(order.operation_belongs_to("Hand Added", "BOM-DYED"))
+		self.assertTrue(order.operation_belongs_to("Hand Added", "BOM-PLAIN"))
+
+	def test_a_bom_that_supplies_no_operations_takes_only_the_hand_added_ones(self):
+		"""with_operations off, so ERPNext puts nothing of the BOM's on the Work
+		Order -- but an operation the planner added still runs there."""
+		order = self.make_order({
+			"BOM-DYED": ["Weaving", "Dyeing"],
+			"BOM-NO-OPERATIONS": [],
+		})
+
+		self.assertFalse(order.operation_belongs_to("Dyeing", "BOM-NO-OPERATIONS"))
+		self.assertFalse(order.operation_belongs_to("Weaving", "BOM-NO-OPERATIONS"))
+		self.assertTrue(order.operation_belongs_to("Hand Added", "BOM-NO-OPERATIONS"))

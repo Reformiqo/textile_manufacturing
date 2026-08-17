@@ -278,7 +278,22 @@ function complete_jobs_dialog(frm) {
         ],
         primary_action_label: __("Complete"),
         primary_action(values) {
-            const selected = values.rows || [];
+            // An empty cell is a nil quantity, not a cell still to be filled in.
+            //
+            // The grid leaves an untouched Float off the row altogether, and
+            // book_reported_qty() only writes Qty to Manufacture back when the
+            // dialog sent one -- so a blank left the row asked for its full
+            // quantity with nothing reported against it, and submit_completed_job_cards()
+            // then refused the Job Card as one nobody had filled in. Typing a 0
+            // by hand worked, because that does send a figure. Sent as an
+            // explicit 0 here, so a blank and a typed 0 are the same thing.
+            const selected = (values.rows || []).map((row) => ({
+                ...row,
+                qty_to_manufacture: flt(row.qty_to_manufacture),
+                completed_qty: flt(row.completed_qty),
+                process_loss_qty: flt(row.process_loss_qty),
+                rejected_qty: flt(row.rejected_qty),
+            }));
             if (!valid_qty_report(frm, selected, true)) return;
 
             for (const row of selected) {

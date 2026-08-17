@@ -210,6 +210,76 @@ class MasterWorkOrder(Document):
 
         self.append_operations_missing_from_work_order(work_order, in_house)
 
+    def bom_operations(self, bom_no):
+        """The operations a Work Order built from this BOM gets from the BOM.
+
+        Which is what ERPNext's set_work_order_operations() reads, and this has to
+        answer the same: with_operations off means the BOM supplies none at all, and
+        use_multi_level_bom pulls in the operations of the whole tree under it, not
+        just the rows on the top BOM."""
+        cache = self._bom_operations_cache()
+        if bom_no in cache:
+            return cache[bom_no]
+
+        cache[bom_no] = operations = set()
+        if not bom_no or not frappe.get_cached_value("BOM", bom_no, "with_operations"):
+            return operations
+
+        bom_nos = (
+            self.bom_tree(bom_no) if self.use_multi_level_bom else {bom_no}
+        )
+        operations.update(frappe.get_all(
+            "BOM Operation",
+            filters={"parent": ["in", list(bom_nos)], "parenttype": "BOM"},
+            pluck="operation",
+        ))
+
+        return operations
+
+    def bom_tree(self, bom_no):
+        """A BOM and every BOM below it, however deep."""
+        seen = set()
+        pending = [bom_no]
+
+        while pending:
+            current = pending.pop()
+            if not current or current in seen:
+                continue
+            seen.add(current)
+
+            pending.extend(frappe.get_all(
+                "BOM Item",
+                filters={"parent": current, "parenttype": "BOM"},
+                pluck="bom_no",
+            ))
+
+        return seen
+
+    def _bom_operations_cache(self):
+        cache = getattr(self, "_bom_operations", None)
+        if cache is None:
+            cache = self._bom_operations = {}
+
+        return cache
+
+    def operation_belongs_to(self, operation, bom_no):
+        """Whether the Work Order built from this BOM runs the operation.
+
+        An operation that came off a BOM belongs to the items whose BOM carries it,
+        and to no others: an order making three items where only one is dyed asks for
+        10 pieces of Dyeing, not 30. An operation the planner added by hand is on no
+        BOM of the order at all, and there is nothing to go on but the order-wide
+        table it was added to -- so it runs on every Work Order of the order."""
+        if operation in self.bom_operations(bom_no):
+            return True
+
+        # On some other item's BOM, so it is that item's operation, not this one's.
+        return not any(
+            operation in self.bom_operations(row.bom_no)
+            for row in self.items_to_be_manufacture
+            if row.bom_no
+        )
+
     def append_operations_missing_from_work_order(self, work_order, operations):
         """Put the operations no BOM supplied onto the Work Order.
 
@@ -218,6 +288,12 @@ class MasterWorkOrder(Document):
         Operation row is the only thing a Job Card can be raised against. It runs on
         every Work Order of the order whatever any one BOM happens to carry, which is
         what the planner asked for by adding it to an order-wide table.
+
+        An operation that did come off a BOM is left to the Work Orders built from
+        that BOM. Handing it to the rest as well was what put an operation asked of
+        one item onto every item's Work Order -- and the Master Job Card, which reads
+        the Work Orders rather than the BOMs, then came out raised for the whole order
+        against a row that says 10.
 
         Sequence Id is carried on from the last row rather than taken off the
         operation: ERPNext's validate_operations_sequence() will only have them run
@@ -229,6 +305,8 @@ class MasterWorkOrder(Document):
 
         for op in operations:
             if op.opration_name in on_work_order:
+                continue
+            if not self.operation_belongs_to(op.opration_name, work_order.bom_no):
                 continue
 
             values = self.work_order_operation_values(op)
@@ -855,22 +933,27 @@ class MasterWorkOrder(Document):
     def add_work_order_operation(self, work_order, operation):
         """Add the operation to a submitted Work Order, and raise its Job Card.
 
-        Whatever the BOM carries. The Work Order Operation row is what a Job Card is
-        booked against, so an operation the planner adds to the order has to reach
-        every Work Order on it -- and the BOM has nothing to say about that, because
-        the operation was added to the order rather than to the BOM.
+        The Work Order Operation row is what a Job Card is booked against, so an
+        operation the planner adds to the order by hand has to reach every Work Order
+        on it -- and the BOM has nothing to say about that, because the operation was
+        added to the order rather than to the BOM.
 
         Skipping the ones no BOM carried, which is what this used to do, left the
         planner with an operation that looked added and was not: a Master Job Card was
         still raised for it, and it failed at the far end on submit with "the
         operation is not on the Work Order, so there is no operation row to book the
-        work against"."""
+        work against".
+
+        Reaching every Work Order regardless of the BOMs, which is what it did next,
+        was the other half of the same mistake -- see operation_belongs_to()."""
         from erpnext.manufacturing.doctype.work_order.work_order import create_job_card
 
         work_order = frappe.get_doc("Work Order", work_order)
         if work_order.docstatus != 1:
             return
         if any(op.operation == operation.opration_name for op in work_order.operations):
+            return
+        if not self.operation_belongs_to(operation.opration_name, work_order.bom_no):
             return
 
         row = work_order.append(
