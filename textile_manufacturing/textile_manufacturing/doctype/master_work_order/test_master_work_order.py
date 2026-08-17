@@ -2771,6 +2771,254 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 				f"{name}: nothing drives it any more, so it goes with the card",
 			)
 
+	# ------------------------------------------------------------------
+	# Completing with one row left entirely pending
+	# ------------------------------------------------------------------
+	def complete_one_row_only(self, card):
+		"""Run the first row and report nothing at all on the rest.
+
+		What the operator does when the operation is run for one item and the other
+		is left for a later pass: 0 completed, 0 lost, the whole quantity pending."""
+		card.start_jobs(employees=[{"employee": self.employee}])
+		card.reload()
+
+		rows, ran, skipped = [], None, []
+		for row in card.job_card_detail:
+			if not row.job_card_number:
+				continue
+			first = ran is None
+			if first:
+				ran = row.work_order_number
+			else:
+				skipped.append(row.work_order_number)
+			rows.append({
+				"job_card_number": row.job_card_number,
+				"qty_to_manufacture": flt(row.qty_to_manufacture) if first else 0,
+				"completed_qty": flt(row.qty_to_manufacture) if first else 0,
+				"process_loss_qty": 0,
+				"rejected_qty": 0,
+			})
+
+		card.complete_jobs(rows=rows)
+		card.reload()
+		return card, ran, skipped
+
+	def test_a_row_reporting_nothing_does_not_stop_the_card_completing(self):
+		"""One item run, the other left whole -- and the card still submits.
+
+		The row that ran nothing has no quantity for ERPNext to submit its Job Card
+		for, and validate_jobs_completed() will not pass a card whose Job Card is
+		unsubmitted. So the operation could not be completed at all until the row that
+		was not run stopped being counted as work this card owed."""
+		order = self.two_item_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		self.assertEqual(len(card.job_card_detail), 2, "two items to choose between")
+
+		held = {
+			row.work_order_number: row.job_card_number
+			for row in card.job_card_detail if row.job_card_number
+		}
+
+		card, ran, skipped = self.complete_one_row_only(card)
+
+		self.assertEqual(card.docstatus, 1, "the card submits")
+		self.assertEqual(card.status, "Completed")
+		self.assertEqual(len(skipped), 1, "one row was left for later")
+
+		self.assertEqual(
+			frappe.db.get_value("Job Card", held[ran], "docstatus"), 1,
+			"the row that ran is submitted, as always",
+		)
+		for work_order in skipped:
+			job_card = held[work_order]
+			self.assertEqual(
+				frappe.db.get_value("Job Card", job_card, "docstatus"), 1,
+				f"{job_card}: asked for nothing, so it is finished with and submitted",
+			)
+			self.assertAlmostEqual(
+				flt(frappe.db.get_value("Job Card", job_card, "for_quantity")), 0.0,
+				places=3, msg=f"{job_card}: at nought",
+			)
+			self.assertAlmostEqual(
+				flt(frappe.db.get_value("Job Card", job_card, "total_completed_qty")),
+				0.0, places=3, msg=f"{job_card}: having made nothing",
+			)
+
+	def test_a_row_asked_for_nothing_adds_nothing_to_the_totals(self):
+		"""A zero row is a zero row -- it must not move a single figure.
+
+		The whole point of reporting it at nought rather than leaving it out: the sums
+		take it in and nothing changes. The card's totals are the run row's, and the
+		operation reads what one item made, not two."""
+		order = self.two_item_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		ordered = {
+			row.work_order_number: flt(row.qty_to_manufacture)
+			for row in card.job_card_detail
+		}
+
+		card, ran, skipped = self.complete_one_row_only(card)
+
+		self.assertAlmostEqual(
+			flt(card.total_qty_to_manufacture), ordered[ran], places=3,
+			msg="the card was asked for what it ran, and no more",
+		)
+		self.assertAlmostEqual(
+			flt(card.total_completed_qty), ordered[ran], places=3,
+			msg="and made it",
+		)
+		self.assertAlmostEqual(
+			flt(card.total_process_loss_qty), 0.0, places=3,
+			msg="the row that ran nothing lost nothing either",
+		)
+
+		row = self.operation_row(order, card.operation_name)
+		self.assertAlmostEqual(
+			flt(row.completed_qty), ordered[ran], places=3,
+			msg="the operation reads what the one item made",
+		)
+		self.assertAlmostEqual(
+			flt(row.process_loss_qty), 0.0, places=3,
+			msg="and nothing is charged as lost",
+		)
+
+	def test_the_untouched_quantity_is_offered_to_a_pending_card(self):
+		"""The whole point: the quantity is not stranded.
+
+		A row that ran nothing but went on claiming its Qty to Manufacture would be
+		subtracted from the operation's balance by claimed_by_operation(), so nothing
+		would ever be offered for it -- the cloth would sit between a card that is not
+		running it and a card that is never raised."""
+		order = self.two_item_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		operation = card.operation_name
+		ordered = {
+			row.work_order_number: flt(row.qty_to_manufacture)
+			for row in card.job_card_detail
+		}
+
+		card, ran, skipped = self.complete_one_row_only(card)
+
+		self.assertAlmostEqual(
+			flt(card.total_qty_to_manufacture), ordered[ran], places=3,
+			msg="the card claims only what it actually ran",
+		)
+
+		order.reload()
+		pending = {
+			row["opration_name"]: row
+			for row in order.pending_master_job_card_operations()
+		}
+		self.assertIn(
+			operation, pending, "the operation is offered a pending card for the rest"
+		)
+
+		created = order.make_pending_master_job_cards(operations=[pending[operation]])
+		self.assertEqual(len(created), 1, "and one is raised")
+
+		next_card = frappe.get_doc("Master Job Card", created[0])
+		carried = {
+			row.work_order_number: flt(row.qty_to_manufacture)
+			for row in next_card.job_card_detail
+		}
+		for work_order in skipped:
+			self.assertAlmostEqual(
+				carried.get(work_order), ordered[work_order], places=3,
+				msg=f"{work_order}: the whole quantity carries to the pending card",
+			)
+
+		self.assertEqual(
+			set(carried), set(skipped),
+			"and only the untouched item -- the one that ran is finished with",
+		)
+		for row in next_card.job_card_detail:
+			self.assertTrue(
+				row.job_card_number,
+				f"{row.work_order_number}: the pending card claims a Job Card for it",
+			)
+
+	def test_a_card_asked_for_nothing_at_all_completes_and_strands_nothing(self):
+		"""Every row at nought, not just one -- the operation is passed over entire.
+
+		Reachable now that a row asked for nothing goes through, so it is worth
+		holding still: the card completes, its Job Cards close at nought, and the
+		whole quantity is still offered to a pending card. Nothing is stranded by a
+		card that ran nothing."""
+		order = self.two_item_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		operation = card.operation_name
+		ordered = {
+			row.work_order_number: flt(row.qty_to_manufacture)
+			for row in card.job_card_detail
+		}
+
+		card.start_jobs(employees=[{"employee": self.employee}])
+		card.reload()
+		card.complete_jobs(rows=[
+			{
+				"job_card_number": row.job_card_number,
+				"qty_to_manufacture": 0,
+				"completed_qty": 0,
+				"process_loss_qty": 0,
+				"rejected_qty": 0,
+			}
+			for row in card.job_card_detail if row.job_card_number
+		])
+		card.reload()
+
+		self.assertEqual(card.docstatus, 1, "the card completes")
+		self.assertAlmostEqual(flt(card.total_qty_to_manufacture), 0.0, places=3)
+
+		order.reload()
+		pending = {
+			row["opration_name"]: row
+			for row in order.pending_master_job_card_operations()
+		}
+		self.assertIn(operation, pending, "the operation is offered again, entire")
+
+		created = order.make_pending_master_job_cards(operations=[pending[operation]])
+		carried = {
+			row.work_order_number: flt(row.qty_to_manufacture)
+			for row in frappe.get_doc("Master Job Card", created[0]).job_card_detail
+		}
+		for work_order, qty in ordered.items():
+			self.assertAlmostEqual(
+				carried.get(work_order), qty, places=3,
+				msg=f"{work_order}: the whole quantity is still to be run",
+			)
+
+	def test_a_row_asked_for_work_that_reports_nothing_still_stops_the_submit(self):
+		"""The guard that was there before, still there.
+
+		Reporting nothing against a row that was asked for something is not an item
+		being passed on -- it is a row nobody filled in, and it has always stopped the
+		submit. Only a row asked for nothing goes through, so this must keep failing:
+		the same figures as the pending case, except that Qty to Manufacture is left
+		standing at what the operation was asked for."""
+		order = self.two_item_order()
+		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
+		card.start_jobs(employees=[{"employee": self.employee}])
+		card.reload()
+
+		rows, first = [], True
+		for row in card.job_card_detail:
+			if not row.job_card_number:
+				continue
+			rows.append({
+				"job_card_number": row.job_card_number,
+				# left as it was -- the operation is still asked for this
+				"qty_to_manufacture": flt(row.qty_to_manufacture),
+				"completed_qty": flt(row.qty_to_manufacture) if first else 0,
+				"process_loss_qty": 0,
+				"rejected_qty": 0,
+			})
+			first = False
+
+		with self.assertRaises(frappe.ValidationError) as caught:
+			card.complete_jobs(rows=rows)
+
+		self.assertIn("No work has been reported", str(caught.exception))
+
 	def test_deleting_an_open_card_from_the_desk_takes_its_job_cards(self):
 		"""The Delete an operator actually presses, on an Open card.
 

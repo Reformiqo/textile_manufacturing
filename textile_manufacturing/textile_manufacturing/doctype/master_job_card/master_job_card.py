@@ -857,6 +857,23 @@ class MasterJobCard(Document):
             job_card.save(ignore_permissions=True)
 
     def submit_completed_job_cards(self):
+        """Submit the Job Cards the operation has finished with.
+
+        A card asked for nothing is finished with: an operation that runs one item and
+        leaves another for a later pass reports the second at zero throughout -- Qty
+        to Manufacture, Completed, Process Loss and Rejected all nothing -- and there
+        is no work left on it to wait for. It is submitted at zero, which ERPNext
+        allows: validate_job_card() asks only that the Work Order is not Stopped and
+        that there are time logs, and validate_transfer_qty() compares transferred
+        against for_quantity, which is nought against nought.
+
+        Submitting it is what lets this card go. validate_jobs_completed() will not
+        pass a card while a Job Card it names is unsubmitted, so a zero row left in
+        draft used to hold the whole operation open with no way to close it.
+
+        Still skipped where the card was asked for something and reported nothing:
+        that is not a row being passed on, it is a row nobody filled in, and it should
+        stop the submit the way it always has."""
         for row in (self.get("job_card_detail") or []):
             if not row.job_card_number:
                 continue
@@ -864,7 +881,7 @@ class MasterJobCard(Document):
             job_card = frappe.get_doc("Job Card", row.job_card_number)
             if job_card.docstatus != 0:
                 continue
-            if flt(job_card.total_completed_qty) <= 0:
+            if flt(job_card.total_completed_qty) <= 0 and flt(job_card.for_quantity) > 0:
                 continue
 
             job_card.submit()
