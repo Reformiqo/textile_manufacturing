@@ -1562,8 +1562,12 @@ class MasterWorkOrder(Document):
             if qty <= 0.001:
                 continue
 
+            # Every column the dialog draws, so the form has nothing to look up and
+            # no rule of its own to apply -- it renders these rows as they come.
             pending.append({
                 "opration_name": op.opration_name,
+                "workstation": op.workstation,
+                "opration_sequence_no": cint(op.opration_sequence_no),
                 "qty": flt(qty, 3),
             })
 
@@ -1595,6 +1599,52 @@ class MasterWorkOrder(Document):
             )
 
         return claimed
+
+    def unclaimed_by_work_order(self, operation):
+        """The same balance the dialog offers for an operation, split by Work Order.
+
+        pending_master_job_card_operations() offers one figure for the operation --
+        Total Qty to Manufacture less what every card of it claims. The new card
+        carries a row per Work Order, so limit_to_pending_qty() needs that same figure
+        per Work Order to hold each row to. Added up, this is exactly what was
+        offered.
+
+        Nothing comes off for process loss or rejects here either, for the reason
+        qty_claimed_by_operation() gives: a card has to account for every piece it was
+        raised for, so the loss is already inside what it claims. What the cloth can
+        no longer supply is taken off later, at completion, where qty_caps() holds the
+        card down.
+
+        The Work Orders are the ones that run the operation --
+        work_orders_running_operation(), which is what MasterJobCard._set_detail_rows()
+        builds the new card's rows from -- so every row the card is about to carry has
+        a figure waiting for it here. Taking the list off the existing cards instead
+        would miss a Work Order that runs the operation and has no row on them, and
+        limit_to_pending_qty() would then drop its row and strand the quantity."""
+        running = self.work_orders_running_operation(operation)
+        if not running:
+            return {}
+
+        claimed = {}
+        for row in self.operation_detail_rows(
+            operation, ["work_order_number", "qty_to_manufacture"]
+        ):
+            if not row.work_order_number:
+                continue
+            claimed[row.work_order_number] = (
+                flt(claimed.get(row.work_order_number)) + flt(row.qty_to_manufacture)
+            )
+
+        unclaimed = {}
+        for item in self.items_to_be_manufacture:
+            if not item.work_order_number or item.work_order_number not in running:
+                continue
+
+            qty = flt(item.qty_to_manufacture) - flt(claimed.get(item.work_order_number))
+            if qty > 0.001:
+                unclaimed[item.work_order_number] = flt(qty, 3)
+
+        return unclaimed
 
     def outstanding_after_loss(self):
         """Work Orders with cloth still to run, per Work Order.
@@ -1662,16 +1712,25 @@ class MasterWorkOrder(Document):
                 title="Nothing Pending",
             )
 
-        by_operation = self.pending_by_operation()
-
         created = []
         previous = None
         for op in self.in_house_operations():
             if op.opration_name not in wanted:
                 continue
 
+            # The balance the dialog offered, split across the Work Orders the card
+            # will carry rows for. Not pending_by_operation(), which is the operation
+            # row's Pending -- ordered less completed less loss. That is the right
+            # figure for the row, which has to show what is still to be DONE, but the
+            # wrong one here: it counts quantity an open card is already seeing
+            # through as free to raise again, and it takes destroyed cloth off a
+            # second time when the card that lost it has already accounted for it. It
+            # is what made the dialog offer 27 and the card come out at 24, and offer
+            # 3 on an operation the create then refused outright.
             previous = self.make_pending_master_job_card(
-                op.opration_name, by_operation.get(op.opration_name) or {}, previous
+                op.opration_name,
+                self.unclaimed_by_work_order(op.opration_name),
+                previous,
             )
             created.append(previous)
 

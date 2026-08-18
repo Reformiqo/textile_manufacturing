@@ -1461,11 +1461,19 @@ class MasterJobCard(Document):
             if not row:
                 continue
 
-            # The dialog's own figure when it sent one -- it is editable there, and
-            # what is reported has to fit inside what the run is being held to.
-            ordered = flt(data.get("qty_to_manufacture")) or flt(row.qty_to_manufacture)
-            if not ordered:
-                continue
+            # The dialog's own figure -- it is editable there, and what is reported
+            # has to fit inside what the run is being held to. Taken as sent, 0 and
+            # all: complete_jobs_dialog() puts a figure on every row it sends, so
+            # there is nothing to fall back to the stored qty for, and falling back
+            # was what threw a typed 0 away and checked the row against the 10 the
+            # operation was raised for.
+            #
+            # A row asked for nothing needs no exemption from either check below. The
+            # cap is never negative -- qty_caps() floors it at 0 -- so nothing can be
+            # over it, and nothing reported cannot be more than nothing asked. Left
+            # to them rather than skipped, so a caller that sends no qty at all still
+            # has to answer for whatever it reports.
+            ordered = flt(data.get("qty_to_manufacture"))
 
             # The same ceiling the dialog applies, checked again here. The dialog is
             # the only thing that was enforcing it, so a stale form or a direct call

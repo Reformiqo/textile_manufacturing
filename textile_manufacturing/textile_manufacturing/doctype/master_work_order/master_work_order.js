@@ -817,28 +817,24 @@ function pending_master_job_card_dialog(frm) {
 
     dialog.fields_dict["operations"].grid.grid_buttons.hide();
 
-    // What the order asked of each operation, less everything its Master Job Cards
-    // accounted for -- made, lost or rejected. Off onload alone, computed fresh
-    // every time the form opens: the operation rows carry a Pending Qty of their
-    // own, but it is only rewritten when a card syncs, and an operation the server
-    // no longer counts as pending must not come back on that stale figure.
-    const pending_qty = {};
+    // Drawn exactly as the server sent them.
+    //
+    // These are the very rows pending_master_job_card_operations() worked out to
+    // decide whether this button is drawn at all, and the same ones
+    // make_pending_master_job_cards() raises the cards from. The form applies no rule
+    // of its own to them -- no filter, no threshold, no rounding, and no second look
+    // at frm.doc.operations. What is offered is what was decided and what gets
+    // raised, because it is all one list.
+    //
+    // Off onload, computed fresh every time the form opens. Nothing is fetched for
+    // it: onload rides along with the document.
     (frm.doc.__onload?.pending_master_job_card_operations || []).forEach((row) => {
-        pending_qty[row.opration_name] = flt(row.qty);
-    });
-
-    (frm.doc.operations || []).forEach((row) => {
-        if (row.manufacturing_type !== "In-House") return;
-
-        const qty = flt(pending_qty[row.opration_name]);
-        if (qty <= 0) return;
-
         dialog.fields_dict.operations.df.data.push({
             __checked: 1,
             opration_name: row.opration_name,
             workstation: row.workstation,
             opration_sequence_no: row.opration_sequence_no,
-            qty: qty,
+            qty: row.qty,
         });
     });
 
