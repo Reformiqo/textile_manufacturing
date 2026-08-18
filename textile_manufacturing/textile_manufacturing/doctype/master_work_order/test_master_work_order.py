@@ -307,15 +307,15 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		return frappe._dict({
 			# add_finish_button(): drawn whenever onload offers any row at all.
 			"finish": bool(onload.get("pending_manufacture_rows")),
-			# add_pending_master_job_card_button(): the flag, and the form also
-			# requires the operations table to be non-empty.
-			"pending_card": bool(onload.get("show_pending_master_job_card_button"))
+			# add_pending_master_job_card_button(): drawn whenever onload offers any
+			# row, and the form also requires the operations table to be non-empty.
+			"pending_card": bool(onload.get("pending_master_job_card_rows"))
 				and bool(doc.operations),
 			# add_status_buttons(): Close and Stop go once the order is finished.
 			"close_stop": doc.status not in ("Completed", "Cancelled", "Closed"),
 			"blocked_reason": onload.get("finish_blocked_reason"),
 			"rows": onload.get("pending_manufacture_rows") or [],
-			"operations": onload.get("pending_master_job_card_operations") or [],
+			"pending_rows": onload.get("pending_master_job_card_rows") or [],
 		})
 
 	def assert_buttons(self, order, finish, pending_card, close_stop=True, when=""):
@@ -655,28 +655,23 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assert_order(order, status="In Process", made=4.0, lost=1.0,
 			when="after the first Finish")
 
-		# Pass two: each operation is offered exactly what its own row says it owes.
-		# This is the partial case working -- unfinished work is pending and
-		# offered, where destroyed cloth is neither.
-		# The formula, per operation:
-		#     Qty to Manufacture on the operation row
-		#       - the Qty to Manufacture of every card raised for that operation
-		#
-		# The first ran 10 of its 20 and its cards claim 10, so 10 is left. The
-		# second's cards claim only the 8 that reached it -- the 2 destroyed at the
-		# first operation are counted against that operation's cards, not this one --
-		# so it is offered 12. What the pieces the cloth can no longer supply comes
-		# off at completion instead, where qty_caps() holds the card down.
-		pending = {row["opration_name"]: flt(row["qty"])
-				   for row in order.pending_master_job_card_operations()}
-		self.assertEqual(pending, {
-			self.operations[0]: 10.0,
-			self.operations[1]: 12.0,
-		})
-
-		created = order.make_pending_master_job_cards(
-			operations=order.pending_master_job_card_operations()
+		# Pass two: each operation and item is offered what the formula at the top
+		# of master_work_order.py works out: 10 ordered, 1 destroyed on the line, 4
+		# made -- 5 apiece, at both operations. Destroyed cloth is offered nowhere:
+		# it is not work. (The old claim-based rule read the second operation's
+		# balance off its own cards alone and offered it 12, counting the 2 pieces
+		# the first operation had destroyed as still to come.)
+		pending = order.pending_master_job_card_rows()
+		self.assertEqual(
+			sorted((row["opration_name"], flt(row["qty"])) for row in pending),
+			sorted(
+				(operation, 5.0)
+				for operation in self.operations
+				for _ in order.items_to_be_manufacture
+			),
 		)
+
+		created = order.make_pending_master_job_cards(rows=pending)
 		self.assertEqual(len(created), len(self.operations))
 
 		# The cards come back in the operations table's order, so they are matched
@@ -753,7 +748,7 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assert_buttons(order, finish=True, pending_card=False,
 			when="half destroyed")
 		self.assertEqual(
-			order.pending_master_job_card_operations(), [],
+			order.pending_master_job_card_rows(), [],
 			"nothing may be offered on a pending card -- the shortfall is destroyed",
 		)
 		self.assertEqual(order.outstanding_after_loss(), {},
@@ -822,11 +817,11 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 3.0)
 
 		# The other 4 are work still to do, not loss: offered on pending cards.
-		pending = order.pending_master_job_card_operations()
+		pending = order.pending_master_job_card_rows()
 		self.assertEqual(
 			[flt(row["qty"]) for row in pending], [4.0] * len(self.operations)
 		)
-		created = order.make_pending_master_job_cards(operations=pending)
+		created = order.make_pending_master_job_cards(rows=pending)
 
 		# Round two: the pending cards themselves run only 2 of their 4.
 		for name in created:
@@ -842,11 +837,11 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 8.0)
 
 		# And 2 are still work to do, on a second round of pending cards.
-		pending = order.pending_master_job_card_operations()
+		pending = order.pending_master_job_card_rows()
 		self.assertEqual(
 			[flt(row["qty"]) for row in pending], [2.0] * len(self.operations)
 		)
-		for name in order.make_pending_master_job_cards(operations=pending):
+		for name in order.make_pending_master_job_cards(rows=pending):
 			self.run_card(name)
 
 		order.reload()
@@ -1051,19 +1046,11 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		)
 
 	def test_a_card_typed_down_to_five_offers_the_other_five(self):
-		"""The formula the Pending Master Job Card button runs on, per operation:
+		"""An open card holds only what it claims, and the rest is offered at once.
 
-		    Qty to Manufacture on the Master Work Order operation row
-		      - the Qty to Manufacture of every Master Job Card raised for it
-
-		Nothing comes off for process loss or rejects. A card's Qty to Manufacture is
-		already what it accounted for -- completed + process loss + rejected -- so
-		they are inside it, and taking them off again would offer the same pieces
-		twice.
-
-		The case itself: an order for 10 whose card is typed down from 10 to 5. The
-		other 5 belong to nobody, so that is what the button offers -- and it offers
-		it straight away, without waiting for the card to be finished."""
+		The held term of the formula: an order for 10 whose card is typed down to 5
+		and has reported nothing holds exactly 5 -- the other 5 belong to nobody, and
+		the button offers them without waiting for the card to be finished."""
 		order = self.make_order()
 		card = frappe.get_doc("Master Job Card", self.cards_of(order)[0].name)
 		operation = card.operation_name
@@ -1080,7 +1067,7 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		offered = {
 			row["opration_name"]: flt(row["qty"])
-			for row in order.pending_master_job_card_operations()
+			for row in order.pending_master_job_card_rows()
 		}
 
 		self.assertEqual(
@@ -1442,9 +1429,9 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertEqual(flt(order.items_to_be_manufacture[0].manufacture_qty), 5.0)
 
 		# The balance of 5 goes onto pending cards, and the first destroys 1 of it.
-		pending = order.pending_master_job_card_operations()
+		pending = order.pending_master_job_card_rows()
 		self.assertEqual([flt(row["qty"]) for row in pending], [5.0] * len(self.operations))
-		created = order.make_pending_master_job_cards(operations=pending)
+		created = order.make_pending_master_job_cards(rows=pending)
 		self.run_card(created[0], loss=1.0)
 
 		# The second pending card may only take what is left: 10 less the 1 destroyed
@@ -2057,8 +2044,8 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		set_operations() works the figure out from the BOMs, and this operation was in
 		none of them -- so without set_operation_qty_to_manufacture() the row sits at
-		nothing and pending_master_job_card_operations(), which reads exactly this
-		field, never offers the operation a card for the balance."""
+		nothing and its Completed, Process Loss and Pending, written against exactly
+		this field, could never add up."""
 		order, operation = self.hand_added_order()
 
 		self.assertEqual(
@@ -2459,9 +2446,8 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 		Process Loss on the *operation* rows is deliberately left out: the two mean
 		different things there. ERPNext's is what that operation itself destroyed;
-		the order's also carries what died at an operation the cloth passes earlier
-		and so never arrived here -- see operation_figures(). Both are right about
-		their own question."""
+		the order's is the share of the order's loss the row has to carry for it to
+		add up -- see operation_figures(). Both are right about their own question."""
 		order.reload()
 
 		work_orders = [
@@ -2944,7 +2930,7 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		"""The whole point: the quantity is not stranded.
 
 		A row that ran nothing but went on claiming its Qty to Manufacture would be
-		subtracted from the operation's balance by claimed_by_operation(), so nothing
+		subtracted from the operation's balance for ever, so nothing
 		would ever be offered for it -- the cloth would sit between a card that is not
 		running it and a card that is never raised."""
 		order = self.two_item_order()
@@ -2963,15 +2949,15 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		)
 
 		order.reload()
-		pending = {
-			row["opration_name"]: row
-			for row in order.pending_master_job_card_operations()
-		}
-		self.assertIn(
-			operation, pending, "the operation is offered a pending card for the rest"
+		pending = [
+			row for row in order.pending_master_job_card_rows()
+			if row["opration_name"] == operation
+		]
+		self.assertTrue(
+			pending, "the operation is offered a pending card for the rest"
 		)
 
-		created = order.make_pending_master_job_cards(operations=[pending[operation]])
+		created = order.make_pending_master_job_cards(rows=pending)
 		self.assertEqual(len(created), 1, "and one is raised")
 
 		next_card = frappe.get_doc("Master Job Card", created[0])
@@ -3028,13 +3014,13 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		self.assertAlmostEqual(flt(card.total_qty_to_manufacture), 0.0, places=3)
 
 		order.reload()
-		pending = {
-			row["opration_name"]: row
-			for row in order.pending_master_job_card_operations()
-		}
-		self.assertIn(operation, pending, "the operation is offered again, entire")
+		pending = [
+			row for row in order.pending_master_job_card_rows()
+			if row["opration_name"] == operation
+		]
+		self.assertTrue(pending, "the operation is offered again, entire")
 
-		created = order.make_pending_master_job_cards(operations=[pending[operation]])
+		created = order.make_pending_master_job_cards(rows=pending)
 		carried = {
 			row.work_order_number: flt(row.qty_to_manufacture)
 			for row in frappe.get_doc("Master Job Card", created[0]).job_card_detail
@@ -3278,19 +3264,31 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 
 
 class TestPendingArithmetic(UnitTestCase):
-	"""Each operation owes the order's qty less what it has itself handled.
+	"""Each operation owes what is left of the order less what it has completed.
 
-	Handled means completed and destroyed together -- a piece it rejected is a
-	piece it worked and will not work again. Nothing else enters: no routing, no
-	sequence, and never what another operation did. The floor runs the operations
-	in whatever order it likes, so one operation's loss is never charged to
-	another.
+		Remaining = Qty to Manufacture - Process Loss Qty, off the item row
+		Pending   = Remaining - what this operation has completed
 
-	Built in memory with only the balances stubbed: the arithmetic is the whole of
+	Process loss is the order's and not the operation's. Cloth destroyed anywhere
+	on the line is gone from all of it -- the operations it has passed will not see
+	it again and the ones that never had it never will -- so the whole line is
+	short by it and every operation is asked for the remainder. Where on the line
+	it died is nobody's question here: no routing, no sequence, and no comparison
+	between one operation's figures and another's.
+
+	The row still has to add up -- completed + loss + pending = the order's qty --
+	so Process Loss is what is left over once Completed and Pending are known. An
+	operation that finished 14 of 20 where the order lost 10 reads 6 lost: the
+	other 4 died after it had put that cloth through.
+
+	Built in memory, with each operation's completed qty and the loss the cards
+	have written onto the item rows given straight: the arithmetic is the whole of
 	the question and needs no site to answer. Folding covers only WO-A throughout,
 	as an operation that not every item runs."""
 
-	def make_order(self, balances):
+	def make_order(self, completed, lost=None):
+		lost = lost or {}
+
 		order = frappe.new_doc("Master Work Order")
 		for name in ("Folding", "Embroidery"):
 			order.append("operations", {
@@ -3301,9 +3299,10 @@ class TestPendingArithmetic(UnitTestCase):
 			order.append("items_to_be_manufacture", {
 				"work_order_number": work_order,
 				"qty_to_manufacture": ORDER_QTY,
+				"process_loss_qty": flt(lost.get(work_order)),
 			})
 
-		order.operation_balances = lambda: balances
+		order.operation_balances = lambda: completed
 		return order
 
 	def figures(self, order):
@@ -3336,30 +3335,29 @@ class TestPendingArithmetic(UnitTestCase):
 		return order.pending_by_operation()
 
 	# ------------------------------------------------------------------
-	# Loss downstream must not be charged to the operation before it
+	# Loss is the order's -- it comes off every operation, not just its own
 	# ------------------------------------------------------------------
-	def test_each_operation_answers_for_itself(self):
+	def test_loss_comes_off_every_operation(self):
 		"""5 run at Embroidery for both items, 1 rejected at Folding, which only
 		WO-A runs.
 
-		Embroidery has run 5 of each item and destroyed none, so it owes 5 on each
-		-- 10 in all -- and Folding's reject does not touch its row. Folding has
-		run 5 of WO-A, 4 out and 1 destroyed, so it owes 5."""
-		order = self.make_order({
-			"Embroidery": {
-				"WO-A": {"completed": 5.0, "loss": 0.0},
-				"WO-B": {"completed": 5.0, "loss": 0.0},
+		The reject is WO-A's loss and it is gone from the line: WO-A is an order
+		for 10 with 9 left to run, so Embroidery owes 4 of it and not 5. WO-B lost
+		nothing and Embroidery still owes 5 of it. Folding has completed 4 of the
+		9, so it owes 5."""
+		order = self.make_order(
+			{
+				"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+				"Folding": {"WO-A": 4.0},
 			},
-			"Folding": {
-				"WO-A": {"completed": 4.0, "loss": 1.0},
-			},
-		})
+			lost={"WO-A": 1.0},
+		)
 
 		figures = self.figures(order)
 
 		self.assertEqual(
 			figures["Embroidery"]["WO-A"],
-			{"completed": 5.0, "loss": 0.0, "pending": 5.0},
+			{"completed": 5.0, "loss": 1.0, "pending": 4.0},
 		)
 		self.assertEqual(
 			figures["Embroidery"]["WO-B"],
@@ -3370,50 +3368,49 @@ class TestPendingArithmetic(UnitTestCase):
 			{"completed": 4.0, "loss": 1.0, "pending": 5.0},
 		)
 
-	def test_cloth_destroyed_before_it_arrives_is_lost_to_this_operation(self):
-		"""Folding reads 4 completed and 1 rejected in both orders below. What
-		differs is Embroidery: it destroyed nothing in the first and half the order
-		in the second, where it has also handled all 10 against Folding's 5.
+	def test_cloth_destroyed_elsewhere_is_lost_to_this_operation(self):
+		"""Folding has completed 4 of WO-A in both orders below. What differs is
+		what the order has lost: 1 in the first and 6 in the second, where
+		Embroidery destroyed 5 on top of Folding's reject.
 
-		Where Embroidery has run the whole order, the cloth reaches it first and
-		its 5 never arrive at Folding -- so for Folding they are lost, not
-		outstanding, and its row reads 6 lost with nothing pending. Where nothing
-		was destroyed anywhere, Folding still owes its 5."""
-		untouched = self.make_order({
-			"Embroidery": {
-				"WO-A": {"completed": 5.0, "loss": 0.0},
-				"WO-B": {"completed": 5.0, "loss": 0.0},
+		Where half the order is gone, only 4 of it are left to run: Folding has
+		completed them and owes nothing, its row reading 6 lost. Where 1 was lost,
+		9 are left and Folding still owes 5."""
+		untouched = self.make_order(
+			{
+				"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+				"Folding": {"WO-A": 4.0},
 			},
-			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
-		})
-		half_destroyed = self.make_order({
-			"Embroidery": {
-				"WO-A": {"completed": 5.0, "loss": 5.0},
-				"WO-B": {"completed": 5.0, "loss": 5.0},
+			lost={"WO-A": 1.0},
+		)
+		half_destroyed = self.make_order(
+			{
+				"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+				"Folding": {"WO-A": 4.0},
 			},
-			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
-		})
+			lost={"WO-A": 6.0, "WO-B": 5.0},
+		)
 
-		# Nothing destroyed anywhere: Folding's own reject only, and 5 still to run.
+		# 1 lost: Folding has 5 of the 9 still to run.
 		self.assertEqual(
 			self.figures(untouched)["Folding"]["WO-A"],
 			{"completed": 4.0, "loss": 1.0, "pending": 5.0},
 		)
-		# Half destroyed ahead of it: 1 rejected here and 5 that never arrive.
+		# 6 lost: the 4 that are left are the 4 it has completed.
 		self.assertEqual(
 			self.figures(half_destroyed)["Folding"]["WO-A"],
 			{"completed": 4.0, "loss": 6.0, "pending": 0.0},
 		)
-		# Embroidery has run all 10 of each item -- 5 out, 5 destroyed -- so it is
-		# through as well.
+		# Embroidery has completed 5 of each item and 5 of each is all that is
+		# left of WO-B, and less than that of WO-A -- so it is through as well.
 		self.assertEqual(self.pending(half_destroyed)["Embroidery"], {})
 
 	def test_part_production_still_shows_as_pending(self):
 		"""Pieces merely unfinished are still coming: 5 of 10 through each
 		operation with nothing destroyed leaves 5 pending on both."""
 		order = self.make_order({
-			"Embroidery": {"WO-A": {"completed": 5.0, "loss": 0.0}},
-			"Folding": {"WO-A": {"completed": 5.0, "loss": 0.0}},
+			"Embroidery": {"WO-A": 5.0},
+			"Folding": {"WO-A": 5.0},
 		})
 
 		self.assertEqual(self.pending(order), {
@@ -3421,17 +3418,19 @@ class TestPendingArithmetic(UnitTestCase):
 			"Embroidery": {"WO-A": 5.0},
 		})
 
-	def test_an_operations_own_loss_is_work_it_has_done(self):
-		"""Destroying a piece is running it: Embroidery put all 10 through, 7 out
-		and 3 destroyed, so 7 and 3 account for its 10 and it owes nothing.
+	def test_destroying_a_piece_is_running_it(self):
+		"""Embroidery put all 10 through, 7 out and 3 destroyed, so 7 completed
+		against 7 remaining leaves it owing nothing.
 
-		Folding has handled only 5, so the cloth reaches it after Embroidery and
-		Embroidery's 3 never arrive. Its row reads 5 completed, 3 lost, 2 still to
-		run -- and 5, 3 and 2 account for the 10."""
-		order = self.make_order({
-			"Embroidery": {"WO-A": {"completed": 7.0, "loss": 3.0}},
-			"Folding": {"WO-A": {"completed": 5.0, "loss": 0.0}},
-		})
+		Folding has completed 5 of the same 7, so it owes 2 -- and 5, 3 and 2
+		account for the 10."""
+		order = self.make_order(
+			{
+				"Embroidery": {"WO-A": 7.0},
+				"Folding": {"WO-A": 5.0},
+			},
+			lost={"WO-A": 3.0},
+		)
 
 		figures = self.figures(order)
 		self.assertEqual(
@@ -3443,6 +3442,21 @@ class TestPendingArithmetic(UnitTestCase):
 			{"completed": 5.0, "loss": 3.0, "pending": 2.0},
 		)
 
+	def test_an_operation_no_card_has_been_raised_for_owes_the_remainder(self):
+		"""Embroidery has run and lost 2 of WO-A; Folding has no card at all.
+
+		It has completed nothing, so it owes the whole of what is left -- 8, not
+		the 10 the order asked for. The 2 will never reach it."""
+		order = self.make_order(
+			{"Embroidery": {"WO-A": 4.0}},
+			lost={"WO-A": 2.0},
+		)
+
+		self.assertEqual(
+			self.figures(order)["Folding"]["WO-A"],
+			{"completed": 0.0, "loss": 2.0, "pending": 8.0},
+		)
+
 	def test_no_operation_order_is_read_anywhere(self):
 		"""The same figures give the same answer whichever way round the operations
 		table lists them, and whichever order the cards were filled in.
@@ -3450,48 +3464,49 @@ class TestPendingArithmetic(UnitTestCase):
 		Nothing holds the floor to a sequence, so nothing here assumes one: the row
 		order of the operations table, which is the union over every item, must
 		never change a quantity."""
-		balances = {
-			"Embroidery": {"WO-A": {"completed": 5.0, "loss": 0.0}},
-			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
+		completed = {
+			"Embroidery": {"WO-A": 5.0},
+			"Folding": {"WO-A": 4.0},
 		}
 
-		listed_one_way = self.make_order(balances)
+		listed_one_way = self.make_order(completed, lost={"WO-A": 1.0})
 
-		listed_the_other = self.make_order(balances)
+		listed_the_other = self.make_order(completed, lost={"WO-A": 1.0})
 		listed_the_other.operations = list(reversed(listed_the_other.operations))
 
 		self.assertEqual(
 			listed_one_way.pending_by_operation(),
 			listed_the_other.pending_by_operation(),
 		)
-		# Each row off its own figures: Embroidery has run 5 of 10 and owes 5;
-		# Folding has run 5 (4 out, 1 destroyed) and owes 5.
+		# 9 left of the order: Embroidery has completed 5 and owes 4, Folding has
+		# completed 4 and owes 5.
 		self.assertEqual(
 			listed_one_way.pending_by_operation(),
-			{"Embroidery": {"WO-A": 5.0}, "Folding": {"WO-A": 5.0}},
+			{"Embroidery": {"WO-A": 4.0}, "Folding": {"WO-A": 5.0}},
 		)
 
 	def test_everything_comes_off_the_master_work_orders_own_tables(self):
-		"""No BOM, no Work Order Operation rows, no routing table is read.
+		"""No BOM and no routing table is read.
 
-		The order's items give the qty, the cards give each operation's completed
-		and destroyed, and those are the whole of the input. This is the guard
-		against a routing lookup creeping back in: the doc here has no Work Orders
-		behind it at all, and the arithmetic still answers."""
-		order = self.make_order({
-			"Embroidery": {
-				"WO-A": {"completed": 5.0, "loss": 0.0},
-				"WO-B": {"completed": 5.0, "loss": 0.0},
+		The item rows give the qty and the loss, the cards give each operation's
+		completed, and those are the whole of the input. The Work Order Operation
+		rows are asked only which items run which operation, and the doc here has
+		no Work Orders behind it at all -- the arithmetic still answers, off the
+		cards."""
+		order = self.make_order(
+			{
+				"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+				"Folding": {"WO-A": 4.0},
 			},
-			"Folding": {"WO-A": {"completed": 4.0, "loss": 1.0}},
-		})
+			lost={"WO-A": 1.0},
+		)
 
 		self.assertFalse(
 			frappe.db.exists("Work Order", "WO-A"),
 			"the fixture's Work Orders are made up -- nothing may look them up",
 		)
 		self.assertEqual(self.pending(order), {
-			"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+			"Embroidery": {"WO-A": 4.0, "WO-B": 5.0},
 			"Folding": {"WO-A": 5.0},
 		})
 
@@ -3499,15 +3514,13 @@ class TestPendingArithmetic(UnitTestCase):
 		"""A piece is only made once every operation that runs it has put it
 		through, so WO-A is held to Folding's 4 and WO-B, which Folding never
 		touches, to Embroidery's 5. No notion of a last operation is needed."""
-		order = self.make_order({
-			"Embroidery": {
-				"WO-A": {"completed": 5.0, "loss": 5.0},
-				"WO-B": {"completed": 5.0, "loss": 5.0},
+		order = self.make_order(
+			{
+				"Embroidery": {"WO-A": 5.0, "WO-B": 5.0},
+				"Folding": {"WO-A": 4.0},
 			},
-			"Folding": {
-				"WO-A": {"completed": 4.0, "loss": 1.0},
-			},
-		})
+			lost={"WO-A": 6.0, "WO-B": 5.0},
+		)
 
 		self.assertEqual(
 			order.final_operation_output(),

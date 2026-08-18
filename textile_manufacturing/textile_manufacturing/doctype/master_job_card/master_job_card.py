@@ -1043,7 +1043,7 @@ class MasterJobCard(Document):
             re-fetching a card that has already claimed its Job Cards leaves them
             stamped and named on no row;
 
-            _apply_previous_operation_ceiling() and limit_to_pending_qty() drop a row
+            _apply_previous_operation_ceiling() and apply_pending_qty() drop a row
             outright where the operation has nothing left to run, stamp and all.
 
         The stamp is the one that decides, so the stamp is what is read. The rows go
@@ -1678,16 +1678,14 @@ class MasterJobCard(Document):
         self.calculate_scrap_items()
         self.calculate_totals()
 
-    def limit_to_pending_qty(self, pending):
-        """Hold this card to a balance, keyed by Work Order.
-
-        fetch_from_master_work_order() reads the quantity the order was raised for, and
-        a pending card is raised for what is left of it -- 5 where 10 were ordered and
-        the first run accounted for 5. A Work Order with nothing left drops out
-        entirely: there is no work there to raise a Job Card against."""
+    def apply_pending_qty(self, qty_by_item):
+        """Hold this card to the picked rows, keyed by item. The balance was worked
+        out in MasterWorkOrder.pending_master_job_card_rows() -- no rule here. An
+        item that was not picked drops out entirely: there is no work there to
+        raise a Job Card against."""
         rows = []
         for row in (self.get("job_card_detail") or []):
-            qty = flt(pending.get(row.work_order_number))
+            qty = flt(qty_by_item.get(row.item_code))
             if qty <= 0:
                 continue
 

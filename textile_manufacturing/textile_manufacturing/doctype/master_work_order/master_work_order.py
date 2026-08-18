@@ -5,17 +5,27 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils import cint, flt
 
+# Pending Master Job Card -- the balance an operation may still be raised for:
+#
+#   pending(operation, item) = item.qty_to_manufacture
+#                            - item.process_loss_qty      (the whole line's loss; rejects are inside it)
+#                            - completed(operation, item)  (every card of the operation, docstatus < 2)
+#                            - held(operation, item)       (open cards: qty_to_manufacture - completed_qty)
+#
+# Rows that come out <= 0 are not offered. Loss is the order's, not the operation's:
+# cloth destroyed anywhere is gone from the whole line, so every operation is asked
+# for the same remainder -- the rule operation_figures() states for the row's own
+# Pending Qty. Summed per operation this is that Pending Qty less what its open
+# cards already hold, so the dialog and the form agree.
+
 
 class MasterWorkOrder(Document):
     def onload(self):
         # Settled here so the form knows whether to offer the button by the time it
         # draws, the way the Work Order settles Create Job Card in its own onload.
-        # The quantities travel with the flag: the operation rows carry a Pending Qty
-        # of their own, but only from the moment a card last reported against them,
-        # and the dialog should not open empty on an order that predates that.
-        pending = self.pending_master_job_card_operations()
-        self.set_onload("show_pending_master_job_card_button", bool(pending))
-        self.set_onload("pending_master_job_card_operations", pending)
+        self.set_onload(
+            "pending_master_job_card_rows", self.pending_master_job_card_rows()
+        )
 
         # The Finish dialog's rows, and the ceiling on each: what the last operation
         # turned out, which the form itself does not carry. The reason travels with
@@ -366,9 +376,10 @@ class MasterWorkOrder(Document):
 
         set_operations() works this out per BOM when the order is built, and an
         operation added by hand was in none of them -- so the row would sit at
-        nothing, and pending_master_job_card_operations(), which reads exactly this
-        field, would never offer it. It runs on every Work Order it reached, so it is
-        asked for the whole of what those were raised for.
+        nothing, and the row's Completed, Process Loss and Pending -- written against
+        exactly this field by update_operation_rows() -- could never add up. It runs
+        on every Work Order it reached, so it is asked for the whole of what those
+        were raised for.
 
         A figure already on the row is left alone: it is either the BOMs' or the
         planner's, and both outrank this."""
@@ -1269,32 +1280,17 @@ class MasterWorkOrder(Document):
             key=lambda op: cint(op.idx),
         )
 
-    def operation_detail_rows(self, operation, fields):
-        cards = frappe.get_all(
-            "Master Job Card",
-            filters={
-                "master_work_order_number": self.name,
-                "operation_name": operation,
-                "docstatus": ["<", 2],
-            },
-            pluck="name",
-        )
-        if not cards:
-            return []
-
-        return frappe.get_all(
-            "Master Job Card Detail",
-            filters={"parent": ["in", cards], "parenttype": "Master Job Card"},
-            fields=fields,
-        )
-
     def operation_balances(self):
-        """What each operation has made and lost, per Work Order.
+        """What each operation has completed, per Work Order.
 
         Summed over every card of the operation -- the one the order was raised with
         and any pending card carrying a balance on from it. Read in one pass over the
         whole order, because onload asks this of every operation each time the form
-        opens."""
+        opens.
+
+        Completed only. What a card destroyed is the order's loss and reaches the
+        figures through the item rows -- see process_loss_by_work_order() -- so it is
+        never counted per operation."""
         cards = frappe.get_all(
             "Master Job Card",
             filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
@@ -1312,22 +1308,69 @@ class MasterWorkOrder(Document):
                 "parent": ["in", list(operation_by_card)],
                 "parenttype": "Master Job Card",
             },
-            fields=[
-                "parent", "work_order_number",
-                "completed_qty", "process_loss_qty", "rejected_qty",
-            ],
+            fields=["parent", "work_order_number", "completed_qty"],
         ):
             operation = operation_by_card.get(row.parent)
             if not operation or not row.work_order_number:
                 continue
 
-            balance = balances.setdefault(operation, {}).setdefault(
-                row.work_order_number, {"completed": 0.0, "loss": 0.0}
+            by_work_order = balances.setdefault(operation, {})
+            by_work_order[row.work_order_number] = (
+                flt(by_work_order.get(row.work_order_number))
+                + flt(row.completed_qty)
             )
-            balance["completed"] += flt(row.completed_qty)
-            balance["loss"] += flt(row.process_loss_qty) + flt(row.rejected_qty)
 
         return balances
+
+    def process_loss_by_work_order(self):
+        """Process Loss Qty off the item rows, per Work Order.
+
+        The order's own figure, written by every card as it finishes -- see
+        MasterJobCard.update_master_work_order_process_loss(). It is what the item
+        lost over the whole line and not at any one operation, and it is the figure
+        every operation is held to.
+
+        Read from the database and only fallen back to the rows in hand: a card
+        reporting writes Process Loss Qty behind whatever document is loaded, so an
+        instance opened before that would still think the cloth was there."""
+        lost = {
+            row.work_order_number: flt(row.process_loss_qty)
+            for row in self.items_to_be_manufacture
+            if row.work_order_number
+        }
+
+        if not self.name:
+            return lost
+
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=["work_order_number", "process_loss_qty"],
+        ):
+            if row.work_order_number:
+                lost[row.work_order_number] = flt(row.process_loss_qty)
+
+        return lost
+
+    def work_orders_by_operation(self):
+        """The Work Orders each operation runs, all of them in one pass.
+
+        work_orders_running_operation() answers this for a single operation and a
+        query each. The figures want it of every operation at once, and onload asks
+        for the figures each time the form opens."""
+        work_orders = self.linked_work_orders()
+        if not work_orders:
+            return {}
+
+        by_operation = {}
+        for row in frappe.get_all(
+            "Work Order Operation",
+            filters={"parent": ["in", work_orders], "parenttype": "Work Order"},
+            fields=["parent", "operation"],
+        ):
+            by_operation.setdefault(row.operation, set()).add(row.parent)
+
+        return by_operation
 
     def operation_figures(self):
         """What each operation row should read, per Work Order.
@@ -1336,68 +1379,74 @@ class MasterWorkOrder(Document):
         Total Qty to Manufacture -- completed + loss + pending = total, on every
         row, always. A row that does not add up is a row nobody can check.
 
+            Remaining    = Qty to Manufacture - Process Loss Qty, off the item row
             Completed    = every card of this operation, added up
-            Process Loss = what never came out of this operation
-            Pending      = Qty to Manufacture - Completed - Process Loss
+            Pending      = Remaining - Completed
+            Process Loss = Qty to Manufacture - Completed - Pending
 
         Qty to Manufacture never moves -- it is what the order asked of this
         operation, and it stays that whatever happens on the floor. The three
         always account for it, so every row adds up.
 
-        Completed and Pending are plain. Process Loss is the one that needs
-        saying: it is not only what this operation destroyed, but everything that
-        stopped it running the whole order. Its own rejects are gone, and so is
-        material destroyed at an operation the cloth passes before reaching here --
-        that never arrives and never will. 5 destroyed ahead of it and 1 rejected
-        here leaves the row 4 completed, 6 lost, nothing pending: 4 and 6 make the
-        10 it was asked for.
+        Process loss is the order's and not the operation's. Cloth destroyed
+        anywhere on the line is gone from all of it: the operations it has already
+        passed will not see it again and the ones ahead of it never will, so the
+        whole line is short by it and each operation is asked for the remainder. 10
+        ordered with 2 destroyed leaves 8 to run at every operation, and one that
+        has completed 5 owes 3 -- wherever on the line the 2 were lost.
 
-        Which operations the cloth passes first is settled off the reported
-        quantities, not off any routing or sequence -- none is declared and the
-        floor keeps to none. What each operation receives it passes on, so an
-        operation that has handled more of the order is one the cloth reaches
-        earlier, and handled is Completed and destroyed together. An operation that
-        has handled the same or less is behind or alongside this one, and what it
-        destroyed had already come through here -- so it is not charged here, and
-        5 run of 10 with 1 rejected further down still leaves 5 to run, not 4.
+        No sequence and no routing enter it, and neither does any reckoning of which
+        operation the cloth reaches first. Which is the point of the rule: the floor
+        declares no sequence and keeps to none, so the loss is taken off the order
+        once, at the item row, and every operation works from the same remainder.
 
-        Added up over every card the operation was run on, the card the order was
-        raised with and each pending card after it, so 4 made on one and 4 on the
-        next reads as 8 and not 4."""
+        Completed is added up over every card the operation was run on, the card the
+        order was raised with and each pending card after it, so 4 made on one and 4
+        on the next reads as 8 and not 4.
+
+        Every Work Order the operation runs gets a figure, not only the ones a card
+        has been raised for: an operation that has run nothing still owes the
+        remainder, and 6 destroyed ahead of it leaves it 4 to run and not 10."""
         ordered = {
             row.work_order_number: flt(row.qty_to_manufacture)
             for row in self.items_to_be_manufacture
             if row.work_order_number
         }
+        lost = self.process_loss_by_work_order()
         balances = self.operation_balances()
+        running = self.work_orders_by_operation()
 
         figures = {}
         for op in self.in_house_operations():
             name = op.opration_name
+            balance_by_work_order = balances.get(name) or {}
+
+            # Which items run this operation, off the Work Order Operation rows --
+            # the same question work_orders_running_operation() answers, because a
+            # Job Card is booked against that row and an item runs an operation
+            # exactly when its Work Order carries it. Falling back to the cards, and
+            # then to the whole order, for an order whose Work Orders are not there
+            # to be asked.
+            work_orders = (
+                running.get(name) or set(balance_by_work_order) or set(ordered)
+            )
+
             figures[name] = {}
+            for work_order in work_orders:
+                qty = flt(ordered.get(work_order))
+                completed = flt(balance_by_work_order.get(work_order))
+                pending = max(qty - flt(lost.get(work_order)) - completed, 0.0)
 
-            for work_order, balance in (balances.get(name) or {}).items():
-                handled = balance["completed"] + balance["loss"]
-
-                # Destroyed where the cloth passes before it gets here.
-                never_arrived = 0.0
-                for other_name, by_work_order in balances.items():
-                    if other_name == name:
-                        continue
-                    other = by_work_order.get(work_order)
-                    if not other:
-                        continue
-                    if other["completed"] + other["loss"] > handled + 0.001:
-                        never_arrived += other["loss"]
-
-                loss = balance["loss"] + never_arrived
                 figures[name][work_order] = {
-                    "completed": balance["completed"],
-                    "loss": loss,
-                    "pending": max(
-                        flt(ordered.get(work_order)) - balance["completed"] - loss,
-                        0.0,
-                    ),
+                    "completed": completed,
+                    # What the row has to carry for it to add up, which is the loss
+                    # as far as this operation is concerned: the order's loss, less
+                    # anything it destroyed after this operation had already put the
+                    # cloth through. 14 completed of 20 with 10 lost over the line
+                    # reads 6 lost here -- the other 4 died further down, on cloth
+                    # this operation had finished with.
+                    "loss": max(qty - completed - pending, 0.0),
+                    "pending": pending,
                 }
 
         return figures
@@ -1446,8 +1495,9 @@ class MasterWorkOrder(Document):
         operation_figures() so they always agree:
 
             Completed    = every card of that operation added up
-            Process Loss = every card of that operation added up
-            Pending      = Qty to Manufacture - Completed - Process Loss
+            Pending      = Qty to Manufacture - the item rows' Process Loss Qty
+                           - Completed
+            Process Loss = Qty to Manufacture - Completed - Pending
 
         Qty to Manufacture is not touched. It is what the order asked of the
         operation and it stays that.
@@ -1474,9 +1524,9 @@ class MasterWorkOrder(Document):
                     ),
                 }
             else:
-                # No live card for this operation: the last one was cancelled, or
-                # none was ever raised. Nothing made, nothing lost, and the whole of
-                # what the order asked of it owed again.
+                # No item runs this operation that the figures could be worked out
+                # for. Nothing made, nothing lost, and the whole of what the order
+                # asked of it owed again.
                 #
                 # Written out rather than summed off an empty reckoning, which reads
                 # Pending as zero and leaves the row not adding up -- 0 completed, 0
@@ -1496,155 +1546,107 @@ class MasterWorkOrder(Document):
                 update_modified=False,
             )
 
-    def pending_master_job_card_operations(self):
-        """The operations a pending Master Job Card could be raised for.
+    def ordered_by_item(self):
+        """Ordered qty and the line's loss per item, fresh from the database --
+        a reporting card writes Process Loss Qty behind the loaded document."""
+        ordered = {}
+        for row in frappe.get_all(
+            "Master Work Order Item",
+            filters={"parent": self.name, "parenttype": "Master Work Order"},
+            fields=["item_code", "qty_to_manufacture", "process_loss_qty"],
+            order_by="idx",
+        ):
+            if not row.item_code:
+                continue
+            item = ordered.setdefault(row.item_code, {
+                "qty": 0.0, "lost": 0.0,
+            })
+            item["qty"] += flt(row.qty_to_manufacture)
+            item["lost"] += flt(row.process_loss_qty)
 
-        What no card has claimed yet. Per operation:
+        return ordered
 
-            Qty to Manufacture on the Master Work Order operation row
-              - the Qty to Manufacture of every Master Job Card raised for it
+    def card_figures_by_item(self):
+        """completed and held per operation and item, off the Master Job Cards.
 
-        Nothing comes off for process loss or rejects. A card's Qty to Manufacture is
-        already what it accounted for -- completed + process loss + rejected -- so
-        those are inside it, and taking them off again would offer the same pieces to
-        be made twice.
+        held counts only cards not yet submitted+Completed -- after that their loss
+        is in the item row's Process Loss Qty and their output in completed. It is
+        claim less completed, not the whole claim: a card finished but still in
+        draft has its completed_qty in the sum already."""
+        cards = {
+            card.name: card
+            for card in frappe.get_all(
+                "Master Job Card",
+                filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
+                fields=["name", "operation_name", "status", "docstatus"],
+            )
+        }
+        if not cards:
+            return {}
 
-        A card being open does not stand in the way. It claims its own quantity and
-        nothing more, so the balance beside it belongs to nobody and can be raised
-        while the first is still being worked -- an order for 10 whose card is typed
-        down to 5 offers the other 5 at once. Two cards never claim the same pieces,
-        because what one takes is subtracted before the next is offered, and the sum
-        of them stays inside the order, which is the same sum ERPNext holds Job Cards
-        to in validate_job_card_qty()."""
+        figures = {card.operation_name: {} for card in cards.values()}
+
+        for row in frappe.get_all(
+            "Master Job Card Detail",
+            filters={"parent": ["in", list(cards)], "parenttype": "Master Job Card"},
+            fields=["parent", "item_code", "qty_to_manufacture", "completed_qty"],
+        ):
+            if not row.item_code:
+                continue
+
+            card = cards[row.parent]
+            figure = figures[card.operation_name].setdefault(
+                row.item_code, {"completed": 0.0, "held": 0.0}
+            )
+            figure["completed"] += flt(row.completed_qty)
+            if not (card.docstatus == 1 and card.status == "Completed"):
+                figure["held"] += flt(row.qty_to_manufacture) - flt(row.completed_qty)
+
+        return figures
+
+    def pending_master_job_card_rows(self):
+        """One row per operation and item still holding cloth to run -- the formula
+        at the top of this file. The dialog draws these rows and
+        make_pending_master_job_cards() raises the cards from them."""
         if self.docstatus != 1 or self.status in ("Completed", "Closed", "Stopped", "Cancelled"):
             return []
 
-        cards = self.master_job_cards()
-        if not cards:
+        # Cards only ever exist for In-House operations.
+        in_house = self.in_house_operations()
+        if not in_house:
             return []
 
-        # An operation left with no card at all -- its only one having been cancelled
-        # -- has to be raised again before anything downstream of it carries on. A
-        # pending card continues an operation that ran; it does not start one.
-        raised = {card.operation_name for card in cards}
-        if any(op.opration_name not in raised for op in self.in_house_operations()):
+        figures = self.card_figures_by_item()
+        if not figures:
             return []
 
-        # Nothing may be raised once there is no cloth left to run. What has come
-        # off the end of the line, plus what every operation destroyed, accounts
-        # for the whole order: the rest is gone, and a card raised for it could
-        # never be finished. The rows should read nothing pending by then anyway --
-        # this is the order-level check behind the per-operation one.
-        if not self.outstanding_after_loss():
+        # An operation whose only card was cancelled must be raised again, not
+        # continued: a pending card continues an operation that ran.
+        if any(op.opration_name not in figures for op in in_house):
             return []
 
-        # What each operation still owes, straight off its own row. Every card writes
-        # its operation's Completed, Process Loss and Pending back there as it
-        # finishes -- see update_operation_rows() -- so the row is the figure, and the
-        # dialog offers exactly what the form shows.
-        #
-        # Read from the database rather than off self.operations: a card reporting
-        # writes the row behind whatever document is in hand, so an instance loaded
-        # before that would offer figures the form has already moved past.
-        ordered = {
-            row.opration_name: flt(row.total_qty_to_manufacture)
-            for row in frappe.get_all(
-                "Master Work Order Operation",
-                filters={"parent": self.name, "parenttype": "Master Work Order"},
-                fields=["opration_name", "total_qty_to_manufacture"],
-            )
-        }
-        claimed = self.qty_claimed_by_operation()
+        ordered = self.ordered_by_item()
 
-        pending = []
-        for op in self.in_house_operations():
-            qty = flt(ordered.get(op.opration_name)) - flt(claimed.get(op.opration_name))
-            if qty <= 0.001:
-                continue
+        rows = []
+        for op in in_house:
+            by_item = figures.get(op.opration_name) or {}
+            for item_code, item in ordered.items():
+                figure = by_item.get(item_code)
+                if not figure:
+                    continue  # no card of this operation carries the item
 
-            # Every column the dialog draws, so the form has nothing to look up and
-            # no rule of its own to apply -- it renders these rows as they come.
-            pending.append({
-                "opration_name": op.opration_name,
-                "workstation": op.workstation,
-                "opration_sequence_no": cint(op.opration_sequence_no),
-                "qty": flt(qty, 3),
-            })
+                qty = item["qty"] - item["lost"] - figure["completed"] - figure["held"]
+                if qty <= 0.001:
+                    continue
 
-        return pending
+                rows.append({
+                    "opration_name": op.opration_name,
+                    "opration_sequence_no": cint(op.opration_sequence_no),
+                    "item_code": item_code,
+                    "qty": flt(qty, 3),
+                })
 
-    def qty_claimed_by_operation(self):
-        """The Qty to Manufacture of every card of an operation, added up.
-
-        The card's own figure, not the order's: a run of 5 off an order for 10 is
-        saved on the card as 5, so what it claims is the 5 it ran and not the 10 it
-        was raised for.
-
-        Nothing is taken off for process loss or rejects. A piece can only be
-        destroyed after it has been taken, so the loss is already inside the qty the
-        card claims -- subtracting it again would hand the same pieces back to be
-        made a second time.
-
-        A card being worked claims its qty just as a finished one does, which is what
-        lets a second be raised beside it for the balance. A cancelled card claims
-        nothing."""
-        claimed = {}
-        for card in frappe.get_all(
-            "Master Job Card",
-            filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
-            fields=["operation_name", "total_qty_to_manufacture"],
-        ):
-            claimed[card.operation_name] = (
-                flt(claimed.get(card.operation_name)) + flt(card.total_qty_to_manufacture)
-            )
-
-        return claimed
-
-    def unclaimed_by_work_order(self, operation):
-        """The same balance the dialog offers for an operation, split by Work Order.
-
-        pending_master_job_card_operations() offers one figure for the operation --
-        Total Qty to Manufacture less what every card of it claims. The new card
-        carries a row per Work Order, so limit_to_pending_qty() needs that same figure
-        per Work Order to hold each row to. Added up, this is exactly what was
-        offered.
-
-        Nothing comes off for process loss or rejects here either, for the reason
-        qty_claimed_by_operation() gives: a card has to account for every piece it was
-        raised for, so the loss is already inside what it claims. What the cloth can
-        no longer supply is taken off later, at completion, where qty_caps() holds the
-        card down.
-
-        The Work Orders are the ones that run the operation --
-        work_orders_running_operation(), which is what MasterJobCard._set_detail_rows()
-        builds the new card's rows from -- so every row the card is about to carry has
-        a figure waiting for it here. Taking the list off the existing cards instead
-        would miss a Work Order that runs the operation and has no row on them, and
-        limit_to_pending_qty() would then drop its row and strand the quantity."""
-        running = self.work_orders_running_operation(operation)
-        if not running:
-            return {}
-
-        claimed = {}
-        for row in self.operation_detail_rows(
-            operation, ["work_order_number", "qty_to_manufacture"]
-        ):
-            if not row.work_order_number:
-                continue
-            claimed[row.work_order_number] = (
-                flt(claimed.get(row.work_order_number)) + flt(row.qty_to_manufacture)
-            )
-
-        unclaimed = {}
-        for item in self.items_to_be_manufacture:
-            if not item.work_order_number or item.work_order_number not in running:
-                continue
-
-            qty = flt(item.qty_to_manufacture) - flt(claimed.get(item.work_order_number))
-            if qty > 0.001:
-                unclaimed[item.work_order_number] = flt(qty, 3)
-
-        return unclaimed
+        return rows
 
     def outstanding_after_loss(self):
         """Work Orders with cloth still to run, per Work Order.
@@ -1680,58 +1682,50 @@ class MasterWorkOrder(Document):
         return outstanding
 
     def show_pending_master_job_card_button(self):
-        """Whether any operation has quantity left to run.
-
-        The same question the Work Order answers in show_create_job_card_button(),
-        asked of the Master Job Cards instead: every operation is through, and the
-        order still asked for more than they accounted for."""
-        return bool(self.pending_master_job_card_operations())
+        """Whether anything is left to run."""
+        return bool(self.pending_master_job_card_rows())
 
     @frappe.whitelist()
-    def make_pending_master_job_cards(self, operations=None):
-        """Raise a Master Job Card for each selected operation's outstanding balance.
+    def make_pending_master_job_cards(self, rows=None):
+        """One card per operation for the rows picked in the dialog, chained in run
+        order. Every qty is re-checked against pending_master_job_card_rows() --
+        the browser's figure is never trusted."""
+        rows = frappe.parse_json(rows) if isinstance(rows, str) else (rows or [])
 
-        Chained in the order the operations run, so the ceiling one operation puts on
-        the next applies to this run exactly as it did to the first."""
-        operations = frappe.parse_json(operations) if isinstance(operations, str) else (operations or [])
+        offered = {
+            (row["opration_name"], row["item_code"]): row["qty"]
+            for row in self.pending_master_job_card_rows()
+        }
 
-        wanted = {row.get("opration_name") for row in operations if row.get("opration_name")}
-        if not wanted:
-            frappe.throw("Select at least one operation.", title="Nothing Selected")
+        wanted = {}
+        stale = []
+        for row in rows:
+            key = (row.get("opration_name"), row.get("item_code"))
+            available = flt(offered.get(key))
+            if available <= 0:
+                stale.append("{0} -- {1}".format(key[0] or "?", key[1] or "?"))
+                continue
+            wanted.setdefault(key[0], {})[key[1]] = min(flt(row.get("qty")) or available, available)
 
-        available = {row["opration_name"] for row in self.pending_master_job_card_operations()}
-
-        unavailable = sorted(name for name in wanted if name not in available)
-        if unavailable:
+        if stale:
             frappe.throw(
-                ("Nothing is left to run through: {0}.<br><br>"
+                ("Nothing is left to run for: {0}.<br><br>"
                  "Refresh the Master Work Order -- work has been reported against it "
                  "since this form was opened.").format(
-                    frappe.bold(", ".join(unavailable))
+                    frappe.bold(", ".join(sorted(stale)))
                 ),
                 title="Nothing Pending",
             )
+        if not wanted:
+            frappe.throw("Select at least one row.", title="Nothing Selected")
 
         created = []
         previous = None
         for op in self.in_house_operations():
-            if op.opration_name not in wanted:
+            qty_by_item = wanted.get(op.opration_name)
+            if not qty_by_item:
                 continue
-
-            # The balance the dialog offered, split across the Work Orders the card
-            # will carry rows for. Not pending_by_operation(), which is the operation
-            # row's Pending -- ordered less completed less loss. That is the right
-            # figure for the row, which has to show what is still to be DONE, but the
-            # wrong one here: it counts quantity an open card is already seeing
-            # through as free to raise again, and it takes destroyed cloth off a
-            # second time when the card that lost it has already accounted for it. It
-            # is what made the dialog offer 27 and the card come out at 24, and offer
-            # 3 on an operation the create then refused outright.
-            previous = self.make_pending_master_job_card(
-                op.opration_name,
-                self.unclaimed_by_work_order(op.opration_name),
-                previous,
-            )
+            previous = self.make_pending_master_job_card(op.opration_name, qty_by_item, previous)
             created.append(previous)
 
         frappe.msgprint(
@@ -1748,16 +1742,16 @@ class MasterWorkOrder(Document):
 
         return created
 
-    def make_pending_master_job_card(self, operation, pending, previous=None):
-        master_job_card = frappe.new_doc("Master Job Card")
-        master_job_card.master_work_order_number = self.name
-        master_job_card.operation_name = operation
-        master_job_card.previous_opration_master_job_card = previous
-        master_job_card.fetch_from_master_work_order()
-        master_job_card.limit_to_pending_qty(pending)
-        master_job_card.insert()
+    def make_pending_master_job_card(self, operation, qty_by_item, previous=None):
+        card = frappe.new_doc("Master Job Card")
+        card.master_work_order_number = self.name
+        card.operation_name = operation
+        card.previous_opration_master_job_card = previous
+        card.fetch_from_master_work_order()
+        card.apply_pending_qty(qty_by_item)
+        card.insert()
 
-        return master_job_card.name
+        return card.name
 
     def final_operation_output(self):
         """What the line has turned all the way out, per Work Order.
@@ -1777,8 +1771,8 @@ class MasterWorkOrder(Document):
 
         output = {}
         for op in in_house:
-            for work_order, balance in (balances.get(op.opration_name) or {}).items():
-                completed = flt(balance["completed"])
+            for work_order, completed in (balances.get(op.opration_name) or {}).items():
+                completed = flt(completed)
                 if work_order in output:
                     output[work_order] = min(output[work_order], completed)
                 else:

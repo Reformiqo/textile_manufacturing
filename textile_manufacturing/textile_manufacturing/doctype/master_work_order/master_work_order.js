@@ -5,6 +5,8 @@ const NO_FURTHER_WORK = ["Completed", "Stopped", "Closed"];
 
 frappe.ui.form.on("Master Work Order", {
     refresh: function(frm){
+        lock_saved_manufacturing_type(frm);
+
         if(frm.doc.docstatus != 1) return;
 
         add_status_buttons(frm);
@@ -49,6 +51,20 @@ frappe.ui.form.on("Master Work Order", {
         update_all_child_warehouses(frm);
     },
 });
+
+
+function lock_saved_manufacturing_type(frm) {
+    (frm.doc.operations || []).forEach((row) => {
+        frm.set_df_property(
+            "operations",
+            "read_only",
+            row.manufacturing_type ? 1 : 0,
+            frm.doc.name,
+            "manufacturing_type",
+            row.name
+        );
+    });
+}
 
 
 function add_create_buttons(frm) {
@@ -742,7 +758,7 @@ function update_all_child_warehouses(frm) {
 function add_pending_master_job_card_button(frm) {
     // Whether anything is left to run is settled in onload, off the Master Job Cards
     // -- the same way the Work Order settles its own Create Job Card button.
-    if (!frm.doc.__onload?.show_pending_master_job_card_button) return;
+    if (!(frm.doc.__onload?.pending_master_job_card_rows || []).length) return;
     if (!(frm.doc.operations || []).length) return;
 
     frm.add_custom_button(__("Pending Master Job Card"), () => {
@@ -752,13 +768,13 @@ function add_pending_master_job_card_button(frm) {
 
 
 function pending_master_job_card_dialog(frm) {
-    const operations_data = [];
+    const rows_data = [];
 
     const dialog = frappe.prompt(
         {
-            fieldname: "operations",
+            fieldname: "rows",
             fieldtype: "Table",
-            label: __("Operations"),
+            label: __("Pending Operations"),
             fields: [
                 {
                     fieldtype: "Link",
@@ -767,14 +783,16 @@ function pending_master_job_card_dialog(frm) {
                     options: "Operation",
                     read_only: 1,
                     in_list_view: 1,
+                    columns: 4,
                 },
                 {
                     fieldtype: "Link",
-                    fieldname: "workstation",
-                    label: __("Workstation"),
-                    options: "Workstation",
+                    fieldname: "item_code",
+                    label: __("Item"),
+                    options: "Item",
                     read_only: 1,
                     in_list_view: 1,
+                    columns: 4,
                 },
                 {
                     fieldtype: "Float",
@@ -782,6 +800,7 @@ function pending_master_job_card_dialog(frm) {
                     label: __("Pending Qty"),
                     read_only: 1,
                     in_list_view: 1,
+                    columns: 2,
                 },
                 {
                     fieldtype: "Int",
@@ -790,15 +809,15 @@ function pending_master_job_card_dialog(frm) {
                     read_only: 1,
                 },
             ],
-            data: operations_data,
+            data: rows_data,
             in_place_edit: true,
-            get_data: () => operations_data,
+            get_data: () => rows_data,
         },
         function () {
-            const selected_rows = dialog.fields_dict["operations"].grid.get_selected_children();
+            const selected_rows = dialog.fields_dict["rows"].grid.get_selected_children();
             if (!selected_rows.length) {
                 frappe.msgprint(
-                    __("Please select atleast one operation to create a Master Job Card")
+                    __("Please select atleast one row to create a Master Job Card")
                 );
                 return;
             }
@@ -806,7 +825,7 @@ function pending_master_job_card_dialog(frm) {
             frm.call({
                 method: "make_pending_master_job_cards",
                 doc: frm.doc,
-                args: { operations: selected_rows },
+                args: { rows: selected_rows },
                 freeze: true,
                 freeze_message: __("Raising Master Job Cards for the pending qty..."),
             }).then(() => frm.reload_doc());
@@ -815,28 +834,17 @@ function pending_master_job_card_dialog(frm) {
         __("Create")
     );
 
-    dialog.fields_dict["operations"].grid.grid_buttons.hide();
+    dialog.fields_dict["rows"].grid.grid_buttons.hide();
 
-    // Drawn exactly as the server sent them.
-    //
-    // These are the very rows pending_master_job_card_operations() worked out to
-    // decide whether this button is drawn at all, and the same ones
-    // make_pending_master_job_cards() raises the cards from. The form applies no rule
-    // of its own to them -- no filter, no threshold, no rounding, and no second look
-    // at frm.doc.operations. What is offered is what was decided and what gets
-    // raised, because it is all one list.
-    //
-    // Off onload, computed fresh every time the form opens. Nothing is fetched for
-    // it: onload rides along with the document.
-    (frm.doc.__onload?.pending_master_job_card_operations || []).forEach((row) => {
-        dialog.fields_dict.operations.df.data.push({
-            __checked: 1,
-            opration_name: row.opration_name,
-            workstation: row.workstation,
-            opration_sequence_no: row.opration_sequence_no,
-            qty: row.qty,
-        });
+    // Drawn exactly as the server sent them: operation by operation, with the items
+    // that still have cloth to run under each. These are the very rows
+    // pending_master_job_card_rows() worked out to decide whether this button is
+    // drawn at all, and the same ones make_pending_master_job_cards() raises the
+    // cards from. The form applies no rule of its own -- no filter, no threshold,
+    // no rounding, and no second look at frm.doc.operations.
+    (frm.doc.__onload?.pending_master_job_card_rows || []).forEach((row) => {
+        dialog.fields_dict.rows.df.data.push({ __checked: 1, ...row });
     });
 
-    dialog.fields_dict.operations.grid.refresh();
+    dialog.fields_dict.rows.grid.refresh();
 }

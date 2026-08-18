@@ -65,8 +65,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Manufacturing Type",
-   "options": "\nIn-House\nOut House",
-   "read_only_depends_on": "eval: doc.manufacturing_type"
+   "options": "\nIn-House\nOut House"
   },
   {
    "allow_on_submit": 1,
