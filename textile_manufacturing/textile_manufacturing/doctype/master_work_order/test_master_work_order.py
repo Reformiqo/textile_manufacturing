@@ -1913,6 +1913,88 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			"routing it in house raises its card",
 		)
 
+	def test_deleting_an_operation_with_a_card_on_it_is_refused(self):
+		"""An operation with a Master Job Card raised against it stays on the order.
+
+		Deleting the row strands the card the way re-routing it does -- left standing
+		with nothing on the order to explain it. The card goes first, and once it is
+		gone the row can be deleted."""
+		order = self.make_order()
+		in_house = next(
+			row for row in order.operations if row.manufacturing_type == "In-House"
+		)
+
+		order.remove(in_house)
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			order.save()
+
+		# Named, so the refusal is this guard's and not some generic one, and so the
+		# planner is told which card is in the way and what to do about it.
+		self.assertIn(in_house.opration_name, str(refusal.exception))
+		self.assertIn("Master Job Card", str(refusal.exception))
+
+		self.assertTrue(
+			frappe.db.exists("Master Work Order Operation", in_house.name),
+			"and the row is left standing",
+		)
+
+		# What the refusal asks for, and it has to be enough to lift it. Deleted
+		# rather than cancelled: a card raised at submit is still a draft.
+		for card in self.cards_of(order):
+			if card.operation_name == in_house.opration_name:
+				frappe.delete_doc("Master Job Card", card.name)
+
+		order.reload()
+		order.remove(
+			next(op for op in order.operations if op.name == in_house.name)
+		)
+		order.save()   # no throw
+
+		self.assertFalse(
+			frappe.db.exists("Master Work Order Operation", in_house.name),
+			"once the card is gone the row goes with it",
+		)
+
+	def test_a_card_cannot_be_started_before_the_order_is(self):
+		"""The order's own Start comes first, and the card's after it.
+
+		Starting a card books time against work whose material has not reached the
+		floor -- the order's Start is the transfer that puts it there. The card is
+		also one of the things that moves the order to In Process, so the refusal has
+		to land before start_operators() saves and does exactly that."""
+		order = self.make_order()
+		card = self.cards_of(order)[0]
+
+		# What an order looks like between its submit and its Start. make_order()
+		# skips the WIP transfer, so it is stamped In Process at submit and the
+		# status has to be put back for the refusal to be reachable at all.
+		frappe.db.set_value("Master Work Order", order.name, "status", "Not Started")
+
+		doc = frappe.get_doc("Master Job Card", card.name)
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			doc.start_jobs(employees=[{"employee": self.employee}])
+
+		self.assertIn("start the Master Work Order", str(refusal.exception))
+		self.assertFalse(
+			frappe.db.get_value("Master Job Card", card.name, "actual_start_date"),
+			"and the card was left unstarted -- the refusal landed before the save",
+		)
+		self.assertEqual(
+			frappe.db.get_value("Master Work Order", order.name, "status"),
+			"Not Started",
+			"and the refused run did not move the order on either",
+		)
+
+		frappe.db.set_value("Master Work Order", order.name, "status", "In Process")
+		doc = frappe.get_doc("Master Job Card", card.name)
+		doc.start_jobs(employees=[{"employee": self.employee}])   # no throw
+
+		self.assertEqual(
+			frappe.db.get_value("Master Job Card", card.name, "status"),
+			"Work In Progress",
+			"once the order is In Process the card starts",
+		)
+
 	# ------------------------------------------------------------------
 	# An operation put on the order by hand -- add_work_order_operation()
 	# ------------------------------------------------------------------

@@ -42,6 +42,7 @@ class MasterWorkOrder(Document):
     def validate(self):
         self.validate_unique_production_plan()
         self.validate_manufacturing_type_change()
+        self.validate_operation_removed_with_card()
 
         for row in self.items_to_be_manufacture:
             if not row.qty_to_manufacture:
@@ -65,6 +66,7 @@ class MasterWorkOrder(Document):
         # allow-on-submit field -- so the check has to be hung here as well, which is
         # where the change it guards against is actually made.
         self.validate_manufacturing_type_change()
+        self.validate_operation_removed_with_card()
 
     def on_update_after_submit(self):
         self.propagate_new_operations()
@@ -151,6 +153,50 @@ class MasterWorkOrder(Document):
                  "Cancel or delete the card first, then change the Manufacturing Type.").format(
                     row.idx,
                     frappe.bold(operation),
+                    ", ".join(
+                        frappe.utils.get_link_to_form("Master Job Card", card)
+                        for card in cards
+                    ),
+                ),
+                title="Master Job Card Exists",
+            )
+
+    def validate_operation_removed_with_card(self):
+        """An operation with a Master Job Card raised against it stays on the order.
+
+        Deleting the row strands the card exactly the way re-routing it does -- it is
+        left standing with nothing on the order to explain it, still booking work
+        against a Work Order Operation row nobody is now asking for. The card goes
+        first, and the row after it."""
+        before = self.get_doc_before_save()
+        if not before:
+            return
+
+        # By row name, so a row whose operation was renamed in the same save is not
+        # mistaken for a deleted one -- the row is still there, only its name changed.
+        current = {row.name for row in self.operations}
+
+        for row in before.operations:
+            if row.name in current or not row.opration_name:
+                continue
+
+            cards = frappe.get_all(
+                "Master Job Card",
+                filters={
+                    "master_work_order_number": self.name,
+                    "operation_name": row.opration_name,
+                    "docstatus": ["<", 2],
+                },
+                pluck="name",
+            )
+            if not cards:
+                continue
+
+            frappe.throw(
+                ("Operation {0} cannot be deleted -- "
+                 "Master Job Card {1} is raised against it.<br><br>"
+                 "Please delete this Master Job Card first.").format(
+                    frappe.bold(row.opration_name),
                     ", ".join(
                         frappe.utils.get_link_to_form("Master Job Card", card)
                         for card in cards

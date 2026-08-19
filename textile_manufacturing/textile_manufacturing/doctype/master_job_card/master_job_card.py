@@ -1337,10 +1337,56 @@ class MasterJobCard(Document):
     # ------------------------------------------------------------------
     @frappe.whitelist()
     def start_jobs(self, employees=None):
+        # First, and before start_operators() -- that saves the card, and the save
+        # runs sync_to_master_work_order(), which moves the order to In Process by
+        # itself. Checked afterwards the guard would be reading the status its own
+        # run had just written, and would never refuse anything.
+        self.validate_master_work_order_started()
+
         self.start_operators(employees)
         self.drive_job_cards("start")
         self.db_set("actual_start_date", now_datetime())
         self.set_card_status("Work In Progress")
+
+    def validate_master_work_order_started(self):
+        """The order has to have been started before the work under it is.
+
+        The order's own Start is the material transfer to WIP, which is what moves it
+        to In Process -- so until it has been pressed the material this operation
+        would consume has not reached the floor, and a card started before it books
+        time against work that cannot yet be done."""
+        if not self.master_work_order_number:
+            return
+
+        order = frappe.db.get_value(
+            "Master Work Order",
+            self.master_work_order_number,
+            ["status", "material_transfer_on"],
+            as_dict=True,
+        )
+        if not order:
+            return
+
+        # An order whose material moves on the Job Card has no Start of its own --
+        # add_start_button() does not offer one -- so the only thing that can move it
+        # to In Process is this card. Held to the rule it would never start at all.
+        if order.material_transfer_on == "Job Card":
+            return
+
+        if order.status == "In Process":
+            return
+
+        frappe.throw(
+            ("Master Work Order {0} is {1}.<br><br>"
+             "Please start the Master Work Order before starting the "
+             "linked Job Card.").format(
+                frappe.utils.get_link_to_form(
+                    "Master Work Order", self.master_work_order_number
+                ),
+                frappe.bold(order.status or "Draft"),
+            ),
+            title="Master Work Order Not In Process",
+        )
 
     def start_operators(self, employees):
         if isinstance(employees, str):
