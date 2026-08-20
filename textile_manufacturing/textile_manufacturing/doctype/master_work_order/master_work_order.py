@@ -2037,7 +2037,7 @@ class MasterWorkOrder(Document):
             # of its own accord, and the wrapper has to follow or it would sit
             # Completed over Work Orders that are not. It is what lets the Finish be
             # cancelled and the run put right afterwards.
-            #
+            ##
             # Closed, Stopped and Cancelled are set by hand and are nobody's to undo
             # here, which is why they are named rather than everything-but-Completed.
             started = any(s not in ("Not Started", "Draft") for s in statuses)
