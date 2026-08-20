@@ -120,14 +120,19 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		plan.submit()
 		return plan.name
 
-	def make_order(self, plan=None, in_house=False):
+	def make_order(self, plan=None, in_house=False, wip_transfer=False):
 		"""A submitted Master Work Order with the first operations run in house.
 
 		in_house routes every operation in house instead, for the tests that need the
 		order to reach Completed off the line alone -- an Out House operation holds it
 		In Process until the goods come back from the supplier. Settled before the
 		submit, so the routing is in hand by the time the cards are raised against
-		it -- an operation's Manufacturing Type is settled once it is set."""
+		it -- an operation's Manufacturing Type is settled once it is set.
+
+		wip_transfer leaves the WIP transfer in place instead of skipping it, for the
+		tests about the order's own Start. It has to be settled before the submit:
+		on_submit() reads the flag to decide whether the order is stamped Not Started
+		or In Process, and skipping the transfer means there is no Start to press."""
 		from textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order import (
 			make_master_work_order,
 		)
@@ -165,8 +170,9 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		order.set_available_qty()
 
 		# Nothing here is about the WIP transfer, so it is skipped -- the operations
-		# and the Finish are what these tests are for.
-		order.skip_material_transfer_to_wip_warehouse = 1
+		# and the Finish are what these tests are for. The tests that are about it
+		# ask for it with wip_transfer.
+		order.skip_material_transfer_to_wip_warehouse = 0 if wip_transfer else 1
 		order.material_transfer_on = "Work Order"
 		order.save()
 		order.submit()
@@ -280,6 +286,42 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 		order.finish_work_orders(rows=rows)
 		order.reload()
 		return offered
+
+	def stock_the_source_warehouse(self, order):
+		"""Receive enough raw material for the order's transfer to go through.
+
+		Read off get_transfer_materials() rather than the required items table, so
+		what is received is exactly what the Stock Entry ERPNext builds will ask
+		for, in the warehouse it will ask for it from. Twice over, because a
+		two-item order transfers once per Work Order out of the same warehouse."""
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+
+		materials = order.get_transfer_materials()
+		if not materials:
+			self.skipTest("the order asks for no raw material to transfer")
+
+		for row in materials:
+			batched, serialised = frappe.db.get_value(
+				"Item", row["item_code"], ["has_batch_no", "has_serial_no"]
+			)
+			if batched or serialised:
+				self.skipTest("raw material is batched or serialised -- needs a bundle")
+
+			make_stock_entry(
+				item_code=row["item_code"],
+				to_warehouse=row["s_warehouse"],
+				qty=flt(row["qty"]) * 2,
+				rate=100,
+				company=self.reference.company,
+			)
+
+	def work_order_statuses(self, order):
+		return frappe.get_all(
+			"Work Order",
+			filters={"name": ["in", order.linked_work_orders()]},
+			fields=["name", "status"],
+			order_by="creation",
+		)
 
 	def operation_row(self, order, operation):
 		return frappe.db.get_value(
@@ -1994,6 +2036,143 @@ class IntegrationTestMasterWorkOrder(UnitTestCase):
 			"Work In Progress",
 			"once the order is In Process the card starts",
 		)
+
+	# ------------------------------------------------------------------
+	# What puts the order In Process -- set_status_from_work_orders()
+	# ------------------------------------------------------------------
+	def test_the_orders_own_start_is_what_puts_it_in_process(self):
+		"""The WIP transfer is the Start, and it is the thing that moves the status.
+
+		start_material_transfer() submits a Material Transfer for Manufacture per
+		Work Order, which is what takes the Work Order off Not Started -- ERPNext
+		reads material_transferred_for_manufacturing in get_status(). The order
+		follows it, through set_status_from_work_orders()."""
+		order = self.make_order(wip_transfer=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Master Work Order", order.name, "status"),
+			"Not Started",
+			"a submitted order that still owes a transfer has not started",
+		)
+		for work_order in self.work_order_statuses(order):
+			self.assertEqual(work_order.status, "Not Started")
+
+		self.stock_the_source_warehouse(order)
+		order.start_material_transfer()
+		order.reload()
+
+		self.assertTrue(
+			frappe.db.exists(
+				"Stock Entry",
+				{
+					"master_work_order": order.name,
+					"purpose": "Material Transfer for Manufacture",
+					"docstatus": 1,
+				},
+			),
+			"the Start submitted its transfer",
+		)
+		for work_order in self.work_order_statuses(order):
+			self.assertEqual(
+				work_order.status, "In Process",
+				"the transfer moved the Work Order",
+			)
+		self.assertEqual(
+			order.status, "In Process",
+			"and the order came with it",
+		)
+		self.assertTrue(order.actual_start_date, "and the Start is stamped")
+
+	def test_raising_a_card_does_not_start_an_order_nobody_has_started(self):
+		"""A Master Job Card being raised is not the order starting.
+
+		Routing an operation in house after the submit runs
+		propagate_new_operations(), which inserts a card -- and every card save ends
+		in sync_to_master_work_order() -> set_status_from_work_orders(). That used to
+		stamp In Process off nothing but the card existing, with no material
+		transferred and no Work Order started, and the Job Card's own Start guard
+		then read the order as started and let the work begin."""
+		order = self.make_order(wip_transfer=True)
+		self.assertEqual(order.status, "Not Started")
+
+		out_house = next(
+			row for row in order.operations if row.manufacturing_type == "Out House"
+		)
+		out_house.manufacturing_type = "In-House"
+		order.save()
+		order.reload()
+
+		# The card really was raised -- otherwise the status held for want of the
+		# path running at all, and the test would pass while proving nothing.
+		self.assertIn(
+			out_house.opration_name,
+			{card.operation_name for card in order.master_job_cards()},
+			"the operation's card was raised",
+		)
+		for work_order in self.work_order_statuses(order):
+			self.assertEqual(
+				work_order.status, "Not Started",
+				"and no Work Order was started by it",
+			)
+		self.assertEqual(
+			order.status, "Not Started",
+			"so the order is still waiting on its own Start",
+		)
+
+		# Which is the whole point of holding it there: the guard on the card's
+		# Start reads this status.
+		card = next(
+			card for card in order.master_job_cards()
+			if card.operation_name == out_house.opration_name
+		)
+		with self.assertRaises(frappe.ValidationError) as refusal:
+			frappe.get_doc("Master Job Card", card.name).start_jobs(
+				employees=[{"employee": self.employee}]
+			)
+		self.assertIn("start the Master Work Order", str(refusal.exception))
+
+	def test_one_started_work_order_is_enough_to_put_the_order_in_process(self):
+		"""In Process the moment any Work Order is, not only once all of them are.
+
+		A two-item order transfers per Work Order, and the floor may well start one
+		item before the other. The order is running as soon as one of them is, so
+		the reading is any() rather than all() -- and the card on the operation both
+		items share has to be startable for the item that did start."""
+		boms = self.find_boms(count=2)
+		if len(boms) < 2:
+			self.skipTest("no two BOMs sharing the same two-operation routing")
+
+		order = self.make_order(
+			plan=self.make_production_plan(boms=boms), wip_transfer=True
+		)
+		self.assertEqual(len(order.items_to_be_manufacture), 2)
+		self.assertEqual(order.status, "Not Started")
+
+		self.stock_the_source_warehouse(order)
+
+		first = order.items_to_be_manufacture[0].work_order_number
+		second = order.items_to_be_manufacture[1].work_order_number
+
+		order.start_material_transfer(
+			rows=[{"work_order_number": first, "qty": ORDER_QTY}]
+		)
+		order.reload()
+
+		statuses = {row.name: row.status for row in self.work_order_statuses(order)}
+		self.assertEqual(statuses[first], "In Process", "the one that was started")
+		self.assertEqual(statuses[second], "Not Started", "the one that was not")
+		self.assertEqual(
+			order.status, "In Process",
+			"one started Work Order is enough for the order to be running",
+		)
+
+		# And it stays there when the second one follows -- nothing here reads the
+		# status back off a half-transferred order and undoes it.
+		order.start_material_transfer(
+			rows=[{"work_order_number": second, "qty": ORDER_QTY}]
+		)
+		order.reload()
+		self.assertEqual(order.status, "In Process")
 
 	# ------------------------------------------------------------------
 	# An operation put on the order by hand -- add_work_order_operation()

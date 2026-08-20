@@ -2040,7 +2040,8 @@ class MasterWorkOrder(Document):
             #
             # Closed, Stopped and Cancelled are set by hand and are nobody's to undo
             # here, which is why they are named rather than everything-but-Completed.
-            self.db_set("status", "In Process")
+            started = any(s not in ("Not Started", "Draft") for s in statuses)
+            self.db_set("status", "In Process" if started else "Not Started")
             self.db_set("actual_end_date", None)
 
         self.update_production_plan()
