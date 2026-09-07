@@ -182,12 +182,11 @@
   {
    "allow_on_submit": 1,
    "columns": 3,
-   "description": "The Master Work Order items this operation line runs. Click the Items column, or Select Items, to tick them off the ones fetched from the Production Plan. Left blank on an operation that appears once, it is filled in from the BOMs that carry it.",
+   "description": "The Master Work Order items this operation line runs, comma separated. Click the Items column, or Select Items, to tick them off the ones fetched from the Production Plan, rather than typing them. Left blank on an operation that appears once, it is filled in from the BOMs that carry it.",
    "fieldname": "item_codes",
    "fieldtype": "Small Text",
    "in_list_view": 1,
-   "label": "Items",
-   "read_only": 1
+   "label": "Items"
   },
   {
    "allow_on_submit": 1,
@@ -201,7 +200,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-09-07 12:30:00.000000",
+ "modified": "2026-09-07 15:30:00.000000",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Operation",
