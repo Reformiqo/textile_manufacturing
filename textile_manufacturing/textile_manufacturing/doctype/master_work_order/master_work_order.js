@@ -56,7 +56,7 @@ frappe.ui.form.on("Master Work Order", {
 
 frappe.ui.form.on("Master Work Order Operation", {
     select_items: function (frm, cdt, cdn) {
-        select_operation_items(frm, locals[cdt][cdn]);
+        open_operation_items_picker(frm, locals[cdt][cdn]);
     },
 });
 
@@ -73,28 +73,86 @@ function split_items(value) {
 }
 
 
-// The Items column is picked, not typed: clicking the cell in the Operations grid
-// opens the same dialog the Select Items button does, so the planner ticks the
-// items off the order's own list instead of spelling item codes out by hand.
+function join_items(item_codes) {
+    return (item_codes || []).join(", ");
+}
+
+
+// The dialog on show, so a second way in cannot stack a second copy of it.
+let operation_items_picker = null;
+
+
+// Two ways to reach the picker -- the Items cell in the Operations grid, and the
+// Select Items button on the row's expanded form -- and both are bound straight
+// to the DOM here, delegated off the table's own wrapper, which outlives every
+// grid and row-form render.
 //
-// The handler is delegated off the table's own wrapper, which outlives every grid
-// render, so it survives a refresh, a new row, and a column the user drags around.
+// The Select Items docfield event is left registered above as a third way in, but
+// it is not relied on: a Button drawn inside a grid row reaches its docfield
+// handler only when the row form has wired the control's doctype and docname
+// through, and when it has not, the click goes nowhere and the button reads as
+// dead. The DOM binding does not care.
 function setup_operation_items_picker(frm) {
     const field = frm.fields_dict.operations;
     if (!field || !field.$wrapper || field.__operation_items_picker) return;
     field.__operation_items_picker = true;
 
-    field.$wrapper.on("click", '.grid-static-col[data-fieldname="item_codes"]', function () {
-        // The heading row carries the same column with no document behind it.
-        const doc = $(this).closest(".grid-row").data("doc");
-        if (!doc || !field.grid.is_editable()) return;
+    const open_from = function (element) {
+        // The grid heading carries the same column with no document behind it.
+        const doc = $(element).closest(".grid-row").data("doc");
+        if (!doc) return;
 
-        select_operation_items(frm, locals[doc.doctype][doc.name] || doc);
+        if (!field.grid.is_editable()) {
+            frappe.msgprint(
+                __("The Operations table is read only, so its items cannot be changed.")
+            );
+            return;
+        }
+
+        open_operation_items_picker(frm, locals[doc.doctype][doc.name] || doc);
+    };
+
+    field.$wrapper.on("click", '.grid-static-col[data-fieldname="item_codes"]', function () {
+        open_from(this);
+    });
+
+    field.$wrapper.on("click", '[data-fieldname="select_items"] button', function () {
+        open_from(this);
     });
 }
 
 
-function select_operation_items(frm, row) {
+function open_operation_items_picker(frm, row) {
+    if (operation_items_picker) return;
+
+    let d = null;
+    try {
+        d = build_operation_items_dialog(frm, row);
+    } catch (error) {
+        // A picker that fails quietly is a button that does nothing. Say what
+        // went wrong and leave the Items column to be typed in the meantime.
+        console.error(error);
+        frappe.msgprint({
+            title: __("Could Not Open The Item Picker"),
+            message: __("Type the items into the Items column instead. {0}", [
+                frappe.utils.escape_html(error.message || String(error)),
+            ]),
+            indicator: "red",
+        });
+        return;
+    }
+
+    if (!d) return;
+
+    operation_items_picker = d;
+    d.onhide = () => {
+        operation_items_picker = null;
+    };
+    d.show();
+}
+
+
+function build_operation_items_dialog(frm, row) {
     // Only the order's own items are on offer: an operation runs cloth this order
     // is making or it runs nothing. They are the Production Plan's items, fetched
     // into Items To be manufacture.
@@ -108,53 +166,32 @@ function select_operation_items(frm, row) {
 
     if (!ordered.length) {
         frappe.msgprint(__("Fetch the items to be manufactured before selecting any."));
-        return;
+        return null;
     }
 
     const selected = new Set(split_items(row.item_codes));
     const taken = items_taken_by_other_lines(frm, row);
-    const on_offer = ordered.filter((item) => !taken.has(item.item_code));
-
-    if (!on_offer.length) {
-        frappe.msgprint({
-            title: __("Nothing Left To Select"),
-            message: __(
-                "Every item of this order is already run by another line of Operation {0}. Free one up there before selecting it here.",
-                [frappe.bold(row.opration_name)]
-            ),
-        });
-        return;
-    }
-
-    const fields = [
-        {
-            fieldtype: "MultiCheck",
-            fieldname: "items",
-            label: __("Items To be manufacture"),
-            columns: 1,
-            select_all: true,
-            // The order the Production Plan lists them in reads better than
-            // alphabetical, and it is the order the Items column is written in.
-            sort_options: false,
-            options: on_offer.map((item) => ({
-                label: item_label(item),
-                value: item.item_code,
-                checked: selected.has(item.item_code),
-            })),
-        },
-    ];
-
-    if (taken.size) {
-        fields.push({
-            fieldtype: "HTML",
-            fieldname: "taken",
-            options: taken_note(taken),
-        });
-    }
 
     const d = new frappe.ui.Dialog({
         title: __("Items run by {0}", [row.opration_name || __("this operation")]),
-        fields: fields,
+        fields: [
+            {
+                fieldtype: "MultiCheck",
+                fieldname: "items",
+                label: __("Items To be manufacture"),
+                columns: 1,
+                select_all: true,
+                // The order the Production Plan lists them in reads better than
+                // alphabetical, and it is the order the Items column is written in.
+                sort_options: false,
+                options: ordered.map((item) => ({
+                    label: item_label(item, taken.get(item.item_code)),
+                    value: item.item_code,
+                    checked: selected.has(item.item_code),
+                    danger: taken.has(item.item_code),
+                })),
+            },
+        ],
         primary_action_label: __("Select"),
         primary_action(values) {
             const picked = values.items || [];
@@ -165,8 +202,18 @@ function select_operation_items(frm, row) {
                 return;
             }
 
-            d.hide();
-            frappe.model.set_value(row.doctype, row.name, "item_codes", picked.join(", "));
+            const moving = picked.filter((item_code) => taken.has(item_code));
+            if (!moving.length) {
+                d.hide();
+                set_operation_items(row, picked);
+                return;
+            }
+
+            frappe.confirm(moving_items_message(moving, taken), () => {
+                d.hide();
+                take_items_off_other_lines(moving, taken);
+                set_operation_items(row, picked);
+            });
         },
         secondary_action_label: __("Clear"),
         secondary_action() {
@@ -174,32 +221,68 @@ function select_operation_items(frm, row) {
             // is filled in from the BOMs that carry it, and one it carries twice
             // asks for the selection again on save.
             d.hide();
-            frappe.model.set_value(row.doctype, row.name, "item_codes", "");
+            set_operation_items(row, []);
         },
     });
 
-    d.show();
+    return d;
 }
 
 
-function item_label(item) {
+function set_operation_items(row, item_codes) {
+    frappe.model.set_value(row.doctype, row.name, "item_codes", join_items(item_codes));
+}
+
+
+// Each line is rewritten once, however many of its items are moving, so no read
+// of item_codes sees a value a write earlier in the same loop has already stale.
+function take_items_off_other_lines(moving, taken) {
+    const by_line = new Map();
+
+    moving.forEach((item_code) => {
+        const op = taken.get(item_code);
+        if (!by_line.has(op.name)) {
+            by_line.set(op.name, { op: op, dropped: new Set() });
+        }
+        by_line.get(op.name).dropped.add(item_code);
+    });
+
+    by_line.forEach(({ op, dropped }) => {
+        set_operation_items(
+            op,
+            split_items(op.item_codes).filter((item_code) => !dropped.has(item_code))
+        );
+    });
+}
+
+
+function item_label(item, taken_by) {
     const name =
         item.item_name && item.item_name !== item.item_code
             ? `${item.item_code}: ${item.item_name}`
             : item.item_code;
-    const label = frappe.utils.escape_html(name);
 
-    if (!item.qty_to_manufacture) return label;
+    let label = frappe.utils.escape_html(name);
 
-    const qty = frappe.format(item.qty_to_manufacture, { fieldtype: "Float" });
-    const uom = frappe.utils.escape_html(item.uom || "");
-    return `${label} <span class="text-muted">(${qty} ${uom})</span>`;
+    if (item.qty_to_manufacture) {
+        const qty = frappe.format(item.qty_to_manufacture, { fieldtype: "Float" });
+        const uom = frappe.utils.escape_html(item.uom || "");
+        label += ` <span class="text-muted">(${qty} ${uom})</span>`;
+    }
+
+    if (taken_by) {
+        label += ` <span class="text-muted">&mdash; ${__("on row {0}", [taken_by.idx])}</span>`;
+    }
+
+    return label;
 }
 
 
-// The same item on two lines of one operation runs it twice over -- in house and
-// at a supplier both -- and the save refuses it. Keep those items off the list
-// rather than letting them be ticked and then rejected.
+// An item goes through an operation once, so the same one on two lines of it is
+// what the save refuses -- it would be raised on the floor and sent to a supplier
+// for the same work. Those items are still offered here, marked and named against
+// the line that holds them, because splitting the items between two lines is the
+// whole reason the second line exists: picking one moves it across.
 function items_taken_by_other_lines(frm, row) {
     const taken = new Map();
 
@@ -216,23 +299,24 @@ function items_taken_by_other_lines(frm, row) {
 }
 
 
-function taken_note(taken) {
-    const lines = [];
-    taken.forEach((op, item_code) => {
-        lines.push(
+function moving_items_message(moving, taken) {
+    const lines = moving.map(
+        (item_code) =>
             `<li>${frappe.utils.escape_html(item_code)} &mdash; ` +
-                __("row {0}, {1}", [
-                    op.idx,
-                    frappe.utils.escape_html(op.manufacturing_type || __("no Manufacturing Type")),
-                ]) +
-                "</li>"
-        );
-    });
+            __("row {0}, {1}", [
+                taken.get(item_code).idx,
+                frappe.utils.escape_html(
+                    taken.get(item_code).manufacturing_type || __("no Manufacturing Type")
+                ),
+            ]) +
+            "</li>"
+    );
 
-    return `<div class="text-muted small">
-        <div>${__("Another line of this operation already runs these, so they are not on offer:")}</div>
-        <ul class="mt-2 mb-0">${lines.join("")}</ul>
-    </div>`;
+    return (
+        `<div>${__("These items run on another line of this operation. Move them here?")}</div>` +
+        `<ul class="mt-2">${lines.join("")}</ul>` +
+        `<div class="text-muted small">${__("They come off that line, so neither runs the item twice.")}</div>`
+    );
 }
 
 
