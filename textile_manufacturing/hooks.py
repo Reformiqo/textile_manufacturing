@@ -160,6 +160,10 @@ doc_events = {
 	},
 	"Purchase Order": {
 		"validate": "textile_manufacturing.override.purchase_order.keep_fg_qty_in_step",
+		# The operation line the order was raised for carries its number, so the
+		# operations table says which work is away at a supplier and on what.
+		"on_submit": "textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
+		"on_cancel": "textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
 	},
 	"Subcontracting Order": {
 		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",

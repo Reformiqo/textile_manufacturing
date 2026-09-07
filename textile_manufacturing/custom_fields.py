@@ -45,7 +45,19 @@ def make_custom_fields():
                 "insert_after": "purchase_order",
                 "read_only": 1,
                 "print_hide": 1,
-            }
+            },
+            {
+                # The row name of the Master Work Order Operation this order is the
+                # supplier's half of, so the trail runs Master Work Order ->
+                # operation -> item -> Subcontracting Order. Data rather than Link:
+                # the operation line is a child row and has no form to link to.
+                "fieldname": "master_work_order_operation",
+                "label": "Master Work Order Operation",
+                "fieldtype": "Data",
+                "insert_after": "master_work_order",
+                "read_only": 1,
+                "print_hide": 1,
+            },
         ],
         "Subcontracting Receipt": [
             {
@@ -67,7 +79,17 @@ def make_custom_fields():
                 "insert_after": "supplier",
                 "read_only": 1,
                 "print_hide": 1,
-            }
+            },
+            {
+                # Which Out House operation line the order was raised for -- see the
+                # Subcontracting Order's field of the same name.
+                "fieldname": "master_work_order_operation",
+                "label": "Master Work Order Operation",
+                "fieldtype": "Data",
+                "insert_after": "master_work_order",
+                "read_only": 1,
+                "print_hide": 1,
+            },
         ],
     }
     create_custom_fields(custom_fields, ignore_validate=True)
