@@ -26,11 +26,7 @@ def split_items(value):
 	if not value:
 		return []
 
-	return [
-		item.strip()
-		for item in str(value).replace("\n", ",").split(",")
-		if item.strip()
-	]
+	return [item.strip() for item in str(value).replace("\n", ",").split(",") if item.strip()]
 
 
 def join_items(items):
