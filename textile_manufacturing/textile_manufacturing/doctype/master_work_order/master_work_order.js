@@ -6,6 +6,7 @@ const NO_FURTHER_WORK = ["Completed", "Stopped", "Closed"];
 frappe.ui.form.on("Master Work Order", {
     refresh: function(frm){
         lock_saved_manufacturing_type(frm);
+        setup_operation_items_picker(frm);
 
         if(frm.doc.docstatus != 1) return;
 
@@ -62,7 +63,7 @@ frappe.ui.form.on("Master Work Order Operation", {
 
 // The Items column, as the server reads it -- see split_items() in
 // master_work_order_operation.py. Kept to the same shape on both sides so a
-// selection typed by hand and one picked here mean the same thing.
+// selection picked here and one an older order was saved with read alike.
 function split_items(value) {
     return (value || "")
         .replace(/\n/g, ",")
@@ -72,9 +73,31 @@ function split_items(value) {
 }
 
 
+// The Items column is picked, not typed: clicking the cell in the Operations grid
+// opens the same dialog the Select Items button does, so the planner ticks the
+// items off the order's own list instead of spelling item codes out by hand.
+//
+// The handler is delegated off the table's own wrapper, which outlives every grid
+// render, so it survives a refresh, a new row, and a column the user drags around.
+function setup_operation_items_picker(frm) {
+    const field = frm.fields_dict.operations;
+    if (!field || !field.$wrapper || field.__operation_items_picker) return;
+    field.__operation_items_picker = true;
+
+    field.$wrapper.on("click", '.grid-static-col[data-fieldname="item_codes"]', function () {
+        // The heading row carries the same column with no document behind it.
+        const doc = $(this).closest(".grid-row").data("doc");
+        if (!doc || !field.grid.is_editable()) return;
+
+        select_operation_items(frm, locals[doc.doctype][doc.name] || doc);
+    });
+}
+
+
 function select_operation_items(frm, row) {
     // Only the order's own items are on offer: an operation runs cloth this order
-    // is making or it runs nothing.
+    // is making or it runs nothing. They are the Production Plan's items, fetched
+    // into Items To be manufacture.
     const ordered = [];
     const seen = new Set();
     (frm.doc.items_to_be_manufacture || []).forEach((item) => {
@@ -89,38 +112,127 @@ function select_operation_items(frm, row) {
     }
 
     const selected = new Set(split_items(row.item_codes));
+    const taken = items_taken_by_other_lines(frm, row);
+    const on_offer = ordered.filter((item) => !taken.has(item.item_code));
+
+    if (!on_offer.length) {
+        frappe.msgprint({
+            title: __("Nothing Left To Select"),
+            message: __(
+                "Every item of this order is already run by another line of Operation {0}. Free one up there before selecting it here.",
+                [frappe.bold(row.opration_name)]
+            ),
+        });
+        return;
+    }
+
+    const fields = [
+        {
+            fieldtype: "MultiCheck",
+            fieldname: "items",
+            label: __("Items To be manufacture"),
+            columns: 1,
+            select_all: true,
+            // The order the Production Plan lists them in reads better than
+            // alphabetical, and it is the order the Items column is written in.
+            sort_options: false,
+            options: on_offer.map((item) => ({
+                label: item_label(item),
+                value: item.item_code,
+                checked: selected.has(item.item_code),
+            })),
+        },
+    ];
+
+    if (taken.size) {
+        fields.push({
+            fieldtype: "HTML",
+            fieldname: "taken",
+            options: taken_note(taken),
+        });
+    }
 
     const d = new frappe.ui.Dialog({
         title: __("Items run by {0}", [row.opration_name || __("this operation")]),
-        fields: [
-            {
-                fieldtype: "MultiCheck",
-                fieldname: "items",
-                label: __("Items"),
-                columns: 1,
-                options: ordered.map((item) => ({
-                    label: item.item_name
-                        ? `${item.item_code}: ${item.item_name}`
-                        : item.item_code,
-                    value: item.item_code,
-                    checked: selected.has(item.item_code),
-                })),
-            },
-        ],
+        fields: fields,
         primary_action_label: __("Select"),
         primary_action(values) {
             const picked = values.items || [];
             if (!picked.length) {
-                frappe.msgprint(__("Select at least one item."));
+                frappe.msgprint(
+                    __("Select at least one item, or Clear to fall back to the default.")
+                );
                 return;
             }
 
             d.hide();
             frappe.model.set_value(row.doctype, row.name, "item_codes", picked.join(", "));
         },
+        secondary_action_label: __("Clear"),
+        secondary_action() {
+            // Blank is a meaning of its own: an operation the order carries once
+            // is filled in from the BOMs that carry it, and one it carries twice
+            // asks for the selection again on save.
+            d.hide();
+            frappe.model.set_value(row.doctype, row.name, "item_codes", "");
+        },
     });
 
     d.show();
+}
+
+
+function item_label(item) {
+    const name =
+        item.item_name && item.item_name !== item.item_code
+            ? `${item.item_code}: ${item.item_name}`
+            : item.item_code;
+    const label = frappe.utils.escape_html(name);
+
+    if (!item.qty_to_manufacture) return label;
+
+    const qty = frappe.format(item.qty_to_manufacture, { fieldtype: "Float" });
+    const uom = frappe.utils.escape_html(item.uom || "");
+    return `${label} <span class="text-muted">(${qty} ${uom})</span>`;
+}
+
+
+// The same item on two lines of one operation runs it twice over -- in house and
+// at a supplier both -- and the save refuses it. Keep those items off the list
+// rather than letting them be ticked and then rejected.
+function items_taken_by_other_lines(frm, row) {
+    const taken = new Map();
+
+    (frm.doc.operations || []).forEach((op) => {
+        if (op.name === row.name) return;
+        if (!op.opration_name || op.opration_name !== row.opration_name) return;
+
+        split_items(op.item_codes).forEach((item_code) => {
+            taken.set(item_code, op);
+        });
+    });
+
+    return taken;
+}
+
+
+function taken_note(taken) {
+    const lines = [];
+    taken.forEach((op, item_code) => {
+        lines.push(
+            `<li>${frappe.utils.escape_html(item_code)} &mdash; ` +
+                __("row {0}, {1}", [
+                    op.idx,
+                    frappe.utils.escape_html(op.manufacturing_type || __("no Manufacturing Type")),
+                ]) +
+                "</li>"
+        );
+    });
+
+    return `<div class="text-muted small">
+        <div>${__("Another line of this operation already runs these, so they are not on offer:")}</div>
+        <ul class="mt-2 mb-0">${lines.join("")}</ul>
+    </div>`;
 }
 
 
