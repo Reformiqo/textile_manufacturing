@@ -53,6 +53,77 @@ frappe.ui.form.on("Master Work Order", {
 });
 
 
+frappe.ui.form.on("Master Work Order Operation", {
+    select_items: function (frm, cdt, cdn) {
+        select_operation_items(frm, locals[cdt][cdn]);
+    },
+});
+
+
+// The Items column, as the server reads it -- see split_items() in
+// master_work_order_operation.py. Kept to the same shape on both sides so a
+// selection typed by hand and one picked here mean the same thing.
+function split_items(value) {
+    return (value || "")
+        .replace(/\n/g, ",")
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item);
+}
+
+
+function select_operation_items(frm, row) {
+    // Only the order's own items are on offer: an operation runs cloth this order
+    // is making or it runs nothing.
+    const ordered = [];
+    const seen = new Set();
+    (frm.doc.items_to_be_manufacture || []).forEach((item) => {
+        if (!item.item_code || seen.has(item.item_code)) return;
+        seen.add(item.item_code);
+        ordered.push(item);
+    });
+
+    if (!ordered.length) {
+        frappe.msgprint(__("Fetch the items to be manufactured before selecting any."));
+        return;
+    }
+
+    const selected = new Set(split_items(row.item_codes));
+
+    const d = new frappe.ui.Dialog({
+        title: __("Items run by {0}", [row.opration_name || __("this operation")]),
+        fields: [
+            {
+                fieldtype: "MultiCheck",
+                fieldname: "items",
+                label: __("Items"),
+                columns: 1,
+                options: ordered.map((item) => ({
+                    label: item.item_name
+                        ? `${item.item_code}: ${item.item_name}`
+                        : item.item_code,
+                    value: item.item_code,
+                    checked: selected.has(item.item_code),
+                })),
+            },
+        ],
+        primary_action_label: __("Select"),
+        primary_action(values) {
+            const picked = values.items || [];
+            if (!picked.length) {
+                frappe.msgprint(__("Select at least one item."));
+                return;
+            }
+
+            d.hide();
+            frappe.model.set_value(row.doctype, row.name, "item_codes", picked.join(", "));
+        },
+    });
+
+    d.show();
+}
+
+
 function lock_saved_manufacturing_type(frm) {
     (frm.doc.operations || []).forEach((row) => {
         frm.set_df_property(
@@ -81,15 +152,16 @@ function add_create_buttons(frm) {
 function add_subcontracted_po_button(frm) {
     // Nothing goes out to a supplier unless an operation is routed Out House, so
     // there is no Purchase Order to raise.
-    const out_house = (frm.doc.operations || []).some(
+    const out_house = (frm.doc.operations || []).filter(
         (row) => row.manufacturing_type === "Out House"
     );
-    if (!out_house) return;
+    if (!out_house.length) return;
 
-    frm.add_custom_button(__("Create Subcontracted PO"), () => {
+    const raise = (operation) => {
         frm.call({
             method: "make_subcontracted_purchase_order",
             doc: frm.doc,
+            args: { operation: operation },
             freeze: true,
             freeze_message: __("Preparing Purchase Order..."),
             callback: function (r) {
@@ -98,7 +170,25 @@ function add_subcontracted_po_button(frm) {
                 frappe.set_route("Form", purchase_order.doctype, purchase_order.name);
             },
         });
-    }, __("Create"));
+    };
+
+    if (out_house.length === 1) {
+        frm.add_custom_button(__("Create Subcontracted PO"), () => {
+            raise(out_house[0].name);
+        }, __("Create"));
+        return;
+    }
+
+    // One order per operation line. Each line has its own supplier and its own
+    // items, and putting them on one Purchase Order would send a supplier cloth
+    // that was never routed to them.
+    out_house.forEach((row) => {
+        frm.add_custom_button(
+            __("Subcontracted PO: {0}", [row.opration_name || __("Operation")]),
+            () => raise(row.name),
+            __("Create"),
+        );
+    });
 }
 
 

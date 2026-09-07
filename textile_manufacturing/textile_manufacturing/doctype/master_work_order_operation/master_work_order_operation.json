@@ -12,6 +12,8 @@
   "workstation",
   "workstation_type",
   "manufacturing_type",
+  "item_codes",
+  "select_items",
   "supplier",
   "service_item",
   "job_work_rate",
@@ -175,13 +177,27 @@
    "fieldtype": "Float",
    "label": "Process Loss Qty",
    "precision": "2"
+  },
+  {
+   "allow_on_submit": 1,
+   "description": "The Master Work Order items this operation line runs, comma separated. Set it with Select Items rather than by hand. Left blank on an operation that appears once, it is filled in from the BOMs that carry it.",
+   "fieldname": "item_codes",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Items"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "select_items",
+   "fieldtype": "Button",
+   "label": "Select Items"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-08-17 14:07:53.426826",
+ "modified": "2026-09-07 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order Operation",

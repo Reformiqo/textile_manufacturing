@@ -5,6 +5,11 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils import cint, flt
 
+from textile_manufacturing.textile_manufacturing.doctype.master_work_order_operation.master_work_order_operation import (
+    join_items,
+    split_items,
+)
+
 # Pending Master Job Card -- the balance an operation may still be raised for:
 #
 #   pending(operation, item) = item.qty_to_manufacture
@@ -17,6 +22,23 @@ from frappe.utils import cint, flt
 # for the same remainder -- the rule operation_figures() states for the row's own
 # Pending Qty. Summed per operation this is that Pending Qty less what its open
 # cards already hold, so the dialog and the form agree.
+
+# An operation line is Operation Name + Manufacturing Type, and it names the items
+# it runs:
+#
+#   Embroidery  In-House   ABC - Sky, ABC - Blue
+#   Embroidery  Out House  ABC - White
+#
+# The pair is unique, so an operation is on the order once per type and no more --
+# which leaves it with one In-House line at most, and that is what keeps a Master
+# Job Card naming its operation and nothing else pointing at exactly one row.
+#
+# The Items column is what the rest of this file works from. It decides which
+# operation rows an item's Work Order is built with, which items a card is raised
+# for, and which items go out on a supplier's Purchase Order. Left blank it falls
+# back to operation_belongs_to() -- an operation off a BOM is that BOM's items', one
+# added by hand is the whole order's -- so an order saved before the column existed
+# behaves exactly as it did.
 
 
 class MasterWorkOrder(Document):
@@ -41,6 +63,9 @@ class MasterWorkOrder(Document):
 
     def validate(self):
         self.validate_unique_production_plan()
+        self.validate_unique_operations()
+        self.set_default_operation_items()
+        self.validate_operation_items()
         self.validate_manufacturing_type_change()
         self.validate_operation_removed_with_card()
 
@@ -62,9 +87,14 @@ class MasterWorkOrder(Document):
         self.db_set("status", status)
 
     def before_update_after_submit(self):
-        # validate() does not run on a submitted doc, and Manufacturing Type is an
-        # allow-on-submit field -- so the check has to be hung here as well, which is
-        # where the change it guards against is actually made.
+        # validate() does not run on a submitted doc, and Manufacturing Type, Items
+        # and the operation table itself are allow-on-submit -- so the checks have to
+        # be hung here as well, which is where the changes they guard against are
+        # actually made.
+        self.validate_unique_operations()
+        self.set_default_operation_items()
+        self.validate_operation_items()
+        self.validate_operation_items_change()
         self.validate_manufacturing_type_change()
         self.validate_operation_removed_with_card()
 
@@ -104,6 +134,278 @@ class MasterWorkOrder(Document):
             ),
             title="Master Work Order Already Exists",
         )
+
+    def validate_unique_operations(self):
+        """Operation Name + Manufacturing Type is what makes an operation line.
+
+        The same operation may be on the order more than once -- Embroidery run in
+        house on two of the colours and sent out to a supplier on the third -- but
+        only once per type. Two In-House Embroidery lines are two rows nothing can
+        tell apart: a Master Job Card names its operation and nothing else, so both
+        rows would claim the one card, and the item selection that decides what that
+        card is raised for would be split across rows with no way to say which of
+        them the floor is working to."""
+        seen = {}
+        for row in self.operations:
+            if not row.opration_name:
+                continue
+
+            key = (row.opration_name, row.manufacturing_type or "")
+            first = seen.setdefault(key, row.idx)
+            if first == row.idx:
+                continue
+
+            frappe.throw(
+                ("Row {0}: Operation {1} is already on row {2} as {3}.<br><br>"
+                 "The same operation may be added again only under a different "
+                 "Manufacturing Type.").format(
+                    row.idx,
+                    frappe.bold(row.opration_name),
+                    first,
+                    frappe.bold(row.manufacturing_type or "no Manufacturing Type"),
+                ),
+                title="Duplicate Operation",
+            )
+
+    # ------------------------------------------------------------------
+    # Item selection -- which of the order's items an operation line runs
+    # ------------------------------------------------------------------
+    def duplicated_operation_names(self):
+        """Operations the order runs under more than one Manufacturing Type."""
+        counted = {}
+        for row in self.operations:
+            if row.opration_name:
+                counted[row.opration_name] = counted.get(row.opration_name, 0) + 1
+
+        return {name for name, count in counted.items() if count > 1}
+
+    def default_items_for_operation(self, operation):
+        """The items an operation line runs where nobody has said which.
+
+        The rule the order has always gone by, now written onto the row:
+        operation_belongs_to() -- an operation that came off a BOM is that BOM's
+        items', and one the planner added by hand is the whole order's."""
+        return [
+            row.item_code
+            for row in self.items_to_be_manufacture
+            if row.item_code
+            and self.operation_belongs_to(operation.opration_name, row.bom_no)
+        ]
+
+    def set_default_operation_items(self):
+        """Fill in the Items of a line that names none and needs no choice made.
+
+        An operation on the order once runs what it has always run, so its row is
+        filled in from the BOMs and the order goes on behaving exactly as it did
+        before the column existed -- including every order saved before it.
+
+        An operation on the order more than once is left blank on purpose. There is
+        no default to reach for: the whole point of the second line is that the items
+        are split between them, and filling both in from the BOMs would put every
+        item through the operation twice. validate_operation_items() asks for the
+        selection instead of guessing at one."""
+        duplicated = self.duplicated_operation_names()
+
+        for op in self.operations:
+            if not op.opration_name or split_items(op.item_codes):
+                continue
+            if op.opration_name in duplicated:
+                continue
+
+            op.item_codes = join_items(self.default_items_for_operation(op))
+
+    def validate_operation_items(self):
+        """Every operation line names items of this order, once each.
+
+        Three ways a selection is wrong, and each of them ends with work raised for
+        cloth that is not there:
+
+            an item the order is not making at all;
+            the same item twice on one line, which asks for it twice over;
+            the same item on two lines of one operation, which runs it both in
+            house and at a supplier.
+        """
+        ordered = [row.item_code for row in self.items_to_be_manufacture if row.item_code]
+        duplicated = self.duplicated_operation_names()
+        by_operation = {}
+
+        for op in self.operations:
+            if not op.opration_name:
+                continue
+
+            selected = split_items(op.item_codes)
+            if not selected and op.opration_name in duplicated:
+                frappe.throw(
+                    ("Row {0}: select the items Operation {1} runs.<br><br>"
+                     "The operation is on this order under more than one "
+                     "Manufacturing Type, so the items have to be split between the "
+                     "lines by hand -- there is no default that would not put every "
+                     "item through it twice.").format(
+                        op.idx, frappe.bold(op.opration_name)
+                    ),
+                    title="No Items Selected",
+                )
+            if not selected:
+                frappe.throw(
+                    ("Row {0}: Operation {1} runs none of this order's items.<br><br>"
+                     "Add the items to be manufactured, then select the ones it "
+                     "runs.").format(op.idx, frappe.bold(op.opration_name)),
+                    title="No Items Selected",
+                )
+
+            seen = set()
+            for item_code in selected:
+                if item_code not in ordered:
+                    frappe.throw(
+                        ("Row {0}: {1} is not one of the items this order is "
+                         "making, so Operation {2} cannot be run on it.").format(
+                            op.idx, frappe.bold(item_code),
+                            frappe.bold(op.opration_name),
+                        ),
+                        title="Item Not On This Order",
+                    )
+                if item_code in seen:
+                    frappe.throw(
+                        ("Row {0}: {1} is selected twice against Operation {2}.").format(
+                            op.idx, frappe.bold(item_code),
+                            frappe.bold(op.opration_name),
+                        ),
+                        title="Duplicate Item",
+                    )
+                seen.add(item_code)
+
+            claimed = by_operation.setdefault(op.opration_name, {})
+            for item_code in seen:
+                other = claimed.get(item_code)
+                if other:
+                    frappe.throw(
+                        ("Row {0}: {1} is already run by Operation {2} on row {3}."
+                         "<br><br>An item goes through an operation once -- pick "
+                         "whether it is run in house or sent out, not both.").format(
+                            op.idx, frappe.bold(item_code),
+                            frappe.bold(op.opration_name), other,
+                        ),
+                        title="Item Already On This Operation",
+                    )
+                claimed[item_code] = op.idx
+
+    def validate_operation_items_change(self):
+        """An In-House operation already raised for keeps the items it was raised for.
+
+        The Work Orders were built to run exactly the items the line named, and the
+        Master Job Card was raised off the same list. Re-cutting it afterwards leaves
+        the card holding Job Cards for items the order now says the operation never
+        ran, and an item newly added to the line with no Work Order Operation row for
+        its work to be booked against.
+
+        An operation added after the submit is not caught by this: nothing has been
+        raised for it yet, and propagate_new_operations() reads the row as it stands
+        when it raises the card."""
+        before = self.get_doc_before_save()
+        if not before:
+            return
+
+        was = {row.name: row for row in before.operations}
+
+        for row in self.operations:
+            if row.manufacturing_type != "In-House" or not row.opration_name:
+                continue
+
+            previous = was.get(row.name)
+            if not previous:
+                continue
+
+            # The effective selection on each side, not the stored text: a row saved
+            # before the Items column existed carries nothing, and
+            # set_default_operation_items() has just written its default down. That
+            # is the same selection the order has always run -- writing it out is not
+            # a re-cut, and refusing it would leave every order raised before this
+            # column unable to be saved at all.
+            #
+            # As sets, because the order the items were picked in is nobody's
+            # business but the dialog's.
+            if self.effective_items(previous) == self.effective_items(row):
+                continue
+
+            cards = frappe.get_all(
+                "Master Job Card",
+                filters={
+                    "master_work_order_number": self.name,
+                    "operation_name": row.opration_name,
+                    "docstatus": ["<", 2],
+                },
+                pluck="name",
+            )
+            if not cards:
+                continue
+
+            frappe.throw(
+                ("Row {0}: the items of Operation {1} cannot be changed -- "
+                 "Master Job Card {2} is raised against it.<br><br>"
+                 "Cancel or delete the card first, then change the selection.").format(
+                    row.idx,
+                    frappe.bold(row.opration_name),
+                    ", ".join(
+                        frappe.utils.get_link_to_form("Master Job Card", card)
+                        for card in cards
+                    ),
+                ),
+                title="Master Job Card Exists",
+            )
+
+    def operation_items(self, operation):
+        """The items an operation line runs.
+
+        The selection on the row, held to the items the order is actually making --
+        a row saved against an item since taken off the order names cloth nobody is
+        producing. Where the row names none at all, the BOM rule behind the default
+        answers instead, so an order saved before the column existed reads the way
+        it always did."""
+        ordered = [row.item_code for row in self.items_to_be_manufacture if row.item_code]
+
+        selected = [
+            item_code for item_code in split_items(operation.get("item_codes"))
+            if item_code in ordered
+        ]
+
+        return selected or self.default_items_for_operation(operation)
+
+    def effective_items(self, operation):
+        """An operation line's selection as a set, defaults and all."""
+        return set(self.operation_items(operation))
+
+    def operation_runs_item(self, operation, item_code):
+        return bool(item_code) and item_code in self.operation_items(operation)
+
+    def in_house_operation(self, operation_name):
+        """The In-House line of an operation, of which there is at most one.
+
+        Operation Name + Manufacturing Type is unique, so an operation has one
+        In-House line at most -- which is what keeps a Master Job Card naming its
+        operation and nothing else unambiguous, however many lines the operation is
+        on."""
+        for op in self.operations:
+            if (
+                op.opration_name == operation_name
+                and op.manufacturing_type == "In-House"
+            ):
+                return op
+
+        return None
+
+    def work_orders_of_items(self, item_codes):
+        """The Work Orders raised for a set of items."""
+        item_codes = set(item_codes)
+
+        return {
+            row.work_order_number
+            for row in self.items_to_be_manufacture
+            if row.work_order_number and row.item_code in item_codes
+        }
+
+    def work_orders_for_operation(self, operation):
+        """The Work Orders of the items an operation line runs."""
+        return self.work_orders_of_items(self.operation_items(operation))
 
     def validate_manufacturing_type_change(self):
         """An In-House operation that already has a Master Job Card stays In-House.
@@ -179,6 +481,13 @@ class MasterWorkOrder(Document):
         for row in before.operations:
             if row.name in current or not row.opration_name:
                 continue
+            if row.manufacturing_type != "In-House":
+                # Out House work is a Purchase Order's, not a card's -- and where the
+                # same operation is also run in house, the card belongs to that line
+                # and that line is still on the order. Matching on the operation name
+                # alone would have this refuse to let go of the supplier's row over a
+                # card raised for the floor's.
+                continue
 
             cards = frappe.get_all(
                 "Master Job Card",
@@ -233,7 +542,7 @@ class MasterWorkOrder(Document):
             work_order.skip_transfer = self.skip_material_transfer_to_wip_warehouse
             work_order.planned_start_date = self.posting_date or frappe.utils.now_datetime()
 
-            self.set_in_house_operations(work_order)
+            self.set_in_house_operations(work_order, row)
 
             work_order.insert()
             work_order.submit()   # This will trigger Job Card Creation
@@ -248,7 +557,15 @@ class MasterWorkOrder(Document):
             }, update_modified=False)
 
 
-    def set_in_house_operations(self, work_order):
+    def set_in_house_operations(self, work_order, item_row):
+        """The operation rows this item's Work Order is built with.
+
+        The In-House lines that name this item, and nothing else. The item selection
+        is the planner's answer to the question the BOMs used to be asked on their
+        own, and it outranks them: Embroidery may be on the BOM of all three colours
+        and still be a supplier's work on one of them, and dropping the row here is
+        what keeps the floor from being asked for it -- the Work Order Operation row
+        is the only thing a Job Card can be booked against."""
         if not work_order.bom_no:
             return
 
@@ -256,7 +573,9 @@ class MasterWorkOrder(Document):
 
         in_house = [
             op for op in self.operations
-            if op.manufacturing_type == "In-House" and op.opration_name
+            if op.manufacturing_type == "In-House"
+            and op.opration_name
+            and self.operation_runs_item(op, item_row.item_code)
         ]
         wanted = {op.opration_name for op in in_house}
 
@@ -341,15 +660,15 @@ class MasterWorkOrder(Document):
 
         set_work_order_operations() builds the table out of the BOM, so an operation
         the planner put on the order by hand is in none of it -- and the Work Order
-        Operation row is the only thing a Job Card can be raised against. It runs on
-        every Work Order of the order whatever any one BOM happens to carry, which is
-        what the planner asked for by adding it to an order-wide table.
+        Operation row is the only thing a Job Card can be raised against.
 
-        An operation that did come off a BOM is left to the Work Orders built from
-        that BOM. Handing it to the rest as well was what put an operation asked of
-        one item onto every item's Work Order -- and the Master Job Card, which reads
-        the Work Orders rather than the BOMs, then came out raised for the whole order
-        against a row that says 10.
+        Which operations reach this Work Order is settled before they get here, by the
+        item selection on the order's own rows -- see set_in_house_operations(). That
+        selection defaults to the BOM rule this used to apply for itself
+        (operation_belongs_to), so an operation that came off a BOM still goes only to
+        the Work Orders built from that BOM, and one the planner added by hand still
+        reaches every Work Order of the order. What is new is that the planner may now
+        say otherwise, line by line.
 
         Sequence Id is carried on from the last row rather than taken off the
         operation: ERPNext's validate_operations_sequence() will only have them run
@@ -361,8 +680,6 @@ class MasterWorkOrder(Document):
 
         for op in operations:
             if op.opration_name in on_work_order:
-                continue
-            if not self.operation_belongs_to(op.opration_name, work_order.bom_no):
                 continue
 
             values = self.work_order_operation_values(op)
@@ -387,6 +704,14 @@ class MasterWorkOrder(Document):
             "completed_qty": 0,
             "process_loss_qty": 0,
         }
+
+    def item_code_of_work_order(self, work_order):
+        """The item a Work Order of this order is making."""
+        for row in self.items_to_be_manufacture:
+            if row.work_order_number == work_order:
+                return row.item_code
+
+        return None
 
     def work_orders_running_operation(self, operation):
         """The Work Orders of this order that carry the operation.
@@ -546,11 +871,17 @@ class MasterWorkOrder(Document):
     def set_operations(self, operations):
         self.set("operations", [])
 
-        # Total qty to manufacture per BOM (multiple items can share a BOM).
+        # Total qty to manufacture per BOM (multiple items can share a BOM), and the
+        # items behind it -- an operation runs the items of the BOMs that carry it,
+        # which is what fills its Items column in.
         bom_qty_map = {}
+        bom_items = {}
         for item in self.items_to_be_manufacture:
-            if item.bom_no:
-                bom_qty_map[item.bom_no] = bom_qty_map.get(item.bom_no, 0) + (item.qty_to_manufacture or 0)
+            if not item.bom_no:
+                continue
+            bom_qty_map[item.bom_no] = bom_qty_map.get(item.bom_no, 0) + (item.qty_to_manufacture or 0)
+            if item.item_code:
+                bom_items.setdefault(item.bom_no, []).append(item.item_code)
 
         # One row per operation, even if several BOMs run it.
         consolidated = {}
@@ -565,17 +896,25 @@ class MasterWorkOrder(Document):
                 "standerd_time": 0,
                 "total_qty_to_manufacture": 0,
                 "counted_boms": set(),
+                "selected": [],
             })
             row["standerd_time"] += op.time_in_mins or 0
             # Add each BOM's qty only once per operation.
             if op.parent not in row["counted_boms"]:
                 row["counted_boms"].add(op.parent)
                 row["total_qty_to_manufacture"] += bom_qty_map.get(op.parent, 0)
+                for item_code in bom_items.get(op.parent, []):
+                    if item_code not in row["selected"]:
+                        row["selected"].append(item_code)
 
         hour_rate_map = frappe._dict(frappe.get_all("Workstation", {"name": ["in", list(unique_workstation)]}, ["name", "hour_rate"], as_list=1))
 
         for data in sorted(consolidated.values(), key=lambda d: d["opration_sequence_no"] or 0):
             data.pop("counted_boms", None)
+            # Filled in here rather than left to set_default_operation_items() so the
+            # planner sees the selection the moment the plan is fetched, with the
+            # order still unsaved, and can re-cut it before anything is raised.
+            data["item_codes"] = join_items(data.pop("selected"))
             data["hour_rate"] = hour_rate_map.get(data["workstation"])
             self.append("operations", data)
 
@@ -1002,15 +1341,20 @@ class MasterWorkOrder(Document):
         work against".
 
         Reaching every Work Order regardless of the BOMs, which is what it did next,
-        was the other half of the same mistake -- see operation_belongs_to()."""
+        was the other half of the same mistake. The item selection on the operation
+        line settles it now, and it defaults to that same BOM rule -- see
+        default_items_for_operation()."""
         from erpnext.manufacturing.doctype.work_order.work_order import create_job_card
+
+        if not self.operation_runs_item(
+            operation, self.item_code_of_work_order(work_order)
+        ):
+            return
 
         work_order = frappe.get_doc("Work Order", work_order)
         if work_order.docstatus != 1:
             return
         if any(op.operation == operation.opration_name for op in work_order.operations):
-            return
-        if not self.operation_belongs_to(operation.opration_name, work_order.bom_no):
             return
 
         row = work_order.append(
@@ -1471,10 +1815,15 @@ class MasterWorkOrder(Document):
             # the same question work_orders_running_operation() answers, because a
             # Job Card is booked against that row and an item runs an operation
             # exactly when its Work Order carries it. Falling back to the cards, and
-            # then to the whole order, for an order whose Work Orders are not there
-            # to be asked.
+            # then to the line's own item selection, for an order whose Work Orders
+            # are not there to be asked. A line that names no items at all -- an
+            # order older than the column, read before the first save fills it in --
+            # is the whole order's, which is what it has always been.
+            items = self.operation_items(op)
             work_orders = (
-                running.get(name) or set(balance_by_work_order) or set(ordered)
+                running.get(name)
+                or set(balance_by_work_order)
+                or (self.work_orders_of_items(items) if items else set(ordered))
             )
 
             figures[name] = {}
@@ -1676,7 +2025,10 @@ class MasterWorkOrder(Document):
         rows = []
         for op in in_house:
             by_item = figures.get(op.opration_name) or {}
+            runs = set(self.operation_items(op))
             for item_code, item in ordered.items():
+                if item_code not in runs:
+                    continue  # the line does not run this item
                 figure = by_item.get(item_code)
                 if not figure:
                     continue  # no card of this operation carries the item
@@ -2051,9 +2403,47 @@ class MasterWorkOrder(Document):
             row for row in self.operations if row.manufacturing_type == "Out House"
         ]
 
+    def out_house_operation(self, name):
+        """One Out House line of this order, by its row name."""
+        for op in self.out_house_operations():
+            if op.name == name:
+                return op
+
+        frappe.throw(
+            ("Operation row {0} is not an Out House operation of this Master Work "
+             "Order.<br><br>Refresh the Master Work Order -- its operations have "
+             "been changed since this form was opened.").format(frappe.bold(name)),
+            title="Operation Not Found",
+        )
+
+    def items_sent_out(self, operation=None):
+        """The item codes that go to a supplier.
+
+        One line's selection where a line is named -- Embroidery sent out on ABC -
+        White alone puts ABC - White on the Purchase Order, and leaves ABC - Sky and
+        ABC - Blue to the In-House Embroidery line -- and the union over every Out
+        House line otherwise.
+
+        An order that routes nothing out has no selection to go by, and then the
+        whole of it is sent, which is what a Purchase Order carried before an
+        operation line could scope one."""
+        if operation is not None:
+            return set(self.operation_items(operation))
+
+        sent = set()
+        for op in self.out_house_operations():
+            sent.update(self.operation_items(op))
+
+        return sent
+
     def outstanding_out_house_qty(self):
         if not self.out_house_operations():
             return
+
+        # Only what actually went out is waited on. An item every Out House line
+        # left alone is the floor's from end to end, and holding the order open
+        # for a supplier to return it would hold it open for good.
+        sent = self.items_sent_out()
 
         receipts = frappe.get_all(
             "Subcontracting Receipt",
@@ -2072,6 +2462,9 @@ class MasterWorkOrder(Document):
 
         outstanding = {}
         for row in self.items_to_be_manufacture:
+            if sent and row.item_code not in sent:
+                continue
+
             # What the supplier owes is what the order asked for less what was
             # destroyed: a piece that no longer exists is never coming back, and
             # holding the order open for it would leave it open for good.
@@ -2204,11 +2597,41 @@ class MasterWorkOrder(Document):
         return "Not Started"
 
     @frappe.whitelist()
-    def make_subcontracted_purchase_order(self):
+    def make_subcontracted_purchase_order(self, operation=None):
+        """The Purchase Order for work going out to a supplier.
+
+        operation is the row name of one Out House line, and the order is then raised
+        for the items that line selected and no others -- so Embroidery sent out on
+        ABC - White alone reaches the supplier as one row, while ABC - Sky and ABC -
+        Blue stay on the floor under the In-House Embroidery line, and the linkage
+        from Master Work Order through operation and item to the Subcontracting Order
+        is the selection itself.
+
+        Left out, every Out House line goes out together on one order -- which is
+        what a single-supplier order has always done, and what the form falls back to
+        where the order routes nothing out at all."""
         from erpnext.stock.get_item_details import get_conversion_factor
 
         if not self.items_to_be_manufacture:
             frappe.throw(("There are no items to be manufactured to raise a Purchase Order for."))
+
+        operation = self.out_house_operation(operation) if operation else None
+        sent = self.items_sent_out(operation)
+
+        if operation and not sent:
+            frappe.throw(
+                ("No item is selected against Operation {0}, so there is nothing to "
+                 "send out for it.<br><br>Select the items it runs on the Master "
+                 "Work Order's operation line first.").format(
+                    frappe.bold(operation.opration_name)
+                ),
+                title="No Items Selected",
+            )
+
+        rows = [
+            row for row in self.items_to_be_manufacture
+            if not sent or row.item_code in sent
+        ]
 
         transaction_date = frappe.utils.getdate()
 
@@ -2222,12 +2645,20 @@ class MasterWorkOrder(Document):
         # Recomputed on validate as the earliest item date; set for the draft view.
         purchase_order.schedule_date = required_by(self.planned_start_date)
         purchase_order.master_work_order = self.name
+        # The line it is the supplier's half of, so the Purchase Order can be written
+        # back onto that line's Subcontracting PO Number once it is submitted -- see
+        # link_operation_to_purchase_order().
+        purchase_order.master_work_order_operation = operation.name if operation else None
         purchase_order.cost_center = self.cost_center
         purchase_order.project = self.get("project")
         purchase_order.set_warehouse = self.wip_warehouse or self.fg_warehouse
         purchase_order.is_subcontracted = 1
+        # The supplier the operation line names, where it names one. The planner is
+        # left to pick on the order itself where it does not.
+        if operation and operation.supplier:
+            purchase_order.supplier = operation.supplier
 
-        for row in self.items_to_be_manufacture:
+        for row in rows:
             stock_uom = frappe.db.get_value("Item", row.item_code, "stock_uom")
             uom = row.uom or stock_uom
             conversion_factor = (

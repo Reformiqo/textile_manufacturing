@@ -22,6 +22,10 @@ import frappe
 from frappe.tests import UnitTestCase
 from frappe.utils import cint, flt
 
+from textile_manufacturing.textile_manufacturing.doctype.master_work_order_operation.master_work_order_operation import (
+	split_items,
+)
+
 ORDER_QTY = 10.0
 IN_HOUSE = 2
 
@@ -3861,3 +3865,351 @@ class TestOperationOwnership(UnitTestCase):
 		self.assertFalse(order.operation_belongs_to("Dyeing", "BOM-NO-OPERATIONS"))
 		self.assertFalse(order.operation_belongs_to("Weaving", "BOM-NO-OPERATIONS"))
 		self.assertTrue(order.operation_belongs_to("Hand Added", "BOM-NO-OPERATIONS"))
+
+
+class TestOperationLines(UnitTestCase):
+	"""Operation Name + Manufacturing Type, and the items each line runs.
+
+	The same operation may be on the order more than once so long as the type
+	differs -- Embroidery run in house on two of the colours and sent out on the
+	third -- and each line names the items it is for. That selection is what decides
+	which operation rows an item's Work Order is built with, which items a Master Job
+	Card is raised for, and which items go out on a supplier's Purchase Order.
+
+	Nothing here touches the database: bom_operations() is answered from its own
+	cache, which is what the BOMs would have filled in, and the Work Order the
+	operations are put onto is a stand-in for the one ERPNext would build.
+	"""
+
+	SKY, BLUE, WHITE = "ABC - Sky", "ABC - Blue", "ABC - White"
+
+	def make_order(self, items=None, operations=(), routings=None):
+		"""An order for three colours, each on its own BOM, running one routing.
+
+		routings overrides what each BOM carries, for the tests about the default
+		the Items column falls back to."""
+		items = items or [self.SKY, self.BLUE, self.WHITE]
+
+		order = frappe.new_doc("Master Work Order")
+		for item_code in items:
+			order.append("items_to_be_manufacture", {
+				"item_code": item_code,
+				"bom_no": f"BOM-{item_code}",
+				"qty_to_manufacture": ORDER_QTY,
+				"work_order_number": f"WO-{item_code}",
+			})
+
+		for row in operations:
+			order.append("operations", dict(row))
+
+		order._bom_operations = {
+			f"BOM-{item_code}": set(
+				(routings or {}).get(item_code, ["Weaving", "Embroidery"])
+			)
+			for item_code in items
+		}
+		return order
+
+	def line(self, name, manufacturing_type="In-House", item_codes=None):
+		row = {"opration_name": name, "manufacturing_type": manufacturing_type}
+		if item_codes is not None:
+			row["item_codes"] = ", ".join(item_codes)
+		return row
+
+	# ------------------------------------------------------------------
+	# Operation Name + Manufacturing Type is the unique combination
+	# ------------------------------------------------------------------
+	def test_the_same_operation_may_be_added_under_a_different_type(self):
+		"""Embroidery run in house on two colours and sent out on the third."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+		])
+
+		order.validate_unique_operations()
+
+	def test_the_same_operation_may_not_be_added_twice_under_one_type(self):
+		"""Two In-House Embroidery lines are two rows nothing can tell apart: a
+		Master Job Card names its operation and nothing else, so both would claim
+		the one card."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY]),
+			self.line("Embroidery", "In-House", [self.BLUE]),
+		])
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_unique_operations()
+
+	def test_two_lines_with_no_type_at_all_are_still_a_duplicate(self):
+		"""Manufacturing Type may be left blank, and two blanks are the same line."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", ""),
+			self.line("Embroidery", ""),
+		])
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_unique_operations()
+
+	def test_different_operations_are_never_a_duplicate(self):
+		order = self.make_order(operations=[
+			self.line("Weaving"),
+			self.line("Embroidery"),
+		])
+
+		order.validate_unique_operations()
+
+	# ------------------------------------------------------------------
+	# The default -- an order saved before the column existed reads the same
+	# ------------------------------------------------------------------
+	def test_a_line_that_names_nothing_runs_what_its_boms_carry(self):
+		"""operation_belongs_to(), written onto the row. Embroidery is on the Sky
+		and Blue BOMs alone, so those are the items it runs."""
+		order = self.make_order(
+			operations=[self.line("Embroidery")],
+			routings={
+				self.SKY: ["Weaving", "Embroidery"],
+				self.BLUE: ["Weaving", "Embroidery"],
+				self.WHITE: ["Weaving"],
+			},
+		)
+
+		order.set_default_operation_items()
+
+		self.assertEqual(
+			order.operations[0].item_codes, f"{self.SKY}, {self.BLUE}",
+			"the BOMs that carry the operation, in the order the items are listed",
+		)
+
+	def test_an_operation_no_bom_carries_runs_the_whole_order(self):
+		"""The planner put it on the order and not on a BOM, so it is every item's
+		-- there is nothing else to go on."""
+		order = self.make_order(operations=[self.line("Hand Added")])
+
+		order.set_default_operation_items()
+
+		self.assertEqual(
+			split_items(order.operations[0].item_codes),
+			[self.SKY, self.BLUE, self.WHITE],
+		)
+
+	def test_a_line_that_names_items_is_left_alone(self):
+		order = self.make_order(
+			operations=[self.line("Embroidery", "In-House", [self.WHITE])]
+		)
+
+		order.set_default_operation_items()
+
+		self.assertEqual(split_items(order.operations[0].item_codes), [self.WHITE])
+
+	def test_a_duplicated_operation_gets_no_default(self):
+		"""There is no default to reach for: the whole point of the second line is
+		that the items are split between them, and filling both in from the BOMs
+		would put every item through the operation twice."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House"),
+			self.line("Embroidery", "Out House"),
+		])
+
+		order.set_default_operation_items()
+
+		for op in order.operations:
+			self.assertFalse(
+				split_items(op.item_codes),
+				f"{op.manufacturing_type}: the planner has to say, not the BOMs",
+			)
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_operation_items()
+
+	# ------------------------------------------------------------------
+	# A selection has to be items of this order, once each
+	# ------------------------------------------------------------------
+	def test_an_item_the_order_is_not_making_is_refused(self):
+		order = self.make_order(
+			operations=[self.line("Embroidery", "In-House", ["ABC - Green"])]
+		)
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_operation_items()
+
+	def test_the_same_item_twice_on_one_line_is_refused(self):
+		order = self.make_order(
+			operations=[self.line("Embroidery", "In-House", [self.SKY, self.SKY])]
+		)
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_operation_items()
+
+	def test_an_item_run_both_in_house_and_out_house_is_refused(self):
+		"""An item goes through an operation once. Selected on both lines it would
+		be raised for on the floor and sent to a supplier for the same work."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY, self.WHITE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+		])
+
+		with self.assertRaises(frappe.ValidationError):
+			order.validate_operation_items()
+
+	def test_one_item_may_be_on_two_different_operations(self):
+		"""Weaving and Embroidery both run ABC - Sky, which is the ordinary case --
+		the rule is about one operation's lines, not about the item."""
+		order = self.make_order(operations=[
+			self.line("Weaving", "In-House", [self.SKY, self.BLUE, self.WHITE]),
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+		])
+
+		order.validate_operation_items()
+
+	# ------------------------------------------------------------------
+	# What the selection then drives
+	# ------------------------------------------------------------------
+	def test_a_line_runs_the_items_it_names_and_no_others(self):
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+		])
+		in_house, out_house = order.operations
+
+		self.assertTrue(order.operation_runs_item(in_house, self.SKY))
+		self.assertTrue(order.operation_runs_item(in_house, self.BLUE))
+		self.assertFalse(order.operation_runs_item(in_house, self.WHITE))
+
+		self.assertTrue(order.operation_runs_item(out_house, self.WHITE))
+		self.assertFalse(order.operation_runs_item(out_house, self.SKY))
+
+	def test_the_in_house_line_is_the_one_a_card_belongs_to(self):
+		"""A Master Job Card names its operation and nothing else, and this is what
+		keeps that unambiguous."""
+		order = self.make_order(operations=[
+			self.line("Embroidery", "Out House", [self.WHITE]),
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+		])
+
+		line = order.in_house_operation("Embroidery")
+
+		self.assertIsNotNone(line)
+		self.assertEqual(line.manufacturing_type, "In-House")
+		self.assertEqual(
+			order.operation_items(line), [self.SKY, self.BLUE],
+			"the card is raised for the items the In-House line runs",
+		)
+
+	def test_an_operation_run_only_out_house_has_no_in_house_line(self):
+		order = self.make_order(
+			operations=[self.line("Embroidery", "Out House", [self.WHITE])]
+		)
+
+		self.assertIsNone(order.in_house_operation("Embroidery"))
+
+	def test_the_work_orders_of_a_line_are_its_items_work_orders(self):
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+		])
+
+		self.assertEqual(
+			order.work_orders_for_operation(order.operations[0]),
+			{f"WO-{self.SKY}", f"WO-{self.BLUE}"},
+		)
+
+	# ------------------------------------------------------------------
+	# The Work Order is built to the item's own selection
+	# ------------------------------------------------------------------
+	class FakeWorkOrder:
+		"""What ERPNext would hand back, with only what is read off it.
+
+		set_work_order_operations() fills the table from the BOM, which is where
+		the operation rows a Job Card is booked against come from."""
+
+		def __init__(self, bom_no, from_bom):
+			self.bom_no = bom_no
+			self._from_bom = from_bom
+			self.operations = []
+
+		def set_work_order_operations(self):
+			self.operations = [
+				frappe._dict({"operation": name, "sequence_id": idx + 1})
+				for idx, name in enumerate(self._from_bom)
+			]
+
+		def append(self, fieldname, values):
+			row = frappe._dict(values)
+			self.operations.append(row)
+			return row
+
+	def work_order_operations(self, order, item_code, from_bom=("Weaving", "Embroidery")):
+		"""The operations the item's Work Order would be built with."""
+		item_row = next(
+			row for row in order.items_to_be_manufacture if row.item_code == item_code
+		)
+		work_order = self.FakeWorkOrder(item_row.bom_no, list(from_bom))
+		order.set_in_house_operations(work_order, item_row)
+
+		return [op.operation for op in work_order.operations]
+
+	def test_an_item_sent_out_gets_no_operation_row_for_that_work(self):
+		"""The bug this is here for.
+
+		Embroidery is on all three BOMs, so ERPNext puts it on all three Work
+		Orders. ABC - White is the supplier's for it, and leaving the row there
+		would have the floor raise a Job Card for cloth that is away being
+		embroidered elsewhere."""
+		order = self.make_order(operations=[
+			self.line("Weaving", "In-House", [self.SKY, self.BLUE, self.WHITE]),
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+		])
+
+		self.assertEqual(
+			self.work_order_operations(order, self.SKY), ["Weaving", "Embroidery"]
+		)
+		self.assertEqual(
+			self.work_order_operations(order, self.WHITE), ["Weaving"],
+			"Embroidery is the supplier's for this one, so the floor is not asked",
+		)
+
+	def test_an_operation_no_bom_supplied_reaches_the_items_that_name_it(self):
+		"""Added to the order by hand, so ERPNext puts it on no Work Order at all
+		-- and the Work Order Operation row is the only thing a Job Card can be
+		booked against."""
+		order = self.make_order(operations=[
+			self.line("Weaving", "In-House", [self.SKY, self.BLUE, self.WHITE]),
+			self.line("Hand Added", "In-House", [self.BLUE]),
+		])
+
+		self.assertEqual(
+			self.work_order_operations(order, self.BLUE, from_bom=["Weaving"]),
+			["Weaving", "Hand Added"],
+		)
+		self.assertEqual(
+			self.work_order_operations(order, self.SKY, from_bom=["Weaving"]),
+			["Weaving"],
+			"the line does not name this item, so its Work Order does not run it",
+		)
+
+	# ------------------------------------------------------------------
+	# What goes out to a supplier
+	# ------------------------------------------------------------------
+	def test_only_the_items_of_the_named_line_are_sent_out(self):
+		order = self.make_order(operations=[
+			self.line("Embroidery", "In-House", [self.SKY, self.BLUE]),
+			self.line("Embroidery", "Out House", [self.WHITE]),
+			self.line("Dyeing", "Out House", [self.SKY]),
+		])
+		embroidery = order.operations[1]
+
+		self.assertEqual(order.items_sent_out(embroidery), {self.WHITE})
+		self.assertEqual(
+			order.items_sent_out(), {self.WHITE, self.SKY},
+			"with no line named, every Out House line's items go out together",
+		)
+
+	def test_an_order_that_routes_nothing_out_sends_the_whole_of_itself(self):
+		"""Which is what a Purchase Order carried before an operation line could
+		scope one."""
+		order = self.make_order(
+			operations=[self.line("Embroidery", "In-House", [self.SKY])]
+		)
+
+		self.assertEqual(order.items_sent_out(), set())

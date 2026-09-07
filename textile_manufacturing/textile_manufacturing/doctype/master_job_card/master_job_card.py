@@ -683,12 +683,16 @@ class MasterJobCard(Document):
         if not self.master_work_order_number or not self.operation_name:
             return
 
+        # In-House, because a card is only ever an In-House line's -- and the same
+        # operation may also be on the order as a supplier's, whose figures are the
+        # Purchase Order's and not this card's.
         row = frappe.db.get_value(
             "Master Work Order Operation",
             {
                 "parent": self.master_work_order_number,
                 "parenttype": "Master Work Order",
                 "opration_name": self.operation_name,
+                "manufacturing_type": "In-House",
             },
             "name",
         )
@@ -1768,6 +1772,23 @@ class MasterJobCard(Document):
         self.expected_end_date = mwo.get("planned_end_date")
 
     def _get_mwo_operation(self, mwo):
+        """The order's In-House line for this card's operation.
+
+        An operation may be on the order twice, once per Manufacturing Type -- run in
+        house on two of the colours and sent out on the third -- and a card is only
+        ever the In-House line's. Operation Name + Manufacturing Type is unique, so
+        there is at most one of those and naming the operation alone still says which
+        line the card belongs to.
+
+        Where the operation is on the order but not in house at all, the Out House row
+        is handed back so _set_operation_details() can say so."""
+        for op in mwo.operations:
+            if (
+                op.opration_name == self.operation_name
+                and op.manufacturing_type == "In-House"
+            ):
+                return op
+
         for op in mwo.operations:
             if op.opration_name == self.operation_name:
                 return op
@@ -1844,8 +1865,17 @@ class MasterJobCard(Document):
         the standard time of this operation as that item runs it.
 
         Falling back to the BOMs while there are no Work Orders yet -- the card is
-        fetched on a draft order too, where nothing has been raised to read."""
+        fetched on a draft order too, where nothing has been raised to read.
+
+        Over all of it sits the operation line's own item selection, which is the
+        planner's answer rather than a reading of anything: an item the line does not
+        run gets no row here, whatever its Work Order or its BOM happens to carry.
+        Where the line names nothing the selection falls back to the BOM rule, so an
+        order saved before the column existed builds the same card it always did."""
         self.set("job_card_detail", [])
+
+        operation = mwo.in_house_operation(self.operation_name)
+        runs = set(mwo.operation_items(operation)) if operation else None
 
         bom_operation = {}
         for item in mwo.items_to_be_manufacture:
@@ -1862,6 +1892,9 @@ class MasterJobCard(Document):
 
         for item in mwo.items_to_be_manufacture:
             if not item.bom_no:
+                continue
+            if runs is not None and item.item_code not in runs:
+                # The operation line does not run this item.
                 continue
 
             bom_op = bom_operation.get(item.name)

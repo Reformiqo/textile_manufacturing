@@ -19,9 +19,17 @@ def set_master_work_order(doc, method=None):
     if not doc.purchase_order:
         return
 
-    doc.master_work_order = frappe.db.get_value(
-        "Purchase Order", doc.purchase_order, "master_work_order"
-    )
+    purchase_order = frappe.db.get_value(
+        "Purchase Order",
+        doc.purchase_order,
+        ["master_work_order", "master_work_order_operation"],
+        as_dict=True,
+    ) or frappe._dict()
+
+    doc.master_work_order = purchase_order.get("master_work_order")
+    # And which of its operation lines, so the trail from the order through the
+    # operation to the items it selected reaches the supplier's own document.
+    doc.master_work_order_operation = purchase_order.get("master_work_order_operation")
 
     if doc.master_work_order:
         doc.supplied_items = []

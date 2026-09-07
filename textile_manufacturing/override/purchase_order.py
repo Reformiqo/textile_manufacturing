@@ -29,3 +29,32 @@ def keep_fg_qty_in_step(doc, method=None):
     for row in (doc.get("items") or []):
         if flt(row.get("fg_item_qty")) != flt(row.qty):
             row.fg_item_qty = flt(row.qty)
+
+
+def link_operation_to_purchase_order(doc, method=None):
+    """Write this Purchase Order onto the operation line it was raised for.
+
+    The line already carries a Subcontracting PO Number and nothing ever filled it
+    in. Filled in here, the trail runs Master Work Order -> operation line -> the
+    items it selected -> the Purchase Order that sent them out, and the planner can
+    see from the operations table which of them is away and on what.
+
+    Cleared again on cancel: the order that sent the cloth out no longer stands, and
+    a line pointing at a cancelled one reads as still away."""
+    operation = doc.get("master_work_order_operation")
+    if not doc.get("master_work_order") or not operation:
+        return
+
+    # Only ever this order's own line. A stray value is not allowed to stamp another
+    # Master Work Order's operations.
+    parent = frappe.db.get_value("Master Work Order Operation", operation, "parent")
+    if parent != doc.master_work_order:
+        return
+
+    frappe.db.set_value(
+        "Master Work Order Operation",
+        operation,
+        "subcontracting_po_number",
+        doc.name if doc.docstatus == 1 else None,
+        update_modified=False,
+    )
