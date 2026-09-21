@@ -4213,3 +4213,286 @@ class TestOperationLines(UnitTestCase):
 		)
 
 		self.assertEqual(order.items_sent_out(), set())
+
+
+class TestConnectionTab(UnitTestCase):
+	"""The Connection tab -- what the order has raised, and where it stands.
+
+	Built in memory, with the subcontracting trail handed straight in. The tables
+	are a reading of documents that already exist, and that reading is the whole
+	of the question -- what the trail is read out of the database by is
+	subcontracting_documents(), which is kept apart for exactly this.
+
+	Every row has to account for what went out on it, sent = completed + loss +
+	pending, on an order that came back in one lot -- which is the usual. An order
+	returned in parts carries the order's own Qty Sent and Pending on each of its
+	receipt rows, because what is still away is a question about the order and not
+	about any one lot, so there the check is made over the order's rows together.
+	"""
+
+	SKY, WHITE = "ABC - Sky", "ABC - White"
+
+	# ------------------------------------------------------------------
+	# Fixtures
+	# ------------------------------------------------------------------
+	def make_order(self, trail=None, ordered=None):
+		"""Dyeing sent out on ABC - White, Embroidery on ABC - Sky, and Folding
+		kept on the floor -- which the subcontracting table never shows."""
+		order = frappe.new_doc("Master Work Order")
+
+		for item_code, qty, lost in ((self.WHITE, 10.0, 2.0), (self.SKY, 6.0, 0.0)):
+			order.append("items_to_be_manufacture", {
+				"item_code": item_code,
+				"qty_to_manufacture": qty,
+				"process_loss_qty": lost,
+			})
+
+		for name, operation, kind, supplier, items in (
+			("op-dye", "Dyeing", "Out House", "SUP-A", self.WHITE),
+			("op-emb", "Embroidery", "Out House", "SUP-B", self.SKY),
+			("op-fold", "Folding", "In-House", None, f"{self.WHITE}, {self.SKY}"),
+		):
+			row = order.append("operations", {
+				"opration_name": operation,
+				"manufacturing_type": kind,
+				"supplier": supplier,
+				"item_codes": items,
+			})
+			# The row name an out house Purchase Order is stamped with. Frappe only
+			# sets it on insert, and nothing here is inserted.
+			row.name = name
+
+		order.subcontracting_documents = lambda: trail or self.trail()
+		order.ordered_by_item = lambda: ordered or {
+			self.WHITE: {"qty": 10.0, "lost": 2.0},
+			self.SKY: {"qty": 6.0, "lost": 0.0},
+		}
+
+		return order
+
+	def trail(self, purchase_orders=(), orders=(), returns=()):
+		return {
+			"purchase_orders": [frappe._dict(row) for row in purchase_orders],
+			"subcontracting_orders": [frappe._dict(row) for row in orders],
+			"returns": list(returns),
+		}
+
+	def purchase_order(self, name="PO-1", operation="op-dye", qty=8.0, supplier="SUP-A"):
+		return {
+			"name": name,
+			"supplier": supplier,
+			"master_work_order_operation": operation,
+			"qty": qty,
+		}
+
+	def subcontracting_order(self, name="SCO-1", purchase_order="PO-1", qty=8.0,
+							 operation="op-dye", supplier="SUP-A"):
+		return {
+			"name": name,
+			"supplier": supplier,
+			"purchase_order": purchase_order,
+			"master_work_order_operation": operation,
+			"qty": qty,
+		}
+
+	def receipt(self, name="SCR-1", order="SCO-1", completed=0.0, loss=0.0):
+		return {
+			"subcontracting_order": order,
+			"subcontracting_receipt": name,
+			"completed": completed,
+			"loss": loss,
+		}
+
+	def rows(self, order):
+		"""The subcontracting table, with the law checked on the way past.
+
+		What went out on an order is accounted for by what has come back, what was
+		destroyed and what is still away -- checked over the order's rows together,
+		so an order returned in parts is held to it as much as one returned in
+		full."""
+		rows = order.subcontracting_connection_rows()
+
+		by_order = {}
+		for row in rows:
+			self.assertGreaterEqual(row["pending_qty"], 0, row["subcontracting_order"])
+			self.assertGreaterEqual(row["process_loss_qty"], 0, row["subcontracting_order"])
+			if row["subcontracting_order"]:
+				by_order.setdefault(row["subcontracting_order"], []).append(row)
+
+		for name, order_rows in by_order.items():
+			sent = order_rows[0]["sent_qty"]
+			pending = order_rows[0]["pending_qty"]
+			self.assertTrue(
+				all(row["sent_qty"] == sent and row["pending_qty"] == pending
+					for row in order_rows),
+				f"{name}: Qty Sent and Pending are the order's, so every row of it "
+				f"reads the same",
+			)
+			self.assertAlmostEqual(
+				sum(row["completed_qty"] + row["process_loss_qty"] for row in order_rows)
+				+ pending,
+				sent, places=3,
+				msg=f"{name}: what went out is not accounted for by what has come "
+					f"back, what was destroyed and what is still away",
+			)
+
+		return rows
+
+	# ------------------------------------------------------------------
+	# An operation whose work has not gone out yet
+	# ------------------------------------------------------------------
+	def test_an_operation_not_sent_yet_owes_the_whole_of_it(self):
+		"""Less what is already destroyed -- ABC - White is an order for 10 that
+		has lost 2, and cloth that is never coming back is never going out."""
+		rows = self.rows(self.make_order())
+
+		self.assertEqual(
+			[(row["operation_name"], row["pending_qty"]) for row in rows],
+			[("Dyeing", 8.0), ("Embroidery", 6.0)],
+		)
+		self.assertTrue(
+			all(not row["purchase_order"] and not row["sent_qty"] for row in rows),
+			"nothing has gone out, so there is no Purchase Order and nothing sent",
+		)
+
+	def test_an_in_house_operation_is_never_on_the_table(self):
+		"""Folding is the floor's from end to end -- no supplier owes it."""
+		rows = self.rows(self.make_order())
+
+		self.assertNotIn("Folding", [row["operation_name"] for row in rows])
+
+	# ------------------------------------------------------------------
+	# The trail, as far as it has got
+	# ------------------------------------------------------------------
+	def test_a_purchase_order_alone_reads_as_away(self):
+		rows = self.rows(self.make_order(
+			self.trail(purchase_orders=[self.purchase_order()])
+		))
+
+		self.assertEqual(rows[0]["operation_name"], "Dyeing")
+		self.assertEqual(rows[0]["purchase_order"], "PO-1")
+		self.assertIsNone(rows[0]["subcontracting_order"])
+		self.assertEqual(rows[0]["sent_qty"], 8.0)
+		self.assertEqual(rows[0]["pending_qty"], 8.0)
+
+	def test_a_receipt_settles_completed_loss_and_pending(self):
+		"""8 sent out, 5 back and 1 destroyed by the supplier, so 2 are still
+		away."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+			returns=[self.receipt(completed=5.0, loss=1.0)],
+		)))
+
+		self.assertEqual(rows[0]["subcontracting_order"], "SCO-1")
+		self.assertEqual(rows[0]["subcontracting_receipt"], "SCR-1")
+		self.assertEqual(rows[0]["completed_qty"], 5.0)
+		self.assertEqual(rows[0]["process_loss_qty"], 1.0)
+		self.assertEqual(rows[0]["pending_qty"], 2.0)
+
+	def test_an_order_returned_in_parts_reads_as_the_parts_it_was(self):
+		"""5 back on one receipt and 3 on the next is two rows of one order, and
+		not 8 on a row that says nothing about when they came."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+			returns=[
+				self.receipt("SCR-1", completed=5.0),
+				self.receipt("SCR-2", completed=3.0),
+			],
+		)))
+		legs = [row for row in rows if row["subcontracting_order"] == "SCO-1"]
+
+		self.assertEqual([row["subcontracting_receipt"] for row in legs],
+						 ["SCR-1", "SCR-2"])
+		self.assertEqual([row["completed_qty"] for row in legs], [5.0, 3.0])
+		self.assertEqual([row["pending_qty"] for row in legs], [0.0, 0.0],
+						 "the order owes nothing once the whole of it is back")
+
+	def test_each_operation_keeps_its_own_supplier_and_order(self):
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[
+				self.purchase_order("PO-1", "op-dye", 8.0, "SUP-A"),
+				self.purchase_order("PO-2", "op-emb", 6.0, "SUP-B"),
+			],
+			orders=[
+				self.subcontracting_order("SCO-1", "PO-1", 8.0, "op-dye", "SUP-A"),
+				self.subcontracting_order("SCO-2", "PO-2", 6.0, "op-emb", "SUP-B"),
+			],
+			returns=[self.receipt("SCR-1", "SCO-2", completed=6.0)],
+		)))
+
+		self.assertEqual(
+			[(row["operation_name"], row["supplier"], row["subcontracting_order"],
+			  row["subcontracting_receipt"], row["pending_qty"]) for row in rows],
+			[
+				("Dyeing", "SUP-A", "SCO-1", None, 8.0),
+				("Embroidery", "SUP-B", "SCO-2", "SCR-1", 0.0),
+			],
+			"the table reads down the operations table, each line with its own trail",
+		)
+
+	def test_a_purchase_order_for_the_whole_order_is_still_listed(self):
+		"""One raised before an operation line could scope it names no line, so it
+		cannot be filed under one -- and it still says where the cloth is."""
+		rows = self.rows(self.make_order(
+			self.trail(purchase_orders=[self.purchase_order("PO-9", None, 16.0, "SUP-Z")])
+		))
+
+		self.assertEqual(rows[-1]["purchase_order"], "PO-9")
+		self.assertIsNone(rows[-1]["operation_name"])
+		self.assertEqual(
+			[row["operation_name"] for row in rows[:-1]], ["Dyeing", "Embroidery"],
+			"neither line can be told it has gone out, so both still read as owed",
+		)
+
+	# ------------------------------------------------------------------
+	# The tab itself
+	# ------------------------------------------------------------------
+	def test_set_connections_fills_both_tables(self):
+		order = self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+			returns=[self.receipt(completed=8.0)],
+		))
+		order.job_card_connection_rows = lambda: [{
+			"master_job_card": "MJC-0001",
+			"operation_name": "Folding",
+			"status": "Completed",
+			"qty_to_manufacture": 16.0,
+			"completed_qty": 14.0,
+			"process_loss_qty": 2.0,
+		}]
+
+		order.set_connections()
+
+		self.assertEqual(
+			[(row.master_job_card, row.operation_name, row.completed_qty,
+			  row.process_loss_qty) for row in order.job_card_details],
+			[("MJC-0001", "Folding", 14.0, 2.0)],
+		)
+		self.assertEqual(
+			[(row.operation_name, row.purchase_order, row.subcontracting_order,
+			  row.subcontracting_receipt, row.completed_qty, row.pending_qty)
+			 for row in order.subcontracting_details],
+			[("Dyeing", "PO-1", "SCO-1", "SCR-1", 8.0, 0.0),
+			 ("Embroidery", None, None, None, 0.0, 6.0)],
+		)
+
+	def test_set_connections_throws_the_old_rows_away(self):
+		"""The tables are the order's own reckoning, so a row a cancelled document
+		left behind cannot survive a second reading."""
+		order = self.make_order()
+		order.append("subcontracting_details", {
+			"operation_name": "Dyeing",
+			"purchase_order": "PO-CANCELLED",
+			"sent_qty": 8.0,
+		})
+		order.job_card_connection_rows = lambda: []
+
+		order.set_connections()
+
+		self.assertNotIn(
+			"PO-CANCELLED",
+			[row.purchase_order for row in order.subcontracting_details],
+		)

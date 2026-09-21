@@ -162,18 +162,35 @@ doc_events = {
 		"validate": "textile_manufacturing.override.purchase_order.keep_fg_qty_in_step",
 		# The operation line the order was raised for carries its number, so the
 		# operations table says which work is away at a supplier and on what.
-		"on_submit": "textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
-		"on_cancel": "textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
+		#
+		# Each leg of the subcontracting trail also refreshes the Master Work
+		# Order's Connection tab, which is drawn from all three of them.
+		"on_submit": [
+			"textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
+			"textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
+		],
+		"on_cancel": [
+			"textile_manufacturing.override.purchase_order.link_operation_to_purchase_order",
+			"textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
+		],
 	},
 	"Subcontracting Order": {
 		"validate": "textile_manufacturing.override.subcontracting_order.set_master_work_order",
+		"on_submit": "textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
+		"on_cancel": "textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
 	},
 	"Subcontracting Receipt": {
 		"validate": "textile_manufacturing.override.subcontracting_receipt.set_receipt_master_work_order",
 		# The receipt is what carries the Subcontracting Order to Completed, which is
 		# what an Out House Master Work Order waits on before it can be finished.
-		"on_submit": "textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
-		"on_cancel": "textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
+		"on_submit": [
+			"textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
+			"textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
+		],
+		"on_cancel": [
+			"textile_manufacturing.override.subcontracting_receipt.update_master_work_order_status",
+			"textile_manufacturing.textile_manufacturing.doctype.master_work_order.master_work_order.refresh_connections",
+		],
 	},
 	"Quality Inspection": {
 		"on_submit": "textile_manufacturing.override.quality_inspection.update_master_job_card_detail",
