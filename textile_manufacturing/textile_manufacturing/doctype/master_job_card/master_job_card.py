@@ -737,6 +737,9 @@ class MasterJobCard(Document):
         master_work_order.hold_process_loss_to_actual()
         master_work_order.refresh_item_status()
         master_work_order.set_status_from_work_orders()
+        # Last, so the Connection tab is written off the figures this card has just
+        # settled rather than the ones it found.
+        master_work_order.update_connections()
 
         self.move_master_work_order_off_not_started()
 

@@ -46,7 +46,11 @@
   "required_items",
   "amended_from",
   "scrap_tab",
-  "scrap_item"
+  "scrap_item",
+  "connection_tab",
+  "job_card_details",
+  "section_break_connection",
+  "subcontracting_details"
  ],
  "fields": [
   {
@@ -293,13 +297,42 @@
    "fieldtype": "Link",
    "label": "Scrape Warhouse",
    "options": "Warehouse"
+  },
+  {
+   "fieldname": "connection_tab",
+   "fieldtype": "Tab Break",
+   "label": "Connection"
+  },
+  {
+   "allow_on_submit": 1,
+   "description": "Every Master Job Card raised against this order, with what it was raised for and what it has turned out. Written by the order itself -- not to be typed in.",
+   "fieldname": "job_card_details",
+   "fieldtype": "Table",
+   "label": "Job Card Details",
+   "no_copy": 1,
+   "options": "Master Work Order Job Card Detail",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_connection",
+   "fieldtype": "Section Break"
+  },
+  {
+   "allow_on_submit": 1,
+   "description": "The subcontracting trail of every Out House operation -- the Purchase Order it went out on, the Subcontracting Order made from it, and the receipts it came back on. Written by the order itself -- not to be typed in.",
+   "fieldname": "subcontracting_details",
+   "fieldtype": "Table",
+   "label": "Sub-Contracting Order Details",
+   "no_copy": 1,
+   "options": "Master Work Order Subcontracting Detail",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-08-04 19:12:44.022469",
+ "modified": "2026-09-21 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Textile Manufacturing",
  "name": "Master Work Order",

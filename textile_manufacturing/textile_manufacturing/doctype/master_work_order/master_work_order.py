@@ -61,6 +61,11 @@ class MasterWorkOrder(Document):
             else None,
         )
 
+        # The Connection tab, read again rather than trusted: an order raised
+        # before the tab existed carries no rows at all, and a card that reported
+        # behind this document moved the figures after they were stored.
+        self.set_connections()
+
     def validate(self):
         self.validate_unique_production_plan()
         self.validate_unique_operations()
@@ -82,6 +87,7 @@ class MasterWorkOrder(Document):
         self.create_work_orders()
         self.set_operation_qty_from_work_orders()
         self.create_master_job_cards()
+        self.update_connections()
 
         status = "Not Started" if not self.skip_material_transfer_to_wip_warehouse else "In Process"
         self.db_set("status", status)
@@ -2704,6 +2710,378 @@ class MasterWorkOrder(Document):
 
         return purchase_order
 
+    # ------------------------------------------------------------------
+    # The Connection tab -- what the order has raised, and where it stands
+    # ------------------------------------------------------------------
+    CONNECTION_TABLES = (
+        ("job_card_details", "Master Work Order Job Card Detail"),
+        ("subcontracting_details", "Master Work Order Subcontracting Detail"),
+    )
+
+    def set_connections(self):
+        """Fill the Connection tab's two tables, in memory.
+
+        Read again every time the form opens, so the tab tells the truth on an
+        order raised before the tab existed and on one whose figures have moved
+        behind a document that was already loaded. Nothing is written here --
+        opening a form is a read, and update_connections() is what stores it."""
+        self.set("job_card_details", [])
+        for row in self.job_card_connection_rows():
+            self.append("job_card_details", row)
+
+        self.set("subcontracting_details", [])
+        for row in self.subcontracting_connection_rows():
+            self.append("subcontracting_details", row)
+
+    def update_connections(self):
+        """Rebuild the Connection tab and store it.
+
+        The rows are the order's own reckoning and are never typed in, so they are
+        thrown away and written again rather than matched up one by one. Hung off
+        every document that can move them -- a card reporting, a Purchase Order, a
+        Subcontracting Order, a receipt -- so what is stored is what the form would
+        draw."""
+        if not self.name or self.docstatus == 2:
+            return
+
+        self.set_connections()
+
+        for fieldname, doctype in self.CONNECTION_TABLES:
+            frappe.db.delete(doctype, {
+                "parent": self.name,
+                "parenttype": self.doctype,
+                "parentfield": fieldname,
+            })
+
+            for idx, row in enumerate(self.get(fieldname), start=1):
+                row.name = None
+                row.idx = idx
+                row.parent = self.name
+                row.parenttype = self.doctype
+                row.parentfield = fieldname
+                row.docstatus = self.docstatus
+                row.db_insert()
+                # Written by hand, so it is no longer a row waiting to be written.
+                # Left local, a save of the order later in the same request would
+                # take it for a new row and insert it a second time -- see
+                # Document.update_child_table().
+                row.__dict__["__islocal"] = 0
+
+    def job_card_connection_rows(self):
+        """One row per Master Job Card raised against this order, oldest first.
+
+        The card's own figures and not the operation's: the tab answers how many
+        cards were raised and what each of them did, so an operation carried on
+        over a second card reads as the two cards it was -- which the operations
+        table, where the two are added up, cannot show."""
+        rows = []
+        for card in frappe.get_all(
+            "Master Job Card",
+            filters={"master_work_order_number": self.name, "docstatus": ["<", 2]},
+            fields=[
+                "name", "operation_name", "workstation", "posting_date", "status",
+                "total_qty_to_manufacture", "total_completed_qty",
+                "total_process_loss_qty",
+            ],
+            order_by="creation",
+        ):
+            rows.append({
+                "master_job_card": card.name,
+                "operation_name": card.operation_name,
+                "workstation": card.workstation,
+                "posting_date": card.posting_date,
+                "status": card.status,
+                "qty_to_manufacture": flt(card.total_qty_to_manufacture, 3),
+                "completed_qty": flt(card.total_completed_qty, 3),
+                "process_loss_qty": flt(card.total_process_loss_qty, 3),
+            })
+
+        return rows
+
+    @staticmethod
+    def qty_by_parent(doctype, parenttype, parents):
+        """Qty on each document, added up off its item rows.
+
+        Off the rows rather than the parent's own total, which is not a figure
+        every ERPNext version carries under the same name."""
+        if not parents:
+            return {}
+
+        qty = {}
+        for row in frappe.get_all(
+            doctype,
+            filters={"parent": ["in", parents], "parenttype": parenttype},
+            fields=["parent", "qty"],
+        ):
+            qty[row.parent] = flt(qty.get(row.parent)) + flt(row.qty)
+
+        return qty
+
+    def receipt_returns(self, receipts):
+        """What came back on each receipt, per Subcontracting Order.
+
+        Accepted qty is what the supplier completed and rejected qty is what he
+        destroyed, which is that leg's process loss. rejected_qty is read only
+        where the site carries it: it is ERPNext's field, not this app's."""
+        if not receipts:
+            return []
+
+        fields = ["parent", "subcontracting_order", "qty"]
+        if frappe.get_meta("Subcontracting Receipt Item").has_field("rejected_qty"):
+            fields.append("rejected_qty")
+
+        legs = {}
+        for row in frappe.get_all(
+            "Subcontracting Receipt Item",
+            filters={
+                "parent": ["in", receipts],
+                "parenttype": "Subcontracting Receipt",
+            },
+            fields=fields,
+        ):
+            leg = legs.setdefault(
+                (row.subcontracting_order or None, row.parent),
+                {
+                    "subcontracting_order": row.subcontracting_order or None,
+                    "subcontracting_receipt": row.parent,
+                    "completed": 0.0,
+                    "loss": 0.0,
+                },
+            )
+            leg["completed"] += flt(row.qty)
+            leg["loss"] += flt(row.get("rejected_qty"))
+
+        # In the order the receipts were raised, so a run that came back in parts
+        # reads down the table the way it happened.
+        position = {name: idx for idx, name in enumerate(receipts)}
+
+        return sorted(
+            legs.values(),
+            key=lambda leg: position.get(leg["subcontracting_receipt"], len(position)),
+        )
+
+    def subcontracting_documents(self):
+        """The subcontracting trail behind this order, straight from the database.
+
+        Kept apart from the reckoning in subcontracting_connection_rows() so the
+        arithmetic can be read -- and tested -- without a site behind it.
+
+        Cancelled documents are left out. An order that no longer stands sent
+        nothing out, and a row pointing at one reads as work that is away."""
+        purchase_orders = frappe.get_all(
+            "Purchase Order",
+            filters={"master_work_order": self.name, "docstatus": ["<", 2]},
+            fields=["name", "supplier", "master_work_order_operation"],
+            order_by="creation",
+        )
+        orders = frappe.get_all(
+            "Subcontracting Order",
+            filters={"master_work_order": self.name, "docstatus": ["<", 2]},
+            fields=[
+                "name", "supplier", "purchase_order", "master_work_order_operation",
+            ],
+            order_by="creation",
+        )
+        receipts = frappe.get_all(
+            "Subcontracting Receipt",
+            filters={"master_work_order": self.name, "docstatus": ["<", 2]},
+            pluck="name",
+            order_by="creation",
+        )
+
+        ordered_qty = self.qty_by_parent(
+            "Purchase Order Item", "Purchase Order", [row.name for row in purchase_orders]
+        )
+        for row in purchase_orders:
+            row.qty = flt(ordered_qty.get(row.name))
+
+        sent_qty = self.qty_by_parent(
+            "Subcontracting Order Item", "Subcontracting Order",
+            [row.name for row in orders],
+        )
+        for row in orders:
+            row.qty = flt(sent_qty.get(row.name))
+
+        return {
+            "purchase_orders": purchase_orders,
+            "subcontracting_orders": orders,
+            "returns": self.receipt_returns(receipts),
+        }
+
+    def subcontracting_connection_rows(self):
+        """One row per leg of the subcontracting trail, read down the operations.
+
+        A leg is as far as the work has got: the Purchase Order alone while it is
+        only ordered, the Subcontracting Order once one is made from it, and one
+        row per receipt once the goods start coming back -- so an order returned
+        in two lots reads as the two lots it was.
+
+        The qty columns are read like this:
+
+            Qty Sent     = what went out on the Subcontracting Order behind the row
+            Completed    = accepted qty on this row's receipt
+            Process Loss = rejected qty on this row's receipt
+            Pending      = Qty Sent - everything received and rejected against
+                           that order
+
+        Qty Sent and Pending are the order's, and read the same on each of its
+        receipt rows: what is still away is a question about the order and not
+        about any one lot that has come back. A single receipt -- which is the
+        usual -- leaves the row adding up on its own, sent = completed + loss +
+        pending.
+
+        An Out House operation that has not gone out yet gets a row of its own,
+        with nothing sent and the whole of what it has to run still pending, so
+        the tab says what is left to raise as well as what is away."""
+        trail = self.subcontracting_documents()
+        operation_names = {op.name: op.opration_name for op in self.operations}
+        out_house_rows = {op.name for op in self.out_house_operations()}
+
+        legs_by_order = {}
+        for leg in trail["returns"]:
+            legs_by_order.setdefault(leg["subcontracting_order"], []).append(leg)
+
+        orders_by_purchase_order = {}
+        loose_orders = []
+        for order in trail["subcontracting_orders"]:
+            if order.purchase_order:
+                orders_by_purchase_order.setdefault(order.purchase_order, []).append(order)
+            else:
+                loose_orders.append(order)
+
+        # One consignment per thing that went out -- a Purchase Order and, under
+        # it, each Subcontracting Order made from it -- filed under the operation
+        # line it was raised for, so the table reads down the operations table.
+        by_operation = {}
+        unattributed = []
+
+        def file_consignment(purchase_order, order):
+            operation_row = (
+                (purchase_order.master_work_order_operation if purchase_order else None)
+                or (order.master_work_order_operation if order else None)
+            )
+            if operation_row in out_house_rows:
+                by_operation.setdefault(operation_row, []).append((purchase_order, order))
+            else:
+                # A line taken off the order after the work went out, or a
+                # Purchase Order raised for the whole order rather than for one
+                # line. Either still says where the cloth is, so it is listed
+                # after the operations rather than dropped.
+                unattributed.append(
+                    (operation_names.get(operation_row), purchase_order, order)
+                )
+
+        for purchase_order in trail["purchase_orders"]:
+            for order in orders_by_purchase_order.pop(purchase_order.name, None) or [None]:
+                file_consignment(purchase_order, order)
+
+        for order in loose_orders:
+            file_consignment(None, order)
+
+        # A Subcontracting Order whose Purchase Order is not this order's -- the
+        # Purchase Order was cancelled and the goods are still out on it.
+        for stranded in orders_by_purchase_order.values():
+            for order in stranded:
+                file_consignment(None, order)
+
+        ordered = self.ordered_by_item()
+
+        rows = []
+        for op in self.out_house_operations():
+            consignments = by_operation.pop(op.name, [])
+            if not consignments:
+                rows.append(self.subcontracting_pending_row(op, ordered))
+                continue
+
+            for purchase_order, order in consignments:
+                rows.extend(self.subcontracting_rows_for(
+                    op.opration_name, purchase_order, order,
+                    legs_by_order.pop(order.name, []) if order else [],
+                ))
+
+        for operation, purchase_order, order in unattributed:
+            rows.extend(self.subcontracting_rows_for(
+                operation, purchase_order, order,
+                legs_by_order.pop(order.name, []) if order else [],
+            ))
+
+        # Goods back against an order this one cannot see -- nothing should reach
+        # here, and what does is still a receipt of this order's cloth.
+        for legs in legs_by_order.values():
+            for leg in legs:
+                rows.append({
+                    "operation_name": None,
+                    "supplier": None,
+                    "purchase_order": None,
+                    "subcontracting_order": leg["subcontracting_order"],
+                    "subcontracting_receipt": leg["subcontracting_receipt"],
+                    "sent_qty": 0.0,
+                    "completed_qty": flt(leg["completed"], 3),
+                    "process_loss_qty": flt(leg["loss"], 3),
+                    "pending_qty": 0.0,
+                })
+
+        return rows
+
+    def subcontracting_rows_for(self, operation, purchase_order, order, legs):
+        """The rows one consignment puts on the table -- one per receipt it came
+        back on, and one with the receipt left blank while it is still away."""
+        sent = flt(order.qty) if order else flt(purchase_order.qty)
+        received = sum(flt(leg["completed"]) for leg in legs)
+        rejected = sum(flt(leg["loss"]) for leg in legs)
+
+        row = {
+            "operation_name": operation,
+            "supplier": (order or purchase_order).supplier,
+            "purchase_order": purchase_order.name if purchase_order else None,
+            "subcontracting_order": order.name if order else None,
+            "sent_qty": flt(sent, 3),
+            "pending_qty": flt(max(sent - received - rejected, 0.0), 3),
+        }
+
+        if not legs:
+            return [dict(
+                row,
+                subcontracting_receipt=None,
+                completed_qty=0.0,
+                process_loss_qty=0.0,
+            )]
+
+        return [
+            dict(
+                row,
+                subcontracting_receipt=leg["subcontracting_receipt"],
+                completed_qty=flt(leg["completed"], 3),
+                process_loss_qty=flt(leg["loss"], 3),
+            )
+            for leg in legs
+        ]
+
+    def subcontracting_pending_row(self, operation, ordered):
+        """An Out House operation with nothing sent out yet.
+
+        Pending is the whole of what it has to run: what the order asked for on
+        the items the line runs, less what has already been destroyed -- cloth
+        that is never coming back is never going out either."""
+        owed = 0.0
+        for item_code in set(self.operation_items(operation)):
+            item = ordered.get(item_code)
+            if not item:
+                continue
+            owed += max(flt(item["qty"]) - flt(item["lost"]), 0.0)
+
+        return {
+            "operation_name": operation.opration_name,
+            "supplier": operation.supplier,
+            "purchase_order": None,
+            "subcontracting_order": None,
+            "subcontracting_receipt": None,
+            "sent_qty": 0.0,
+            "completed_qty": 0.0,
+            "process_loss_qty": 0.0,
+            "pending_qty": flt(owed, 3),
+        }
+
     # --------------------------------
     # Return Components
     # --------------------------------
@@ -2808,6 +3186,24 @@ class MasterWorkOrder(Document):
             frappe.throw("No Stock Return Entry could be created for the selected quantities.")
 
         return created_entries
+
+
+def refresh_connections(doc, method=None):
+    """Bring the Connection tab of the Master Work Order behind this document back
+    in line.
+
+    Hung off the Purchase Order, the Subcontracting Order and the Subcontracting
+    Receipt: each is a leg of the trail the tab draws, and none of them reaches the
+    Master Work Order on its own."""
+    name = doc.get("master_work_order")
+    if not name or not frappe.db.exists("Master Work Order", name):
+        return
+
+    order = frappe.get_doc("Master Work Order", name)
+    if order.docstatus != 1:
+        return
+
+    order.update_connections()
 
 
 @frappe.whitelist()
