@@ -4270,11 +4270,14 @@ class TestConnectionTab(UnitTestCase):
 
 		return order
 
-	def trail(self, purchase_orders=(), orders=(), returns=()):
+	def trail(self, purchase_orders=(), orders=(), returns=(), transfers=None):
 		return {
 			"purchase_orders": [frappe._dict(row) for row in purchase_orders],
 			"subcontracting_orders": [frappe._dict(row) for row in orders],
 			"returns": list(returns),
+			# What actually went out, keyed by the document the Send to
+			# Subcontractor Stock Entry was raised on.
+			"transfers": dict(transfers or {}),
 		}
 
 	def purchase_order(self, name="PO-1", operation="op-dye", qty=8.0, supplier="SUP-A"):
@@ -4316,25 +4319,32 @@ class TestConnectionTab(UnitTestCase):
 		for row in rows:
 			self.assertGreaterEqual(row["pending_qty"], 0, row["subcontracting_order"])
 			self.assertGreaterEqual(row["process_loss_qty"], 0, row["subcontracting_order"])
+			self.assertIn(
+				"send_to_supplier_qty", row,
+				"every row carries what was handed over, even one with nothing sent",
+			)
 			if row["subcontracting_order"]:
 				by_order.setdefault(row["subcontracting_order"], []).append(row)
 
 		for name, order_rows in by_order.items():
-			sent = order_rows[0]["sent_qty"]
+			ordered = order_rows[0]["sent_qty"]
 			pending = order_rows[0]["pending_qty"]
+			handed_over = order_rows[0]["send_to_supplier_qty"]
 			self.assertTrue(
-				all(row["sent_qty"] == sent and row["pending_qty"] == pending
+				all(row["sent_qty"] == ordered and row["pending_qty"] == pending
+					and row["send_to_supplier_qty"] == handed_over
 					for row in order_rows),
-				f"{name}: Qty Sent and Pending are the order's, so every row of it "
-				f"reads the same",
+				f"{name}: Order Qty, Send to Supplier Qty and Pending are the "
+				f"order's, so every row of it reads the same",
 			)
 			self.assertAlmostEqual(
 				sum(row["completed_qty"] + row["process_loss_qty"] for row in order_rows)
 				+ pending,
-				sent, places=3,
-				msg=f"{name}: what went out is not accounted for by what has come "
+				ordered, places=3,
+				msg=f"{name}: what was ordered is not accounted for by what has come "
 					f"back, what was destroyed and what is still away",
 			)
+			self.assertGreaterEqual(handed_over, 0, f"{name}: Send to Supplier Qty")
 
 		return rows
 
@@ -4447,6 +4457,86 @@ class TestConnectionTab(UnitTestCase):
 		)
 
 	# ------------------------------------------------------------------
+	# What actually went out to him
+	# ------------------------------------------------------------------
+	def test_what_was_handed_over_is_read_off_the_transfers(self):
+		"""8 ordered and 5 actually sent. The order still owes 8 -- what it asked
+		for is not changed by the floor being slow to hand it over -- and the row
+		says which end it is short at."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+			transfers={"SCO-1": 5.0},
+		)))
+
+		self.assertEqual(rows[0]["send_to_supplier_qty"], 5.0)
+		self.assertEqual(rows[0]["sent_qty"], 8.0, "Order Qty is what was asked for")
+		self.assertEqual(rows[0]["pending_qty"], 8.0, "and none of it is back yet")
+
+	def test_a_transfer_is_read_against_the_order_it_was_raised_on(self):
+		"""Two operations away at once, each with its own consignment: neither
+		reads the other's transfer."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[
+				self.purchase_order("PO-1", "op-dye", 8.0, "SUP-A"),
+				self.purchase_order("PO-2", "op-emb", 6.0, "SUP-B"),
+			],
+			orders=[
+				self.subcontracting_order("SCO-1", "PO-1", 8.0, "op-dye", "SUP-A"),
+				self.subcontracting_order("SCO-2", "PO-2", 6.0, "op-emb", "SUP-B"),
+			],
+			transfers={"SCO-1": 8.0, "SCO-2": 4.0},
+		)))
+
+		self.assertEqual(
+			[(row["operation_name"], row["send_to_supplier_qty"]) for row in rows],
+			[("Dyeing", 8.0), ("Embroidery", 4.0)],
+		)
+
+	def test_goods_sent_ahead_of_the_subcontracting_order_still_count(self):
+		"""The transfer went out on the Purchase Order, before one was made from
+		it, so that is the document it is read against."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			transfers={"PO-1": 8.0},
+		)))
+
+		self.assertIsNone(rows[0]["subcontracting_order"])
+		self.assertEqual(rows[0]["send_to_supplier_qty"], 8.0)
+
+	def test_an_operation_not_sent_yet_has_handed_over_nothing(self):
+		rows = self.rows(self.make_order())
+
+		self.assertEqual([row["send_to_supplier_qty"] for row in rows], [0.0, 0.0])
+
+	def test_an_order_with_no_transfer_reads_nothing_handed_over(self):
+		"""Raised but not yet dispatched -- which is not the same as dispatched
+		and not yet returned, and the two columns are what tell them apart."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+		)))
+
+		self.assertEqual(rows[0]["send_to_supplier_qty"], 0.0)
+		self.assertEqual(rows[0]["sent_qty"], 8.0)
+
+	def test_every_receipt_row_of_an_order_reads_the_same_transfer(self):
+		"""What was handed over is the order's, like Order Qty and Pending, so a
+		run returned in two lots does not read as two dispatches."""
+		rows = self.rows(self.make_order(self.trail(
+			purchase_orders=[self.purchase_order()],
+			orders=[self.subcontracting_order()],
+			returns=[
+				self.receipt("SCR-1", completed=5.0),
+				self.receipt("SCR-2", completed=3.0),
+			],
+			transfers={"SCO-1": 8.0},
+		)))
+		legs = [row for row in rows if row["subcontracting_order"] == "SCO-1"]
+
+		self.assertEqual([row["send_to_supplier_qty"] for row in legs], [8.0, 8.0])
+
+	# ------------------------------------------------------------------
 	# The tab itself
 	# ------------------------------------------------------------------
 	def test_set_connections_fills_both_tables(self):
@@ -4454,6 +4544,7 @@ class TestConnectionTab(UnitTestCase):
 			purchase_orders=[self.purchase_order()],
 			orders=[self.subcontracting_order()],
 			returns=[self.receipt(completed=8.0)],
+			transfers={"SCO-1": 8.0},
 		))
 		order.job_card_connection_rows = lambda: [{
 			"master_job_card": "MJC-0001",
@@ -4473,10 +4564,11 @@ class TestConnectionTab(UnitTestCase):
 		)
 		self.assertEqual(
 			[(row.operation_name, row.purchase_order, row.subcontracting_order,
-			  row.subcontracting_receipt, row.completed_qty, row.pending_qty)
+			  row.subcontracting_receipt, row.send_to_supplier_qty,
+			  row.completed_qty, row.pending_qty)
 			 for row in order.subcontracting_details],
-			[("Dyeing", "PO-1", "SCO-1", "SCR-1", 8.0, 0.0),
-			 ("Embroidery", None, None, None, 0.0, 6.0)],
+			[("Dyeing", "PO-1", "SCO-1", "SCR-1", 8.0, 8.0, 0.0),
+			 ("Embroidery", None, None, None, 0.0, 0.0, 6.0)],
 		)
 
 	def test_set_connections_throws_the_old_rows_away(self):

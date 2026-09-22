@@ -2860,6 +2860,65 @@ class MasterWorkOrder(Document):
             key=lambda leg: position.get(leg["subcontracting_receipt"], len(position)),
         )
 
+    def supplier_transfers(self, orders, purchase_orders):
+        """What has actually gone out to the supplier, per order.
+
+        The Send to Subcontractor Stock Entries raised against each Subcontracting
+        Order -- or against the Purchase Order, where the goods went out before one
+        was made -- added up over their items.
+
+        What the order asked for and what was physically handed over are not the
+        same figure. An order for 8 with 5 sent has 3 still on the floor, and the
+        supplier can only ever return what he was given: the table carries both, so
+        a row that is short says which end it is short at.
+
+        Read off the reference the entry carries rather than off the order's own
+        Master Work Order field, so a transfer raised by hand from the
+        Subcontracting Order is counted as much as one this app raised."""
+        sent = {}
+        counted = set()
+
+        # The Subcontracting Order first, because an entry raised against one made
+        # from a Purchase Order carries both references and would otherwise be
+        # counted twice -- and it is the Subcontracting Order that such a row is
+        # keyed on. The goods went out once, so they are added up once.
+        for fieldname, references in (
+            ("subcontracting_order", orders),
+            ("purchase_order", purchase_orders),
+        ):
+            references = [name for name in references if name]
+            if not references:
+                continue
+
+            entries = frappe.get_all(
+                "Stock Entry",
+                filters={
+                    fieldname: ["in", references],
+                    "purpose": "Send to Subcontractor",
+                    "docstatus": 1,
+                },
+                fields=["name", fieldname],
+            )
+
+            reference_of = {
+                entry.name: entry.get(fieldname)
+                for entry in entries
+                if entry.name not in counted
+            }
+            if not reference_of:
+                continue
+
+            counted.update(reference_of)
+            for row in frappe.get_all(
+                "Stock Entry Detail",
+                filters={"parent": ["in", list(reference_of)], "parenttype": "Stock Entry"},
+                fields=["parent", "qty"],
+            ):
+                reference = reference_of[row.parent]
+                sent[reference] = flt(sent.get(reference)) + flt(row.qty)
+
+        return sent
+
     def subcontracting_documents(self):
         """The subcontracting trail behind this order, straight from the database.
 
@@ -2906,6 +2965,9 @@ class MasterWorkOrder(Document):
             "purchase_orders": purchase_orders,
             "subcontracting_orders": orders,
             "returns": self.receipt_returns(receipts),
+            "transfers": self.supplier_transfers(
+                [row.name for row in orders], [row.name for row in purchase_orders]
+            ),
         }
 
     def subcontracting_connection_rows(self):
@@ -2918,17 +2980,26 @@ class MasterWorkOrder(Document):
 
         The qty columns are read like this:
 
-            Qty Sent     = what went out on the Subcontracting Order behind the row
-            Completed    = accepted qty on this row's receipt
-            Process Loss = rejected qty on this row's receipt
-            Pending      = Qty Sent - everything received and rejected against
-                           that order
+            Order Qty        = what the order asked the supplier for
+            Send to Supplier = what has actually gone out to him, off the Send to
+                               Subcontractor Stock Entries raised against it
+            Completed        = accepted qty on this row's receipt
+            Process Loss     = rejected qty on this row's receipt
+            Pending          = Order Qty - everything received and rejected
+                               against that order
 
-        Qty Sent and Pending are the order's, and read the same on each of its
+        Order Qty and Pending are the order's, and read the same on each of its
         receipt rows: what is still away is a question about the order and not
         about any one lot that has come back. A single receipt -- which is the
-        usual -- leaves the row adding up on its own, sent = completed + loss +
-        pending.
+        usual -- leaves the row adding up on its own, ordered = completed + loss
+        + pending.
+
+        Send to Supplier Qty stands outside that reckoning rather than inside it.
+        It is not what the order owes but what the floor has handed over, and the
+        two part company the moment an order goes out in less than one load: an
+        order for 8 with 5 sent still owes 8, and the supplier can return no more
+        than the 5 he was given. Carried beside Order Qty it says which end a row
+        is short at.
 
         An Out House operation that has not gone out yet gets a row of its own,
         with nothing sent and the whole of what it has to run still pending, so
@@ -2985,6 +3056,7 @@ class MasterWorkOrder(Document):
                 file_consignment(None, order)
 
         ordered = self.ordered_by_item()
+        transfers = trail.get("transfers") or {}
 
         rows = []
         for op in self.out_house_operations():
@@ -2997,12 +3069,14 @@ class MasterWorkOrder(Document):
                 rows.extend(self.subcontracting_rows_for(
                     op.opration_name, purchase_order, order,
                     legs_by_order.pop(order.name, []) if order else [],
+                    transfers,
                 ))
 
         for operation, purchase_order, order in unattributed:
             rows.extend(self.subcontracting_rows_for(
                 operation, purchase_order, order,
                 legs_by_order.pop(order.name, []) if order else [],
+                transfers,
             ))
 
         # Goods back against an order this one cannot see -- nothing should reach
@@ -3016,6 +3090,7 @@ class MasterWorkOrder(Document):
                     "subcontracting_order": leg["subcontracting_order"],
                     "subcontracting_receipt": leg["subcontracting_receipt"],
                     "sent_qty": 0.0,
+                    "send_to_supplier_qty": 0.0,
                     "completed_qty": flt(leg["completed"], 3),
                     "process_loss_qty": flt(leg["loss"], 3),
                     "pending_qty": 0.0,
@@ -3023,20 +3098,27 @@ class MasterWorkOrder(Document):
 
         return rows
 
-    def subcontracting_rows_for(self, operation, purchase_order, order, legs):
+    def subcontracting_rows_for(self, operation, purchase_order, order, legs,
+                                transfers=None):
         """The rows one consignment puts on the table -- one per receipt it came
-        back on, and one with the receipt left blank while it is still away."""
-        sent = flt(order.qty) if order else flt(purchase_order.qty)
+        back on, and one with the receipt left blank while it is still away.
+
+        What was handed over is looked up against the document the transfer was
+        raised on: the Subcontracting Order where there is one, and the Purchase
+        Order while the goods went out ahead of it."""
+        ordered = flt(order.qty) if order else flt(purchase_order.qty)
         received = sum(flt(leg["completed"]) for leg in legs)
         rejected = sum(flt(leg["loss"]) for leg in legs)
+        reference = order.name if order else purchase_order.name
 
         row = {
             "operation_name": operation,
             "supplier": (order or purchase_order).supplier,
             "purchase_order": purchase_order.name if purchase_order else None,
             "subcontracting_order": order.name if order else None,
-            "sent_qty": flt(sent, 3),
-            "pending_qty": flt(max(sent - received - rejected, 0.0), 3),
+            "sent_qty": flt(ordered, 3),
+            "send_to_supplier_qty": flt((transfers or {}).get(reference), 3),
+            "pending_qty": flt(max(ordered - received - rejected, 0.0), 3),
         }
 
         if not legs:
@@ -3077,6 +3159,8 @@ class MasterWorkOrder(Document):
             "subcontracting_order": None,
             "subcontracting_receipt": None,
             "sent_qty": 0.0,
+            # Nothing has been ordered, so nothing has been handed over either.
+            "send_to_supplier_qty": 0.0,
             "completed_qty": 0.0,
             "process_loss_qty": 0.0,
             "pending_qty": flt(owed, 3),
