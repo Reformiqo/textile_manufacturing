@@ -6,3 +6,4 @@
 # Patches added in this section will be executed after doctypes are migrated
 textile_manufacturing.patches.backfill_master_work_order_connections
 textile_manufacturing.patches.refresh_master_work_order_connections
+textile_manufacturing.patches.name_the_operation_on_subcontracting_documents

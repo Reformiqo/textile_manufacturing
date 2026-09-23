@@ -56,6 +56,7 @@ def make_custom_fields():
                 "fieldtype": "Data",
                 "insert_after": "master_work_order",
                 "read_only": 1,
+                "hidden": 1,
                 "print_hide": 1,
             },
             {
@@ -88,6 +89,7 @@ def make_custom_fields():
                 "fieldtype": "Data",
                 "insert_after": "master_work_order",
                 "read_only": 1,
+                "hidden": 1,
                 "print_hide": 1,
             },
             {
@@ -112,11 +114,17 @@ def make_custom_fields():
             {
                 # Which Out House operation line the order was raised for -- see the
                 # Subcontracting Order's field of the same name.
+                #
+                # Hidden: it is a row name, and a row name is linkage rather than
+                # information. Everything downstream is keyed on it, so it stays on
+                # the document -- but what a reader wants where the operation should
+                # be is Cutwork, not 6lin00j9fo, and that is the field below.
                 "fieldname": "master_work_order_operation",
                 "label": "Master Work Order Operation",
                 "fieldtype": "Data",
                 "insert_after": "master_work_order",
                 "read_only": 1,
+                "hidden": 1,
                 "print_hide": 1,
             },
             {
