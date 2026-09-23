@@ -141,5 +141,9 @@ def make_custom_fields():
             },
         ],
     }
-    create_custom_fields(custom_fields, ignore_validate=True)
+    # update=True explicitly, and not left to the default: a field this app has
+    # already shipped is changed by editing the dict above -- hiding one, adding
+    # an option -- and that only reaches the site if an existing Custom Field is
+    # written again rather than skipped as already there.
+    create_custom_fields(custom_fields, ignore_validate=True, update=True)
     frappe.db.commit()
