@@ -66,24 +66,6 @@ class MasterWorkOrder(Document):
         # behind this document moved the figures after they were stored.
         self.set_connections()
 
-        # Which Out House line the Create menu offers -- one at a time, down the
-        # routing. Settled here so the form knows before it draws, the way the
-        # pending Master Job Card rows are.
-        operation = None
-        if self.docstatus == 1:
-            # Off the rows set_connections() has just built, rather than asking
-            # the database for the same trail a second time.
-            operation = self.next_out_house_operation(
-                self.out_house_progress(self.get("subcontracting_details"))
-            )
-
-        self.set_onload(
-            "next_out_house_operation",
-            {"name": operation.name, "opration_name": operation.opration_name}
-            if operation
-            else None,
-        )
-
     def validate(self):
         self.validate_unique_production_plan()
         self.validate_unique_operations()
@@ -2422,173 +2404,6 @@ class MasterWorkOrder(Document):
 
         self.update_production_plan()
 
-    # ------------------------------------------------------------------
-    # The routing -- which operation's turn it is to go out
-    # ------------------------------------------------------------------
-    def operations_in_sequence(self):
-        """Every operation in the order it runs, In-House and Out House alike.
-
-        The order of the rows, which is the rule in_house_operations() already
-        goes by: Opration Sequence No comes off the BOM and is 0 on every row of
-        plenty of orders, so it cannot be asked which operation runs first.
-
-        This is the line the cloth travels down -- Embroidery, Cutwork, Stitching,
-        Folding -- and it is what decides whose turn it is to be sent out."""
-        return sorted(self.operations, key=lambda op: cint(op.idx))
-
-    def out_house_progress(self, rows=None):
-        """Where each Out House operation stands, by operation name.
-
-            owed        = what the order asks of it, less what is already
-                          destroyed -- cloth that is gone is never sent out
-            ordered     = what its Purchase Orders and Subcontracting Orders carry
-            returned    = what has come back, accepted and rejected alike
-            unordered   = owed - ordered, what an order may still be raised for
-            outstanding = owed - returned, what it has still to see through
-
-        The two remainders answer different questions and an operation part
-        ordered needs both. Cutwork ordered for 5 of 8 has 3 a Purchase Order may
-        still be raised for, and 8 that Stitching cannot start on -- so unordered
-        is what the button offers and outstanding is what the next operation
-        waits for.
-
-        Read off the Connection tab's own rows, so the tab and the routing can
-        never disagree. Order Qty is the consignment's and repeats down its
-        receipt rows, so each consignment is counted once; what came back is that
-        row's own and is added up over all of them."""
-        rows = self.subcontracting_connection_rows() if rows is None else rows
-        ordered_by_item = self.ordered_by_item()
-
-        progress = {}
-        for op in self.out_house_operations():
-            owed = 0.0
-            for item_code in set(self.operation_items(op)):
-                item = ordered_by_item.get(item_code)
-                if item:
-                    owed += max(flt(item["qty"]) - flt(item["lost"]), 0.0)
-
-            progress[op.opration_name] = {
-                "owed": flt(owed, 3), "ordered": 0.0, "returned": 0.0,
-            }
-
-        consignments = set()
-        for row in rows:
-            figure = progress.get(row.get("operation_name"))
-            if not figure:
-                continue
-
-            figure["returned"] += (
-                flt(row.get("completed_qty")) + flt(row.get("process_loss_qty"))
-            )
-
-            # A row naming neither document is an operation with nothing out
-            # yet, and carries no Order Qty to count. Read as "neither is set"
-            # rather than "both are None", so a row off the stored table reads
-            # the same as one just built.
-            key = (row.get("purchase_order"), row.get("subcontracting_order"))
-            if not any(key) or key in consignments:
-                continue
-            consignments.add(key)
-            figure["ordered"] += flt(row.get("sent_qty"))
-
-        for figure in progress.values():
-            figure["ordered"] = flt(figure["ordered"], 3)
-            figure["returned"] = flt(figure["returned"], 3)
-            figure["unordered"] = flt(max(figure["owed"] - figure["ordered"], 0.0), 3)
-            figure["outstanding"] = flt(max(figure["owed"] - figure["returned"], 0.0), 3)
-
-        return progress
-
-    def operation_outstanding(self, progress=None):
-        """What every operation still has to see through, by operation row name.
-
-        In-House off operation_figures(), which is the cards' own reckoning. Out
-        House off the supplier: a line is not through when the Purchase Order is
-        raised but when the goods are back, because the cloth is not on the floor
-        for the next operation until then."""
-        figures = self.operation_figures()
-        progress = self.out_house_progress() if progress is None else progress
-
-        outstanding = {}
-        for op in self.operations:
-            if op.manufacturing_type == "Out House":
-                outstanding[op.name] = flt(
-                    (progress.get(op.opration_name) or {}).get("outstanding")
-                )
-                continue
-
-            by_work_order = figures.get(op.opration_name) or {}
-            outstanding[op.name] = (
-                flt(sum(figure["pending"] for figure in by_work_order.values()), 3)
-                if by_work_order
-                else flt(op.total_qty_to_manufacture, 3)
-            )
-
-        return outstanding
-
-    def operations_blocking(self, operation, outstanding=None):
-        """The operations that run before this one and have not finished.
-
-        The routing is a line and the cloth travels down it. Cutwork is work on
-        cloth that Embroidery has already put through, so an order raised for
-        Cutwork while Embroidery still owes 6 buys work on cloth that does not
-        exist yet."""
-        outstanding = self.operation_outstanding() if outstanding is None else outstanding
-
-        blocking = []
-        for op in self.operations_in_sequence():
-            if op.name == operation.name:
-                break
-            if flt(outstanding.get(op.name)) > 0.001:
-                blocking.append(op)
-
-        return blocking
-
-    def next_out_house_operation(self, progress=None):
-        """The Out House line a Purchase Order is to be raised for next.
-
-        The first one down the routing with qty no order carries yet. Whether its
-        turn has actually come is a separate question -- operations_blocking()
-        answers that, and validate_operation_turn() is what refuses -- so the form
-        can offer the line and say why it is not ready, rather than hiding it and
-        saying nothing."""
-        progress = self.out_house_progress() if progress is None else progress
-
-        for op in self.operations_in_sequence():
-            if op.manufacturing_type != "Out House":
-                continue
-            if flt((progress.get(op.opration_name) or {}).get("unordered")) > 0.001:
-                return op
-
-        return None
-
-    def validate_operation_turn(self, operation):
-        """Refuse a Purchase Order for work whose turn has not come.
-
-        Nothing else holds the sequence: a Purchase Order can be raised from the
-        form, from the API or from a second window, and the operations above it
-        are not consulted by any of them."""
-        outstanding = self.operation_outstanding()
-        blocking = self.operations_blocking(operation, outstanding)
-        if not blocking:
-            return
-
-        frappe.throw(
-            ("The cloth has not reached {0} yet.<br><br>"
-             "It runs after these, and they have not finished:<br>{1}<br><br>"
-             "Raise the Purchase Order once the cloth is through them.").format(
-                frappe.bold(operation.opration_name),
-                "<br>".join(
-                    "{0} &mdash; {1} still to run".format(
-                        frappe.bold(op.opration_name or "?"),
-                        flt(outstanding.get(op.name), 3),
-                    )
-                    for op in blocking
-                ),
-            ),
-            title="Not This Operation's Turn",
-        )
-
     def out_house_operations(self):
         return [
             row for row in self.operations if row.manufacturing_type == "Out House"
@@ -2807,9 +2622,6 @@ class MasterWorkOrder(Document):
             frappe.throw(("There are no items to be manufactured to raise a Purchase Order for."))
 
         operation = self.out_house_operation(operation) if operation else None
-        if operation:
-            self.validate_operation_turn(operation)
-
         sent = self.items_sent_out(operation)
 
         if operation and not sent:

@@ -368,26 +368,30 @@ function add_subcontracted_po_button(frm) {
         });
     };
 
-    // One line at a time, down the routing -- Embroidery, Cutwork, Stitching,
-    // Folding -- because that is the order the cloth reaches them in. The server
-    // settles which line that is in next_out_house_operation() and hands it over
-    // on load; offering every Out House line at once invited an order for Folding
-    // to be raised on cloth still sitting at Cutwork.
-    //
-    // One order per line either way: each has its own supplier and its own items,
-    // and putting two on one Purchase Order would send a supplier cloth that was
-    // never routed to them.
-    const next = (frm.doc.__onload || {}).next_out_house_operation;
-    if (!next) return;
+    if (out_house.length === 1) {
+        frm.add_custom_button(__("Create Subcontracted PO"), () => {
+            raise(out_house[0].name);
+        }, __("Create"));
+        return;
+    }
 
-    // Offered whether or not its turn has come. The operations above it may still
-    // be running, and validate_operation_turn() says so by name and by qty -- a
-    // button that explains itself beats a button that is not there.
-    frm.add_custom_button(
-        __("Subcontracted PO: {0}", [next.opration_name || __("Operation")]),
-        () => raise(next.name),
-        __("Create"),
-    );
+    // Every Out House line, in the order the operations table runs them, and one
+    // order per line: each has its own supplier and its own items, and putting two
+    // on one Purchase Order would send a supplier cloth that was never routed to
+    // them.
+    //
+    // All of them, not just the one whose turn it is. Work is ordered part way
+    // through, and ahead of the line it strictly follows, more often than a
+    // routing read straight down would allow -- and an operation carrying no
+    // Manufacturing Type at all can never be called finished, so a rule that
+    // waited for the ones above would wait for good.
+    out_house.forEach((row) => {
+        frm.add_custom_button(
+            __("Subcontracted PO: {0}", [row.opration_name || __("Operation")]),
+            () => raise(row.name),
+            __("Create"),
+        );
+    });
 }
 
 
