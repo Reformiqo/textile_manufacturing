@@ -4588,3 +4588,64 @@ class TestConnectionTab(UnitTestCase):
 			"PO-CANCELLED",
 			[row.purchase_order for row in order.subcontracting_details],
 		)
+
+	# ------------------------------------------------------------------
+	# Goods coming back in parts
+	# ------------------------------------------------------------------
+	def receipt_row(self, item_code, qty=0.0, rejected=0.0):
+		return {"item_code": item_code, "qty": qty, "rejected_qty": rejected}
+
+	def test_part_receipts_add_up_over_the_receipts_they_came_on(self):
+		"""6 back on one and 3 on the next is 9 received, not 3. Nothing else
+		makes a part receipt work."""
+		order = self.make_order()
+
+		self.assertEqual(
+			order.out_house_received_qty([
+				self.receipt_row(self.WHITE, 6.0),
+				self.receipt_row(self.WHITE, 3.0),
+			]),
+			{self.WHITE: 9.0},
+		)
+
+	def test_what_the_supplier_rejected_has_come_back_too(self):
+		"""To the rejected warehouse rather than the good one, and it is never
+		coming back a second time. Counted as returned, or the order waits on it
+		for good."""
+		order = self.make_order()
+
+		self.assertEqual(
+			order.out_house_received_qty([
+				self.receipt_row(self.WHITE, 7.0, rejected=1.0),
+			]),
+			{self.WHITE: 8.0},
+		)
+
+	def test_an_order_part_returned_is_still_owed_the_rest(self):
+		"""ABC - White is an order for 10 that lost 2 on the floor, so 8 are
+		owed; 5 are back and 3 are not."""
+		order = self.make_order()
+		order.out_house_received_qty = lambda: {self.WHITE: 5.0, self.SKY: 6.0}
+
+		self.assertEqual(order.outstanding_out_house_qty(), {self.WHITE: 3.0})
+
+	def test_an_order_all_back_owes_nothing_though_some_was_rejected(self):
+		"""7 accepted and 1 rejected of the 8 owed. The order can finish -- before
+		this it would have sat In Process waiting on the 1 for good, while the
+		Connection tab read Pending 0 beside it."""
+		order = self.make_order()
+		order.out_house_received_qty = lambda: {self.WHITE: 8.0, self.SKY: 6.0}
+
+		self.assertEqual(order.outstanding_out_house_qty(), {})
+
+	def test_an_item_no_line_sent_out_is_never_waited_on(self):
+		"""It is the floor's from end to end -- no supplier owes it."""
+		order = self.make_order()
+		order.operations[0].item_codes = self.WHITE
+		order.operations[1].item_codes = self.WHITE
+		order.out_house_received_qty = lambda: {}
+
+		self.assertEqual(
+			order.outstanding_out_house_qty(), {self.WHITE: 8.0},
+			"ABC - Sky goes out on no line, so it is not the supplier's to return",
+		)

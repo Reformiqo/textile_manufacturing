@@ -2442,6 +2442,59 @@ class MasterWorkOrder(Document):
 
         return sent
 
+    def subcontracting_receipt_rows(self):
+        """Every row the supplier has sent back on this order.
+
+        rejected_qty is read only where the site carries it: it is ERPNext's
+        field, not this app's."""
+        receipts = frappe.get_all(
+            "Subcontracting Receipt",
+            filters={"master_work_order": self.name, "docstatus": 1},
+            pluck="name",
+        )
+        if not receipts:
+            return []
+
+        fields = ["item_code", "qty"]
+        if frappe.get_meta("Subcontracting Receipt Item").has_field("rejected_qty"):
+            fields.append("rejected_qty")
+
+        return frappe.get_all(
+            "Subcontracting Receipt Item",
+            filters={
+                "parent": ["in", receipts],
+                "parenttype": "Subcontracting Receipt",
+            },
+            fields=fields,
+        )
+
+    def out_house_received_qty(self, rows=None):
+        """What has come back from the supplier, per item.
+
+        Rejected as much as accepted. What he spoiled has come back -- to the
+        rejected warehouse rather than the good one -- and it is never coming
+        back a second time, so an order waiting on it would wait for good and
+        never reach Completed.
+
+        Counted the way the Connection tab counts it in out_house_progress(),
+        so the tab reading Pending 0 and the order refusing to finish cannot
+        happen. Goods returned in parts add up over the receipts they came back
+        on, which is the whole of what makes a part receipt work."""
+        rows = self.subcontracting_receipt_rows() if rows is None else rows
+
+        received = {}
+        for row in rows:
+            item_code = row.get("item_code")
+            if not item_code:
+                continue
+            received[item_code] = (
+                flt(received.get(item_code))
+                + flt(row.get("qty"))
+                + flt(row.get("rejected_qty"))
+            )
+
+        return received
+
     def outstanding_out_house_qty(self):
         if not self.out_house_operations():
             return
@@ -2451,20 +2504,7 @@ class MasterWorkOrder(Document):
         # for a supplier to return it would hold it open for good.
         sent = self.items_sent_out()
 
-        receipts = frappe.get_all(
-            "Subcontracting Receipt",
-            filters={"master_work_order": self.name, "docstatus": 1},
-            pluck="name",
-        )
-
-        received = {}
-        if receipts:
-            for row in frappe.get_all(
-                "Subcontracting Receipt Item",
-                filters={"parent": ["in", receipts]},
-                fields=["item_code", "qty"],
-            ):
-                received[row.item_code] = flt(received.get(row.item_code)) + flt(row.qty)
+        received = self.out_house_received_qty()
 
         outstanding = {}
         for row in self.items_to_be_manufacture:
