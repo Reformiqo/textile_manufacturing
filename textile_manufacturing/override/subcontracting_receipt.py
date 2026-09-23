@@ -26,21 +26,36 @@ def set_receipt_master_work_order(doc, method=None):
     if not orders:
         return
 
+    behind = [
+        frappe.db.get_value(
+            "Subcontracting Order",
+            order,
+            [
+                "master_work_order",
+                "master_work_order_operation",
+                "master_work_order_operation_name",
+            ],
+            as_dict=True,
+        ) or frappe._dict()
+        for order in orders
+    ]
+
     master_work_order = next(
-        (
-            mwo
-            for mwo in (
-                frappe.db.get_value("Subcontracting Order", order, "master_work_order")
-                for order in orders
-            )
-            if mwo
-        ),
+        (row.get("master_work_order") for row in behind if row.get("master_work_order")),
         None,
     )
     if not master_work_order:
         return
 
     doc.master_work_order = master_work_order
+    # The operation the goods went out on, where every order on this receipt went
+    # out on the same one. A receipt covering two operations names neither: there
+    # is no one answer, and a half-right one on the face of the document is worse
+    # than none at all -- the rows still carry their orders.
+    for fieldname in ("master_work_order_operation", "master_work_order_operation_name"):
+        named = {row.get(fieldname) for row in behind if row.get(fieldname)}
+        doc.set(fieldname, named.pop() if len(named) == 1 else None)
+
     doc.supplied_items = []
 
     for item in doc.get("items"):

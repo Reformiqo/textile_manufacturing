@@ -368,23 +368,26 @@ function add_subcontracted_po_button(frm) {
         });
     };
 
-    if (out_house.length === 1) {
-        frm.add_custom_button(__("Create Subcontracted PO"), () => {
-            raise(out_house[0].name);
-        }, __("Create"));
-        return;
-    }
+    // One line at a time, down the routing -- Embroidery, Cutwork, Stitching,
+    // Folding -- because that is the order the cloth reaches them in. The server
+    // settles which line that is in next_out_house_operation() and hands it over
+    // on load; offering every Out House line at once invited an order for Folding
+    // to be raised on cloth still sitting at Cutwork.
+    //
+    // One order per line either way: each has its own supplier and its own items,
+    // and putting two on one Purchase Order would send a supplier cloth that was
+    // never routed to them.
+    const next = (frm.doc.__onload || {}).next_out_house_operation;
+    if (!next) return;
 
-    // One order per operation line. Each line has its own supplier and its own
-    // items, and putting them on one Purchase Order would send a supplier cloth
-    // that was never routed to them.
-    out_house.forEach((row) => {
-        frm.add_custom_button(
-            __("Subcontracted PO: {0}", [row.opration_name || __("Operation")]),
-            () => raise(row.name),
-            __("Create"),
-        );
-    });
+    // Offered whether or not its turn has come. The operations above it may still
+    // be running, and validate_operation_turn() says so by name and by qty -- a
+    // button that explains itself beats a button that is not there.
+    frm.add_custom_button(
+        __("Subcontracted PO: {0}", [next.opration_name || __("Operation")]),
+        () => raise(next.name),
+        __("Create"),
+    );
 }
 
 

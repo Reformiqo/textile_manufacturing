@@ -22,14 +22,23 @@ def set_master_work_order(doc, method=None):
     purchase_order = frappe.db.get_value(
         "Purchase Order",
         doc.purchase_order,
-        ["master_work_order", "master_work_order_operation"],
+        [
+            "master_work_order",
+            "master_work_order_operation",
+            "master_work_order_operation_name",
+        ],
         as_dict=True,
     ) or frappe._dict()
 
     doc.master_work_order = purchase_order.get("master_work_order")
     # And which of its operation lines, so the trail from the order through the
-    # operation to the items it selected reaches the supplier's own document.
+    # operation to the items it selected reaches the supplier's own document. By
+    # name as well as by row: the row name says which line and nothing else, and
+    # the supplier's order should say Cutwork on its face.
     doc.master_work_order_operation = purchase_order.get("master_work_order_operation")
+    doc.master_work_order_operation_name = purchase_order.get(
+        "master_work_order_operation_name"
+    )
 
     if doc.master_work_order:
         doc.supplied_items = []
