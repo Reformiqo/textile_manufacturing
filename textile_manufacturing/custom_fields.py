@@ -58,6 +58,16 @@ def make_custom_fields():
                 "read_only": 1,
                 "print_hide": 1,
             },
+            {
+                # Carried down from the Purchase Order -- see its field of the
+                # same name.
+                "fieldname": "master_work_order_operation_name",
+                "label": "Operation",
+                "fieldtype": "Link",
+                "options": "Operation",
+                "insert_after": "master_work_order_operation",
+                "read_only": 1,
+            },
         ],
         "Subcontracting Receipt": [
             {
@@ -68,7 +78,26 @@ def make_custom_fields():
                 "insert_after": "supplier",
                 "read_only": 1,
                 "print_hide": 1,
-            }
+            },
+            {
+                # The last leg of the trail names its operation too, so the goods
+                # coming back say what was done to them without the reader having
+                # to open the order they went out on.
+                "fieldname": "master_work_order_operation",
+                "label": "Master Work Order Operation",
+                "fieldtype": "Data",
+                "insert_after": "master_work_order",
+                "read_only": 1,
+                "print_hide": 1,
+            },
+            {
+                "fieldname": "master_work_order_operation_name",
+                "label": "Operation",
+                "fieldtype": "Link",
+                "options": "Operation",
+                "insert_after": "master_work_order_operation",
+                "read_only": 1,
+            },
         ],
         "Purchase Order": [
             {
@@ -89,6 +118,18 @@ def make_custom_fields():
                 "insert_after": "master_work_order",
                 "read_only": 1,
                 "print_hide": 1,
+            },
+            {
+                # The operation by name, beside the row it points at. The row name
+                # says which line, and says nothing to anybody reading the order:
+                # this is what puts Cutwork on the face of it, and on the print,
+                # so the supplier and the buyer are looking at the same job work.
+                "fieldname": "master_work_order_operation_name",
+                "label": "Operation",
+                "fieldtype": "Link",
+                "options": "Operation",
+                "insert_after": "master_work_order_operation",
+                "read_only": 1,
             },
         ],
     }
