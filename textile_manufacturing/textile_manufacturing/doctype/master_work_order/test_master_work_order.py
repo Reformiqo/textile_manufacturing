@@ -4836,3 +4836,89 @@ class TestSubcontractedQty(UnitTestCase):
 			order.previous_operation_output(self.operation(order, "op-cut")), {},
 			"nothing runs before it, so the order's own qty stands in",
 		)
+
+	# ------------------------------------------------------------------
+	# What a supplier has sent back, for the operation after him
+	# ------------------------------------------------------------------
+	def work_order_order(self, routing, out_house=None, in_house=None):
+		"""The same routing, with a Work Order against each item."""
+		order = self.make_order(routing, in_house=in_house, out_house=out_house)
+		for row, work_order in zip(order.items_to_be_manufacture, ("WO-RED", "WO-BLUE")):
+			row.work_order_number = work_order
+		order.in_house_operation = lambda name: next(
+			(op for op in order.operations
+			 if op.opration_name == name and op.manufacturing_type == "In-House"),
+			None,
+		)
+		return order
+
+	def test_the_operation_after_a_supplier_may_run_what_came_back(self):
+		"""5 back off an order for 100. Cut Work gets 5, not 100."""
+		order = self.work_order_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED]),
+				("op-out", "OUTSOURCE", "Out House", [self.RED]),
+				("op-cut", "CUT WORK", "In-House", [self.RED]),
+			],
+			in_house={"EMB": {self.RED: 100.0}},
+			out_house={"op-out": {self.RED: 5.0}},
+		)
+
+		self.assertEqual(
+			order.out_house_feed_by_work_order("CUT WORK"), {"WO-RED": 5.0},
+		)
+
+	def test_nothing_back_reads_as_nothing_and_not_as_no_supplier(self):
+		"""A Work Order at nothing is not the same as one missing. Missing means
+		no supplier stands between the operation and its cloth; nothing means one
+		does and has sent none of it back -- which is what stops the card."""
+		order = self.work_order_order(
+			routing=[
+				("op-out", "OUTSOURCE", "Out House", [self.RED]),
+				("op-cut", "CUT WORK", "In-House", [self.RED]),
+			],
+		)
+
+		self.assertEqual(
+			order.out_house_feed_by_work_order("CUT WORK"), {"WO-RED": 0.0},
+		)
+
+	def test_an_operation_the_floor_feeds_has_no_supplier_ceiling(self):
+		"""Its own previous Master Job Card holds it, as it always has. An empty
+		reckoning here is what leaves that path untouched."""
+		order = self.work_order_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED]),
+				("op-cut", "CUT WORK", "In-House", [self.RED]),
+			],
+			in_house={"EMB": {self.RED: 40.0}},
+		)
+
+		self.assertEqual(order.out_house_feed_by_work_order("CUT WORK"), {})
+
+	def test_only_the_items_a_supplier_feeds_are_held_to_him(self):
+		"""The reds went out and came back 5; the blues never left the floor. The
+		blues are not the supplier's to hold up."""
+		order = self.work_order_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-out", "OUTSOURCE", "Out House", [self.RED]),
+				("op-cut", "CUT WORK", "In-House", [self.RED, self.BLUE]),
+			],
+			in_house={"EMB": {self.RED: 100.0, self.BLUE: 100.0}},
+			out_house={"op-out": {self.RED: 5.0}},
+		)
+
+		self.assertEqual(
+			order.out_house_feed_by_work_order("CUT WORK"), {"WO-RED": 5.0},
+			"WO-BLUE is absent, so nothing upstream caps it",
+		)
+
+	def test_an_operation_that_is_not_in_house_has_no_such_ceiling(self):
+		"""The reckoning is for a Master Job Card, and only In-House lines have
+		one."""
+		order = self.work_order_order(
+			routing=[("op-out", "OUTSOURCE", "Out House", [self.RED])],
+		)
+
+		self.assertEqual(order.out_house_feed_by_work_order("OUTSOURCE"), {})

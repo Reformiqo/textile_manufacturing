@@ -2690,27 +2690,18 @@ class MasterWorkOrder(Document):
 
         return output
 
-    def previous_operation_output(self, operation):
-        """What the line before this one has turned out, per item.
-
-        An order for 100 whose Embroidery has finished 10 sends 10 to the
-        supplier and not 100: the other 90 are still on the floor and there is
-        nothing there for him to work on.
+    def feeding_lines(self, operation):
+        """The line that feeds each item this operation runs, by item code.
 
         Per item, not per line. The routing's lines do not all run the same
         items -- Semi Stitching on the reds alone, Folding on both -- so each
-        item is fed by the last line before this one that runs it, and the qty
-        going out is what that line turned out of it.
+        item is fed by the last line before this one that runs it, and that is
+        the line its qty comes from.
 
         A line carrying no Manufacturing Type is passed over. No Master Job Card
         is raised for one and no supplier returns against it, so it can never
         report a qty, and reading it as the feeder would put every item at
-        nothing.
-
-        Empty where nothing before it has turned anything out at all, which is
-        an order the floor has not started. The Purchase Order then falls back
-        to what the order asks for, so it can still be raised ahead of the run
-        -- the rule it has always gone by."""
+        nothing."""
         sequence = sorted(self.operations, key=lambda op: cint(op.idx))
         position = next(
             (idx for idx, op in enumerate(sequence) if op.name == operation.name),
@@ -2720,10 +2711,8 @@ class MasterWorkOrder(Document):
             return {}
 
         items_of = {op.name: set(self.operation_items(op)) for op in sequence}
-        in_house = self.card_figures_by_item()
-        out_house = self.out_house_output_by_item()
 
-        output = {}
+        feeding = {}
         for item_code in items_of.get(operation.name) or set():
             for earlier in reversed(sequence[:position]):
                 if earlier.manufacturing_type not in ("In-House", "Out House"):
@@ -2731,23 +2720,85 @@ class MasterWorkOrder(Document):
                 if item_code not in items_of.get(earlier.name, set()):
                     continue
 
-                if earlier.manufacturing_type == "In-House":
-                    qty = flt(
-                        (in_house.get(earlier.opration_name) or {})
-                        .get(item_code, {})
-                        .get("completed")
-                    )
-                else:
-                    qty = flt((out_house.get(earlier.name) or {}).get(item_code))
-
-                # The feeder is the feeder. One that has turned out nothing
-                # leaves this item with nothing to send, and the line before it
-                # is not asked -- the cloth has not reached that far.
-                if qty > 0:
-                    output[item_code] = flt(qty, 3)
+                feeding[item_code] = earlier
                 break
 
+        return feeding
+
+    def previous_operation_output(self, operation):
+        """What the line before this one has turned out, per item.
+
+        An order for 100 whose Embroidery has finished 10 sends 10 to the
+        supplier and not 100: the other 90 are still on the floor and there is
+        nothing there for him to work on.
+
+        Empty where nothing before it has turned anything out at all, which is
+        an order the floor has not started. The Purchase Order then falls back
+        to what the order asks for, so it can still be raised ahead of the run
+        -- the rule it has always gone by."""
+        in_house = self.card_figures_by_item()
+        out_house = self.out_house_output_by_item()
+
+        output = {}
+        for item_code, earlier in self.feeding_lines(operation).items():
+            if earlier.manufacturing_type == "In-House":
+                qty = flt(
+                    (in_house.get(earlier.opration_name) or {})
+                    .get(item_code, {})
+                    .get("completed")
+                )
+            else:
+                qty = flt((out_house.get(earlier.name) or {}).get(item_code))
+
+            # The feeder is the feeder. One that has turned out nothing leaves
+            # this item with nothing to send, and the line before it is not
+            # asked -- the cloth has not reached that far.
+            if qty > 0:
+                output[item_code] = flt(qty, 3)
+
         return output
+
+    def out_house_feed_by_work_order(self, operation_name):
+        """What a supplier has sent back for an In-House operation, per Work
+        Order.
+
+        The ceiling a Master Job Card is held to where the line before it went
+        out to a supplier. There is no previous card to read then -- there is no
+        card, there is a Purchase Order -- so what the operation may run is what
+        has actually come back.
+
+        Only the items an Out House line feeds are in it. One fed off the floor
+        is the floor's, and the card it follows holds it as it always has, so
+        leaving it out is what keeps that path untouched.
+
+        A Work Order in it at nothing is not the same as one missing. Missing
+        means no supplier stands between this operation and its cloth; nothing
+        means one does and has sent none of it back."""
+        operation = self.in_house_operation(operation_name)
+        if not operation:
+            return {}
+
+        feeding = self.feeding_lines(operation)
+        if not any(
+            earlier.manufacturing_type == "Out House" for earlier in feeding.values()
+        ):
+            return {}
+
+        out_house = self.out_house_output_by_item()
+
+        feed = {}
+        for row in self.items_to_be_manufacture:
+            earlier = feeding.get(row.item_code) if row.item_code else None
+            if not row.work_order_number or not earlier:
+                continue
+            if earlier.manufacturing_type != "Out House":
+                continue
+
+            feed[row.work_order_number] = flt(feed.get(row.work_order_number)) + flt(
+                (out_house.get(earlier.name) or {}).get(row.item_code)
+            )
+
+        return feed
 
     @frappe.whitelist()
     def make_subcontracted_purchase_order(self, operation=None):
