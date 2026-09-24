@@ -534,6 +534,22 @@ class MasterJobCard(Document):
 
         return lost
 
+    def master_work_order_items(self):
+        """The order's item rows, which is what the caps are worked out from."""
+        return frappe.get_all(
+            "Master Work Order Item",
+            filters={
+                "parent": self.master_work_order_number,
+                "parenttype": "Master Work Order",
+            },
+            fields=[
+                "work_order_number",
+                "qty_to_manufacture",
+                "process_loss_qty",
+                "manufacture_qty",
+            ],
+        )
+
     def qty_caps(self):
         """Most each row may be raised for:
 
@@ -549,28 +565,30 @@ class MasterJobCard(Document):
             return {}
 
         own = self.own_operation_loss()
+        feed = self.out_house_feed_ceiling()
 
         caps = {}
-        for row in frappe.get_all(
-            "Master Work Order Item",
-            filters={
-                "parent": self.master_work_order_number,
-                "parenttype": "Master Work Order",
-            },
-            fields=[
-                "work_order_number",
-                "qty_to_manufacture",
-                "process_loss_qty",
-                "manufacture_qty",
-            ],
-        ):
+        for row in self.master_work_order_items():
             if not row.work_order_number:
                 continue
 
             elsewhere = flt(row.process_loss_qty) - flt(own.get(row.work_order_number))
-            caps[row.work_order_number] = max(
+            cap = max(
                 flt(row.qty_to_manufacture) - elsewhere - flt(row.manufacture_qty), 0.0
             )
+
+            # And no more than a supplier has sent back, where the line before
+            # this one went out to one. 5 back off an order for 100 is 5 this
+            # operation can complete, whatever the row was raised for -- the
+            # other 95 are at the supplier and there is nothing here to work.
+            #
+            # Only where one feeds it. A Work Order absent from the ceiling has
+            # no supplier between it and this operation, and is capped exactly
+            # as it always was.
+            if row.work_order_number in feed:
+                cap = min(cap, flt(feed[row.work_order_number]))
+
+            caps[row.work_order_number] = cap
 
         return caps
 
@@ -1192,20 +1210,39 @@ class MasterJobCard(Document):
     # ------------------------------------------------------------------
     @frappe.whitelist()
     def sfg_item_rows(self):
-        """The finished goods of this operation -- the same list either way."""
-        warehouse = self.sfg_warehouse or self.wip_warehouse
+        """The finished goods of this operation -- the same list either way.
 
-        return [
-            {
+        Held to what a supplier has sent back where the line before this one
+        went out to one: 5 back off an order for 100 offers 5, not 100, because
+        5 is all the floor has. A row with none of it back is left off the list
+        entirely, and a card with no row left offers no button -- there is
+        nothing to put into store or take out of it.
+
+        A Work Order no supplier feeds is not in that ceiling and is offered
+        exactly what it always was."""
+        warehouse = self.sfg_warehouse or self.wip_warehouse
+        feed = self.out_house_feed_ceiling()
+
+        rows = []
+        for row in (self.get("job_card_detail") or []):
+            if not row.item_code:
+                continue
+
+            qty = flt(row.completed_qty) or flt(row.qty_to_manufacture)
+            if row.work_order_number in feed:
+                qty = min(qty, flt(feed[row.work_order_number]))
+                if qty <= 0:
+                    continue
+
+            rows.append({
                 "item_code": row.item_code,
                 "item_name": row.item_name,
                 "uom": row.uom,
                 "warehouse": warehouse,
-                "qty": flt(row.completed_qty) or flt(row.qty_to_manufacture),
-            }
-            for row in (self.get("job_card_detail") or [])
-            if row.item_code
-        ]
+                "qty": qty,
+            })
+
+        return rows
 
     @frappe.whitelist()
     def make_sfg_stock_entry(self, entry_type, rows=None):
@@ -1349,11 +1386,45 @@ class MasterJobCard(Document):
         # itself. Checked afterwards the guard would be reading the status its own
         # run had just written, and would never refuse anything.
         self.validate_master_work_order_started()
+        self.validate_out_house_material_received()
 
         self.start_operators(employees)
         self.drive_job_cards("start")
         self.db_set("actual_start_date", now_datetime())
         self.set_card_status("Work In Progress")
+
+    def validate_out_house_material_received(self):
+        """The cloth has to be back from the supplier before this operation runs.
+
+        Where the line before this one went out to a supplier, the material this
+        operation would work on is at his place until he returns it. A card
+        started before then books time against cloth that is not on the floor.
+
+        Refused only where none of it is back. A part return is work: 5 back off
+        an order for 100 is 5 this operation can run, and qty_caps() is what
+        holds it to the 5."""
+        feed = self.out_house_feed_ceiling()
+        if not feed:
+            return
+
+        waiting = [
+            work_order for work_order, qty in feed.items() if flt(qty) <= 0
+        ]
+        # Some of it is back. That is work, and the caps hold it to what there is.
+        if len(waiting) < len(feed):
+            return
+
+        frappe.throw(
+            ("Nothing has come back from the supplier for {0} yet.<br><br>"
+             "The cloth this operation works on is still out on the "
+             "subcontracting order before it, so there is none of it on the "
+             "floor to start against.<br><br>"
+             "Receive it against the Subcontracting Receipt first -- this card "
+             "can then be run for as much as has come back.").format(
+                frappe.bold(self.operation_name or "this operation")
+            ),
+            title="Material Not Received Yet",
+        )
 
     def validate_master_work_order_started(self):
         """The order has to have been started before the work under it is.
@@ -1932,6 +2003,32 @@ class MasterJobCard(Document):
     # ------------------------------------------------------------------
     # Operation sequence -- an operation can only work what the one before it made
     # ------------------------------------------------------------------
+    def out_house_feed_ceiling(self):
+        """What a supplier has sent back for this operation, per Work Order.
+
+        The line before this one went out to a supplier, so there is no previous
+        Master Job Card to read -- there is no card, there is a Purchase Order --
+        and what this operation may run is what has actually come back. 5 back
+        off an order for 100 is 5 this operation can work.
+
+        Empty where no Out House line feeds it, which leaves every card that
+        follows the floor exactly as it was.
+
+        Worked out once per document: the completion cap, the SFG rows and the
+        fetched qty all ask for it, and it reads the whole Master Work Order to
+        answer."""
+        if "_out_house_feed_ceiling" in self.__dict__:
+            return self.__dict__["_out_house_feed_ceiling"]
+
+        ceiling = {}
+        if self.master_work_order_number and self.operation_name:
+            order = frappe.get_doc("Master Work Order", self.master_work_order_number)
+            ceiling = order.out_house_feed_by_work_order(self.operation_name)
+
+        self.__dict__["_out_house_feed_ceiling"] = ceiling
+
+        return ceiling
+
     def previous_operation_ceiling(self):
         """What the operation before this one actually turned out, per Work Order.
 
@@ -1944,7 +2041,10 @@ class MasterJobCard(Document):
         operation it measures has finished, and until then the rows keep the quantity
         the Master Work Order was raised for."""
         if not self.previous_opration_master_job_card:
-            return {}
+            # No card before it. Where a supplier is what stands before it
+            # instead, what has come back is the ceiling; where nothing does,
+            # this is empty and the rows keep what the order was raised for.
+            return self.out_house_feed_ceiling()
 
         previous = frappe.db.get_value(
             "Master Job Card",
