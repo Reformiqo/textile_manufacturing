@@ -4649,3 +4649,190 @@ class TestConnectionTab(UnitTestCase):
 			order.outstanding_out_house_qty(), {self.WHITE: 8.0},
 			"ABC - Sky goes out on no line, so it is not the supplier's to return",
 		)
+
+
+class TestSubcontractedQty(UnitTestCase):
+	"""What goes out to the supplier is what the line before turned out.
+
+	The routing is a line and the cloth travels down it. An order for 100 whose
+	Embroidery has finished 10 has 10 for the next operation to work on and 90
+	still on the floor, so a Purchase Order raised for the whole 100 buys work on
+	cloth that does not exist.
+
+	Per item, not per line: the routing's lines do not all run the same items, so
+	each item is fed by the last line before this one that runs it.
+
+	Built in memory, with what the cards have turned out and what the suppliers
+	have sent back handed straight in.
+	"""
+
+	RED, BLUE = "ABC - Red", "ABC - Blue"
+
+	def make_order(self, routing, in_house=None, out_house=None, qty=100.0):
+		"""An order for two colours down the routing given.
+
+		routing is (row name, operation, type, items) per line, in the order the
+		rows sit in the table -- which is the order they run."""
+		order = frappe.new_doc("Master Work Order")
+
+		for item_code in (self.RED, self.BLUE):
+			order.append("items_to_be_manufacture", {
+				"item_code": item_code,
+				"qty_to_manufacture": qty,
+			})
+
+		for idx, (name, operation, kind, items) in enumerate(routing, start=1):
+			row = order.append("operations", {
+				"opration_name": operation,
+				"manufacturing_type": kind,
+				"item_codes": ", ".join(items),
+			})
+			# Frappe sets both on insert, and nothing here is inserted.
+			row.name = name
+			row.idx = idx
+
+		order.card_figures_by_item = lambda: {
+			operation: {
+				item_code: {"completed": completed, "held": 0.0}
+				for item_code, completed in by_item.items()
+			}
+			for operation, by_item in (in_house or {}).items()
+		}
+		order.out_house_output_by_item = lambda: dict(out_house or {})
+
+		return order
+
+	def operation(self, order, name):
+		return next(op for op in order.operations if op.name == name)
+
+	# ------------------------------------------------------------------
+	# The requirement, in its own words
+	# ------------------------------------------------------------------
+	def test_a_hundred_ordered_with_ten_embroidered_sends_ten(self):
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE]),
+			],
+			in_house={"EMB": {self.RED: 10.0, self.BLUE: 10.0}},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")),
+			{self.RED: 10.0, self.BLUE: 10.0},
+			"the other 90 of each are still on the floor",
+		)
+
+	def test_nothing_embroidered_yet_leaves_the_order_to_stand_in(self):
+		"""Which is what lets the Purchase Order be raised ahead of the run."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE]),
+			],
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")), {},
+		)
+
+	def test_an_item_the_line_has_not_put_through_is_left_off(self):
+		"""10 reds embroidered and no blues. The order goes out for the reds
+		alone -- there is no blue cloth to buy work on."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE]),
+			],
+			in_house={"EMB": {self.RED: 10.0, self.BLUE: 0.0}},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")),
+			{self.RED: 10.0},
+		)
+
+	# ------------------------------------------------------------------
+	# Which line feeds which item
+	# ------------------------------------------------------------------
+	def test_each_item_is_fed_by_the_last_line_that_runs_it(self):
+		"""Semi Stitching runs the reds alone, so the blues reaching Cutwork
+		still come off Embroidery."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-semi", "SEMI", "In-House", [self.RED]),
+				("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE]),
+			],
+			in_house={
+				"EMB": {self.RED: 40.0, self.BLUE: 30.0},
+				"SEMI": {self.RED: 12.0},
+			},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")),
+			{self.RED: 12.0, self.BLUE: 30.0},
+		)
+
+	def test_a_line_carrying_no_manufacturing_type_is_passed_over(self):
+		"""No Master Job Card is raised for one and no supplier returns against
+		it, so it can never report a qty. Read as the feeder it would put every
+		item at nothing."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED, self.BLUE]),
+				("op-fold", "FOLDING", None, [self.RED, self.BLUE]),
+				("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE]),
+			],
+			in_house={"EMB": {self.RED: 10.0, self.BLUE: 10.0}},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")),
+			{self.RED: 10.0, self.BLUE: 10.0},
+		)
+
+	def test_the_cloth_comes_off_a_supplier_as_readily_as_off_the_floor(self):
+		"""Cutwork went out and 8 reds came back, so Stitching is fed 8."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED]),
+				("op-cut", "CUTWORK", "Out House", [self.RED]),
+				("op-stitch", "STITCHING", "Out House", [self.RED]),
+			],
+			in_house={"EMB": {self.RED: 10.0}},
+			out_house={"op-cut": {self.RED: 8.0}},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-stitch")),
+			{self.RED: 8.0},
+		)
+
+	def test_a_feeder_that_has_turned_out_nothing_stops_the_search(self):
+		"""Cutwork is away at the supplier with nothing back. Stitching is fed
+		nothing -- the cloth has not reached it, and Embroidery's 10 are not its
+		to run."""
+		order = self.make_order(
+			routing=[
+				("op-emb", "EMB", "In-House", [self.RED]),
+				("op-cut", "CUTWORK", "Out House", [self.RED]),
+				("op-stitch", "STITCHING", "Out House", [self.RED]),
+			],
+			in_house={"EMB": {self.RED: 10.0}},
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-stitch")), {},
+		)
+
+	def test_the_first_line_in_the_routing_has_nothing_feeding_it(self):
+		order = self.make_order(
+			routing=[("op-cut", "CUTWORK", "Out House", [self.RED, self.BLUE])],
+		)
+
+		self.assertEqual(
+			order.previous_operation_output(self.operation(order, "op-cut")), {},
+			"nothing runs before it, so the order's own qty stands in",
+		)
